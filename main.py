@@ -9,7 +9,15 @@ from fastapi import FastAPI, Form, Request, Query, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
+import os
+import shutil
 
+# Vercel එකේ ලියන්න පුළුවන් /tmp folder එකට DB එක මාරු කිරීම
+DB_NAME = "lab_system.db"  # oyage db file eke nama lab.db නම් ඒ නම දාන්න
+DB_PATH = os.path.join("/tmp", DB_NAME)
+
+if not os.path.exists(DB_PATH) and os.path.exists(DB_NAME):
+    shutil.copyfile(DB_NAME, DB_PATH)
 DB_PATH = "lab_system.db"
 
 # NOTE: The single FastAPI() instance is created further down, right after
