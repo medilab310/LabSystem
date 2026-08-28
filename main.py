@@ -1,5 +1,13 @@
+import sqlite3 as stdlib_sqlite
 from sqlite3 import Row
 import libsql_experimental as sqlite3
+
+# Patch missing standard sqlite3 attributes & exceptions into libsql_experimental
+sqlite3.Row = Row
+sqlite3.OperationalError = stdlib_sqlite.OperationalError
+sqlite3.IntegrityError = stdlib_sqlite.IntegrityError
+sqlite3.Error = stdlib_sqlite.Error
+sqlite3.DatabaseError = stdlib_sqlite.DatabaseError
 import os
 import re
 import html
