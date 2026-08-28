@@ -1,3 +1,4 @@
+from sqlite3 import Row
 import libsql_experimental as sqlite3
 import os
 import re
@@ -18,7 +19,7 @@ TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6Ik
 def get_db_connection():
     """Turso Cloud Database එකට Connection එක ලබා දෙන ශ්‍රිතය"""
     conn = sqlite3.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = Row
     return conn
 
 @asynccontextmanager
