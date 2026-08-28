@@ -12,13 +12,30 @@ from starlette.responses import Response as StarletteResponse
 import os
 import shutil
 
-# Vercel එකේ ලියන්න පුළුවන් /tmp folder එකට DB එක මාරු කිරීම
+# Vercel serverless functions ship the project folder as a READ-ONLY
+# filesystem at runtime — only "/tmp" can be written to. SQLite therefore
+# must live under /tmp. On cold start, if a pre-seeded database file was
+# committed alongside main.py, it is copied into /tmp exactly once before
+# any connection is opened; otherwise init_db() below creates a fresh,
+# empty database directly in /tmp.
 DB_NAME = "lab_system.db"  # oyage db file eke nama lab.db නම් ඒ නම දාන්න
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_SEED_DB_PATH = os.path.join(_APP_DIR, DB_NAME)
 DB_PATH = os.path.join("/tmp", DB_NAME)
 
-if not os.path.exists(DB_PATH) and os.path.exists(DB_NAME):
-    shutil.copyfile(DB_NAME, DB_PATH)
-DB_PATH = "lab_system.db"
+if not os.path.exists(DB_PATH):
+    # Prefer a seed DB bundled next to main.py (works regardless of the
+    # process's current working directory on Vercel); fall back to a
+    # relative path for local/dev runs where cwd == project root.
+    if os.path.exists(_SEED_DB_PATH):
+        shutil.copyfile(_SEED_DB_PATH, DB_PATH)
+    elif os.path.exists(DB_NAME):
+        shutil.copyfile(DB_NAME, DB_PATH)
+# NOTE: DB_PATH intentionally stays as the /tmp path from here on.
+# (Previously this was reset back to the read-only "lab_system.db" path,
+# which caused every sqlite3.connect(DB_PATH) call below — inside init_db()
+# and every route handler — to hit the read-only filesystem and raise
+# `sqlite3.OperationalError: attempt to write a readonly database`.)
 
 # NOTE: The single FastAPI() instance is created further down, right after
 # the `lifespan` function is defined, so that lifespan can be attached at
@@ -38,8 +55,18 @@ app = FastAPI(lifespan=lifespan)
 # 1. Static files folder එක ඔටෝ හැදී සර්වර් එකට Mount වීම (Absolute Path එක හරහා 404 Error එක මඟහරවා ගැනීමට)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-os.makedirs(STATIC_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# BASE_DIR is read-only on Vercel, so only attempt to create this folder if
+# it doesn't already exist, and never let a read-only filesystem crash the
+# whole app on import — the "static" folder is normally already bundled
+# with the deployment (e.g. it contains letterhead.png), so this is mainly
+# a safety net for local/dev environments.
+if not os.path.isdir(STATIC_DIR):
+    try:
+        os.makedirs(STATIC_DIR, exist_ok=True)
+    except OSError:
+        pass
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # -------------------------------------------------------------
 # GLOBAL SESSION / CROSS-TAB LOGOUT SYNCHRONIZATION
