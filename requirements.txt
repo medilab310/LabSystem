@@ -2,4 +2,3 @@ fastapi
 uvicorn
 python-multipart
 jinja2
-libsql-experimental
