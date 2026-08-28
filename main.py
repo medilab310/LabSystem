@@ -20,9 +20,35 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 from contextlib import asynccontextmanager
 
+# -------------------------------------------------------------
 # Turso Cloud Database Credentials
-TURSO_DB_URL = os.getenv("TURSO_DB_URL", "libsql://lab-system-medilab310.aws-ap-south-1.turso.io")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODc5NDM5NTksImlkIjoiMDFhMDQ5YzEtMzIwMS03ZmMxLWI3YzQtZTFmMWUyMjg3M2I4Iiwia2lkIjoiRXQtY2FBZ2lvdi1lVUFpek5OWm11QUhOUW84bk01Z25WdmF6MnZ3azNIcyIsInJpZCI6ImUwMDU5NWYyLTNkYjAtNGQ3Yi1hZjhjLTQ4ODNhNzUxYzc4MSJ9.Z2ThLbkhOxlDqEGEIGF0TDP7-fE8lpqsWRBh-WqPbSEAT788xlaExpQG2gRPhPCAJByGWJSapzR1O0Wfs6IYDw")
+# -------------------------------------------------------------
+# IMPORTANT: `os.getenv("X", default)` only falls back to `default` when the
+# env var is completely UNSET. If Vercel has the variable defined but blank
+# (e.g. an empty value in the dashboard, or a build step that exports an
+# empty string), os.getenv() happily returns "" instead of the fallback -
+# which is exactly what produced "empty JWT token": the code had a real
+# hardcoded default, but it was never actually reached.
+#
+# _env_or_default() below treats a missing OR blank/whitespace-only env var
+# as "not configured" and uses the hardcoded fallback in both cases, so
+# startup can never proceed with an empty token.
+
+DEFAULT_TURSO_DB_URL = "libsql://lab-system-medilab310.aws-ap-south-1.turso.io"
+DEFAULT_TURSO_AUTH_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODc5NDM5NTksImlkIjoiMDFhMDQ5YzEtMzIwMS03ZmMxLWI3YzQtZTFmMWUyMjg3M2I4Iiwia2lkIjoiRXQtY2FBZ2lvdi1lVUFpek5OWm11QUhOUW84bk01Z25WdmF6MnZ3azNIcyIsInJpZCI6ImUwMDU5NWYyLTNkYjAtNGQ3Yi1hZjhjLTQ4ODNhNzUxYzc4MSJ9.Z2ThLbkhOxlDqEGEIGF0TDP7-fE8lpqsWRBh-WqPbSEAT788xlaExpQG2gRPhPCAJByGWJSapzR1O0Wfs6IYDw"
+
+
+def _env_or_default(var_name: str, default_value: str) -> str:
+    """Return the env var's value, or `default_value` if it's unset, None,
+    or blank/whitespace-only (covers the 'defined but empty' Vercel case)."""
+    val = os.environ.get(var_name)
+    if val is None or val.strip() == "":
+        return default_value
+    return val
+
+
+TURSO_DB_URL = _env_or_default("TURSO_DB_URL", DEFAULT_TURSO_DB_URL)
+TURSO_AUTH_TOKEN = _env_or_default("TURSO_AUTH_TOKEN", DEFAULT_TURSO_AUTH_TOKEN)
 
 class LibsqlRow:
     """
@@ -157,7 +183,12 @@ class _TursoConnectionWrapper:
 
 def get_db_connection():
     """Turso Cloud Database එකට Connection එක ලබා දෙන ශ්‍රිතය"""
-    raw_conn = sqlite3.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
+    # Belt-and-suspenders: re-check right before connecting so a blank
+    # token can never reach Hrana/libsql, even if TURSO_DB_URL /
+    # TURSO_AUTH_TOKEN were somehow reassigned to "" elsewhere at runtime.
+    db_url = TURSO_DB_URL if TURSO_DB_URL and TURSO_DB_URL.strip() else DEFAULT_TURSO_DB_URL
+    auth_token = TURSO_AUTH_TOKEN if TURSO_AUTH_TOKEN and TURSO_AUTH_TOKEN.strip() else DEFAULT_TURSO_AUTH_TOKEN
+    raw_conn = sqlite3.connect(f"{db_url}?auth_token={auth_token}")
     # NOTE: libsql_experimental's connection object does NOT support
     # `conn.row_factory = Row` (raises AttributeError). We wrap the
     # connection/cursor instead so `row["col"]`, `row[0]`, and `dict(row)`
