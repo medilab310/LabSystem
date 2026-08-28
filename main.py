@@ -1,4 +1,4 @@
-import sqlite3
+import libsql_experimental as sqlite3
 import os
 import re
 import html
@@ -9,40 +9,17 @@ from fastapi import FastAPI, Form, Request, Query, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
-import os
-import shutil
-
-# Vercel serverless functions ship the project folder as a READ-ONLY
-# filesystem at runtime — only "/tmp" can be written to. SQLite therefore
-# must live under /tmp. On cold start, if a pre-seeded database file was
-# committed alongside main.py, it is copied into /tmp exactly once before
-# any connection is opened; otherwise init_db() below creates a fresh,
-# empty database directly in /tmp.
-DB_NAME = "lab_system.db"  # oyage db file eke nama lab.db නම් ඒ නම දාන්න
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
-_SEED_DB_PATH = os.path.join(_APP_DIR, DB_NAME)
-DB_PATH = os.path.join("/tmp", DB_NAME)
-
-if not os.path.exists(DB_PATH):
-    # Prefer a seed DB bundled next to main.py (works regardless of the
-    # process's current working directory on Vercel); fall back to a
-    # relative path for local/dev runs where cwd == project root.
-    if os.path.exists(_SEED_DB_PATH):
-        shutil.copyfile(_SEED_DB_PATH, DB_PATH)
-    elif os.path.exists(DB_NAME):
-        shutil.copyfile(DB_NAME, DB_PATH)
-# NOTE: DB_PATH intentionally stays as the /tmp path from here on.
-# (Previously this was reset back to the read-only "lab_system.db" path,
-# which caused every sqlite3.connect(DB_PATH) call below — inside init_db()
-# and every route handler — to hit the read-only filesystem and raise
-# `sqlite3.OperationalError: attempt to write a readonly database`.)
-
-# NOTE: The single FastAPI() instance is created further down, right after
-# the `lifespan` function is defined, so that lifespan can be attached at
-# creation time. A duplicate `app = FastAPI()` here previously caused all
-# routes registered before that point (e.g. /logout, /login, /) to be
-# silently discarded, since reassigning `app` replaces the whole app object.
 from contextlib import asynccontextmanager
+
+# Turso Cloud Database Credentials
+TURSO_DB_URL = os.getenv("TURSO_DB_URL", "libsql://lab-system-medilab310.aws-ap-south-1.turso.io")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODc5NDM5NTksImlkIjoiMDFhMDQ5YzEtMzIwMS03ZmMxLWI3YzQtZTFmMWUyMjg3M2I4Iiwia2lkIjoiRXQtY2FBZ2lvdi1lVUFpek5OWm11QUhOUW84bk01Z25WdmF6MnZ3azNIcyIsInJpZCI6ImUwMDU5NWYyLTNkYjAtNGQ3Yi1hZjhjLTQ4ODNhNzUxYzc4MSJ9.Z2ThLbkhOxlDqEGEIGF0TDP7-fE8lpqsWRBh-WqPbSEAT788xlaExpQG2gRPhPCAJByGWJSapzR1O0Wfs6IYDw")
+
+def get_db_connection():
+    """Turso Cloud Database එකට Connection එක ලබා දෙන ශ්‍රිතය"""
+    conn = sqlite3.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,14 +29,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 1. Static files folder එක ඔටෝ හැදී සර්වර් එකට Mount වීම (Absolute Path එක හරහා 404 Error එක මඟහරවා ගැනීමට)
+# Static files folder configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-# BASE_DIR is read-only on Vercel, so only attempt to create this folder if
-# it doesn't already exist, and never let a read-only filesystem crash the
-# whole app on import — the "static" folder is normally already bundled
-# with the deployment (e.g. it contains letterhead.png), so this is mainly
-# a safety net for local/dev environments.
+
 if not os.path.isdir(STATIC_DIR):
     try:
         os.makedirs(STATIC_DIR, exist_ok=True)
@@ -67,7 +40,7 @@ if not os.path.isdir(STATIC_DIR):
         pass
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
+    
 # -------------------------------------------------------------
 # GLOBAL SESSION / CROSS-TAB LOGOUT SYNCHRONIZATION
 # -------------------------------------------------------------
@@ -216,8 +189,7 @@ async def login_post(request: Request):
     
     # 2. Database Check
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -261,7 +233,7 @@ async def add_user(request: Request):
     role = form_data.get("role", "").strip()
     
     if username and password and role:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
         conn.commit()
@@ -271,7 +243,7 @@ async def add_user(request: Request):
 
 @app.get("/delete-user/{user_id}")
 def delete_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
@@ -453,7 +425,7 @@ def parse_optional_float(x: str):
 # DATABASE INITIALIZATION (ටේබල්ස් මැකීයාමෙන් තොරව සුරක්ෂිතව සෑදීම)
 # -------------------------------------------------------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # 1. Results Table
@@ -645,7 +617,7 @@ def init_db():
 # -------------------------------------------------------------
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute("SELECT COUNT(*) FROM patients")
@@ -1104,8 +1076,7 @@ def dashboard():
 # -------------------------------------------------------------
 @app.get("/manage-users", response_class=HTMLResponse)
 def manage_users():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # 1. Ensure table and columns exist properly
@@ -1304,7 +1275,7 @@ def manage_users():
 # -------------------------------------------------------------
 @app.get("/reports", response_class=HTMLResponse)
 def reports_page(start_date: str = "", end_date: str = "", report_type: str = "sales"):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     table_headers = ""
@@ -1500,8 +1471,7 @@ def patients_dashboard(
     end_date: Optional[str] = Query(None)
 ):
     import re
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Tables check
@@ -1666,7 +1636,7 @@ def patients_dashboard(
 # -------------------------------------------------------------
 @app.get("/add-patient", response_class=HTMLResponse)
 def add_patient_page(saved_id: int = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # 1. Fetch Tests (name වෙනුවට test_name දාලා ඇත)
@@ -1873,7 +1843,7 @@ async def add_patient_post(request: Request):
         form_data = await request.form()
         selected_tests = form_data.getlist("test_ids")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
 
         # Use the server's actual local date/time (not SQLite's built-in
@@ -1922,8 +1892,7 @@ from fastapi import Form
 # --- DOCTORS MANAGEMENT ---
 @app.get("/manage-doctors", response_class=HTMLResponse)
 def manage_doctors():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM doctors ORDER BY name")
     doctors = cursor.fetchall()
@@ -1998,7 +1967,7 @@ def manage_doctors():
 
 @app.post("/add-doctor")
 def add_doctor(code: str = Form(...), name: str = Form(...), specialization: str = Form(None), phone: str = Form(None)):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("INSERT INTO doctors (code, name, specialization, phone) VALUES (?, ?, ?, ?)", 
@@ -2012,8 +1981,7 @@ def add_doctor(code: str = Form(...), name: str = Form(...), specialization: str
 # --- COLLECTING CENTERS MANAGEMENT ---
 @app.get("/manage-centers", response_class=HTMLResponse)
 def manage_centers():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM collecting_centers ORDER BY center_name")
     centers = cursor.fetchall()
@@ -2082,7 +2050,7 @@ def manage_centers():
 
 @app.post("/add-center")
 def add_center(center_name: str = Form(...), location: str = Form(None), phone: str = Form(None)):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("INSERT INTO collecting_centers (center_name, location, phone) VALUES (?, ?, ?)", 
                    (center_name, location, phone))
@@ -2096,8 +2064,7 @@ def add_center(center_name: str = Form(...), location: str = Form(None), phone: 
 # -------------------------------------------------------------
 @app.get("/add-test-entry", response_class=HTMLResponse)
 def add_test_entry(search: str = "", selected_patient_id: int = None):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     if search:
@@ -2185,8 +2152,7 @@ def patient_tests(patient_id: int = None, selected_patient_id: int = None):
     if not p_id:
         return RedirectResponse(url="/select-patient", status_code=303)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # රෝගියාගේ විස්තර
@@ -2268,7 +2234,7 @@ def patient_tests(patient_id: int = None, selected_patient_id: int = None):
 # -----------------------------
 @app.get("/manage-tests", response_class=HTMLResponse)
 def manage_tests(dept: str = ""):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Safety checks for columns (Including 'notes' for rich test description)
@@ -2510,7 +2476,7 @@ def seed_standard_tests_and_parameters():
     - Never overwrites a parameter's current reference range or customisation.
     - Adds calculation metadata only to the calculated parameters we own.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         _ensure_column(cursor, "tests", "test_code", "test_code TEXT")
@@ -2786,7 +2752,7 @@ def calculate_and_save_derived_results(cursor, patient_id, test_id):
 # -----------------------------
 @app.get("/load-standard-templates")
 def load_standard_templates():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Safety checks to ensure all columns exist in 'tests' table
@@ -2914,7 +2880,7 @@ def load_standard_templates():
 # -----------------------------
 @app.get("/manage-tests/{test_id}", response_class=HTMLResponse)
 def manage_test_parameters(test_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
@@ -3043,7 +3009,7 @@ def add_parameter(
     input_type: str = Form("numeric"),
     is_bold: int = Form(0)
 ):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
@@ -3071,7 +3037,7 @@ def add_parameter(
 # -----------------------------
 @app.get("/edit-parameter/{param_id}", response_class=HTMLResponse)
 def edit_parameter_page(param_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("ALTER TABLE test_parameters ADD COLUMN is_bold INTEGER DEFAULT 0")
@@ -3154,7 +3120,7 @@ def update_parameter(
     input_type: str = Form("numeric"),
     is_bold: int = Form(0)
 ):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("SELECT test_id FROM test_parameters WHERE id = ?", (param_id,))
@@ -3177,7 +3143,7 @@ def delete_test(test_id: int):
     two-step confirmation. Related parameter rules/results/assignments
     are cleaned in the same SQLite transaction.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
@@ -3223,7 +3189,7 @@ def delete_parameter(param_id: int):
     (its reference-range rules and any previously saved patient results),
     so the parent test's parameter list stays consistent.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Work out which test this parameter belongs to so we can redirect back to it.
@@ -3261,7 +3227,7 @@ async def update_param_orders(request: Request):
     form_data = await request.form()
     test_id = form_data.get("test_id")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
@@ -3349,7 +3315,7 @@ def add_main_test(
     width_unit: float = Form(14), width_ref: float = Form(27)
 ):
     alignments = f"{align_inv},{align_res},{align_flag},{align_unit},{align_ref},{width_inv},{width_res},{width_flag},{width_unit},{width_ref}"
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Safety checks for columns
@@ -3377,7 +3343,7 @@ def add_main_test(
 # -----------------------------
 @app.get("/edit-test-category/{test_id}", response_class=HTMLResponse)
 def edit_test_category_page(test_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT test_name, price, department, specimen, notes, col_alignments, test_code FROM tests WHERE id = ?", (test_id,))
     test = cursor.fetchone()
@@ -3500,7 +3466,7 @@ def update_test_category(
     width_unit: float = Form(14), width_ref: float = Form(27)
 ):
     alignments = f"{align_inv},{align_res},{align_flag},{align_unit},{align_ref},{width_inv},{width_res},{width_flag},{width_unit},{width_ref}"
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE tests 
@@ -3518,7 +3484,7 @@ def update_test_category(
 # -----------------------------
 @app.get("/manage-ranges/{param_id}", response_class=HTMLResponse)
 def manage_ranges(param_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -3691,7 +3657,7 @@ def add_range(
     if gender not in ("Male", "Female", "Both"):
         gender = "Both"
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO param_ref_ranges (param_id, gender, age_from_days, age_to_days, low, high)
@@ -3705,7 +3671,7 @@ def add_range(
 
 @app.get("/delete-range/{range_id}")
 def delete_range(range_id: int, param_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM param_ref_ranges WHERE id = ?", (range_id,))
     conn.commit()
@@ -3716,8 +3682,7 @@ def delete_range(range_id: int, param_id: int):
 
 @app.get("/select-patient", response_class=HTMLResponse)
 def select_patient(search: str = "", selected_patient_id: int = None):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     if search:
@@ -3825,7 +3790,7 @@ def enter_results_compat(patient_id: Optional[int] = None, test_id: Optional[int
 # -------------------------------------------------------------
 @app.post("/reset-test-results/{patient_id}/{test_id}")
 async def reset_test_results(patient_id: int, test_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # ඩේටාබේස් එකෙන් අදාළ ටෙස්ට් එකේ පරාමිතීන් සහ රිසාල්ට් මකා දමා අන්ලොක් කිරීම
@@ -3840,8 +3805,7 @@ async def reset_test_results(patient_id: int, test_id: int):
 
 @app.get("/test-entry/{patient_id}/{test_id}", response_class=HTMLResponse)
 def test_entry_page(patient_id: int, test_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row 
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     # Fetch patient details
@@ -4140,7 +4104,7 @@ def test_entry_page(patient_id: int, test_id: int):
 # -------------------------------------------------------------
 @app.post("/update-patient-info/{patient_id}")
 def update_patient_info(patient_id: int, patient_title: str = Form(...), patient_name: str = Form(...), patient_phone: str = Form(None), patient_doctor: str = Form(None), patient_age: str = Form(None), patient_center: str = Form(None), patient_gender: str = Form(None), test_id: int = Form(None)):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -4164,8 +4128,7 @@ def update_patient_info(patient_id: int, patient_title: str = Form(...), patient
 @app.post("/save-specific-test/{patient_id}/{test_id}")
 async def save_specific_test(patient_id: int, test_id: int, request: Request):
     form_data = await request.form()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN saved_at TEXT")
@@ -4219,7 +4182,6 @@ async def save_specific_test(patient_id: int, test_id: int, request: Request):
 
 
 
-import sqlite3
 from typing import Optional
 from fastapi import Request, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -4229,8 +4191,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 # -------------------------------------------------------------
 @app.get("/patient-results/{patient_id}", response_class=HTMLResponse)
 def patient_results(request: Request, patient_id: int, updated: Optional[str] = Query(None)):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Ensure required tables and 'comment' column exist safely
@@ -4600,7 +4561,7 @@ async def update_patient_details(request: Request):
         doctor = form_data.get("doctor")
         center = form_data.get("center")
         
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         # Update patients table based on standard column names
@@ -4629,8 +4590,7 @@ async def save_test_results(request: Request):
             return HTMLResponse("<h3>Patient ID missing!</h3>", status_code=400)
         patient_id = int(patient_id)
         
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -4734,7 +4694,7 @@ def print_report_with_test(patient_id: int, test_id: int):
 # Compatibility route: old save buttons can open the first assigned test report.
 @app.get("/print-report/{patient_id}", response_class=HTMLResponse)
 def print_report(patient_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT test_id FROM patient_assigned_tests
@@ -4796,8 +4756,7 @@ def report_letterhead_preview(patient_id: int, test_id: int, request: Request):
 
 @app.get("/report-view/{patient_id}/{test_id}", response_class=HTMLResponse)
 def report_view(patient_id: int, test_id: int, request: Request, letterhead: int = 1):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     # Base URL for static images (Fixes 404 Not Found error for letterhead & signature)
