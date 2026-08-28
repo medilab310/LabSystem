@@ -1,14 +1,6 @@
-import sqlite3 as stdlib_sqlite
-from sqlite3 import Row
-import libsql_experimental as sqlite3
-
-# Patch missing standard sqlite3 attributes & exceptions into libsql_experimental
-sqlite3.Row = Row
-sqlite3.OperationalError = stdlib_sqlite.OperationalError
-sqlite3.IntegrityError = stdlib_sqlite.IntegrityError
-sqlite3.Error = stdlib_sqlite.Error
-sqlite3.DatabaseError = stdlib_sqlite.DatabaseError
+import sqlite3
 import os
+import shutil
 import re
 import html
 from datetime import datetime
@@ -20,14 +12,37 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 from contextlib import asynccontextmanager
 
-# Turso Cloud Database Credentials
-TURSO_DB_URL = os.getenv("TURSO_DB_URL", "libsql://lab-system-medilab310.aws-ap-south-1.turso.io")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODc5NDM5NTksImlkIjoiMDFhMDQ5YzEtMzIwMS03ZmMxLWI3YzQtZTFmMWUyMjg3M2I4Iiwia2lkIjoiRXQtY2FBZ2lvdi1lVUFpek5OWm11QUhOUW84bk01Z25WdmF6MnZ3azNIcyIsInJpZCI6ImUwMDU5NWYyLTNkYjAtNGQ3Yi1hZjhjLTQ4ODNhNzUxYzc4MSJ9.Z2ThLbkhOxlDqEGEIGF0TDP7-fE8lpqsWRBh-WqPbSEAT788xlaExpQG2gRPhPCAJByGWJSapzR1O0Wfs6IYDw")
+# -------------------------------------------------------------
+# Database Configuration (standard sqlite3, Vercel-safe)
+# -------------------------------------------------------------
+# Vercel's deployment filesystem is read-only everywhere except /tmp, and
+# /tmp itself is ephemeral (wiped between cold starts / separate function
+# instances - there's no guarantee two requests hit the same instance).
+# The repo ships a seed lab_system.db next to this file; on startup we
+# copy that seed into /tmp (once) and do ALL reads/writes against the
+# /tmp copy from then on, since that's the only writable location.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SEED_DB_PATH = os.path.join(BASE_DIR, "lab_system.db")
+DB_PATH = os.path.join("/tmp", "lab_system.db")
+
+
+def _ensure_db_copied():
+    """Copy the bundled lab_system.db into /tmp the first time this
+    instance runs. If no seed db is bundled in the repo, sqlite3.connect()
+    below will simply create a fresh empty one at DB_PATH and init_db()
+    will build the schema into it."""
+    if not os.path.exists(DB_PATH) and os.path.exists(SEED_DB_PATH):
+        try:
+            shutil.copyfile(SEED_DB_PATH, DB_PATH)
+        except OSError:
+            pass
+
 
 def get_db_connection():
-    """Turso Cloud Database එකට Connection එක ලබා දෙන ශ්‍රිතය"""
-    conn = sqlite3.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
-    conn.row_factory = Row
+    """Returns a connection to the writable /tmp copy of the SQLite DB."""
+    _ensure_db_copied()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
 
 @asynccontextmanager
@@ -39,7 +54,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Static files folder configuration
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Guarded: Vercel's deployment root is read-only, so os.makedirs() can
+# raise there. We swallow that, and only mount /static if a directory
+# actually ends up existing (e.g. bundled in the repo already) - this
+# is what stops static file setup from crashing app startup on Vercel.
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 if not os.path.isdir(STATIC_DIR):
@@ -47,6 +65,7 @@ if not os.path.isdir(STATIC_DIR):
         os.makedirs(STATIC_DIR, exist_ok=True)
     except OSError:
         pass
+
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     
