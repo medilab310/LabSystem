@@ -24,11 +24,145 @@ from contextlib import asynccontextmanager
 TURSO_DB_URL = os.getenv("TURSO_DB_URL", "libsql://lab-system-medilab310.aws-ap-south-1.turso.io")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODc5NDM5NTksImlkIjoiMDFhMDQ5YzEtMzIwMS03ZmMxLWI3YzQtZTFmMWUyMjg3M2I4Iiwia2lkIjoiRXQtY2FBZ2lvdi1lVUFpek5OWm11QUhOUW84bk01Z25WdmF6MnZ3azNIcyIsInJpZCI6ImUwMDU5NWYyLTNkYjAtNGQ3Yi1hZjhjLTQ4ODNhNzUxYzc4MSJ9.Z2ThLbkhOxlDqEGEIGF0TDP7-fE8lpqsWRBh-WqPbSEAT788xlaExpQG2gRPhPCAJByGWJSapzR1O0Wfs6IYDw")
 
+class LibsqlRow:
+    """
+    Drop-in replacement for sqlite3.Row when working with libsql_experimental.
+
+    libsql_experimental's `builtins.Connection` object does not support
+    `conn.row_factory = ...` (it raises AttributeError, since the Rust/PyO3
+    connection object doesn't allow arbitrary attribute assignment). Its
+    cursors instead always return raw tuples from fetchone()/fetchall().
+
+    This class wraps a raw tuple together with the column names taken from
+    `cursor.description`, so existing code that does `row["col"]`,
+    `row[0]`, `dict(row)`, `"col" in row.keys()`, or `for v in row` keeps
+    working exactly as it did with sqlite3.Row.
+    """
+    __slots__ = ("_data", "_columns")
+
+    def __init__(self, columns, data):
+        self._columns = columns
+        self._data = data
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            try:
+                idx = self._columns.index(key)
+            except ValueError:
+                raise KeyError(key)
+            return self._data[idx]
+        return self._data[key]
+
+    def keys(self):
+        return list(self._columns)
+
+    def __contains__(self, key):
+        return key in self._columns
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, LibsqlRow):
+            return self._data == other._data
+        return self._data == other
+
+    def __repr__(self):
+        return f"<LibsqlRow {dict(zip(self._columns, self._data))!r}>"
+
+
+class _TursoCursorWrapper:
+    """
+    Wraps a raw libsql_experimental cursor so that fetchone()/fetchall()/
+    fetchmany() return LibsqlRow objects (built from cursor.description)
+    instead of plain tuples - mirroring sqlite3's Row-based access without
+    needing (the unsupported) conn.row_factory.
+
+    Anything not explicitly overridden here (execute, executemany,
+    description, lastrowid, rowcount, close, ...) is transparently
+    delegated to the underlying raw cursor.
+    """
+
+    def __init__(self, raw_cursor):
+        self._raw_cursor = raw_cursor
+
+    def _columns(self):
+        desc = self._raw_cursor.description
+        return [d[0] for d in desc] if desc else []
+
+    def execute(self, *args, **kwargs):
+        self._raw_cursor.execute(*args, **kwargs)
+        return self
+
+    def executemany(self, *args, **kwargs):
+        self._raw_cursor.executemany(*args, **kwargs)
+        return self
+
+    def executescript(self, *args, **kwargs):
+        self._raw_cursor.executescript(*args, **kwargs)
+        return self
+
+    def fetchone(self):
+        row = self._raw_cursor.fetchone()
+        if row is None:
+            return None
+        return LibsqlRow(self._columns(), row)
+
+    def fetchall(self):
+        columns = self._columns()
+        return [LibsqlRow(columns, r) for r in self._raw_cursor.fetchall()]
+
+    def fetchmany(self, size=None):
+        columns = self._columns()
+        rows = self._raw_cursor.fetchmany(size) if size is not None else self._raw_cursor.fetchmany()
+        return [LibsqlRow(columns, r) for r in rows]
+
+    def __iter__(self):
+        columns = self._columns()
+        for row in self._raw_cursor:
+            yield LibsqlRow(columns, row)
+
+    def __getattr__(self, name):
+        # Delegates description, lastrowid, rowcount, close, connection, etc.
+        return getattr(self._raw_cursor, name)
+
+
+class _TursoConnectionWrapper:
+    """
+    Thin wrapper around the raw libsql_experimental connection.
+
+    We can't set attributes (like row_factory) directly on the raw
+    connection object, so instead we intercept cursor() to hand back a
+    _TursoCursorWrapper that produces dict/index-accessible rows.
+    Everything else (commit, close, execute, etc.) passes straight through.
+    """
+
+    def __init__(self, raw_conn):
+        self._raw_conn = raw_conn
+
+    def cursor(self):
+        return _TursoCursorWrapper(self._raw_conn.cursor())
+
+    def execute(self, *args, **kwargs):
+        # Support the (rarely used) conn.execute(...) shortcut too.
+        return self.cursor().execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        # Delegates commit, close, rollback, etc.
+        return getattr(self._raw_conn, name)
+
+
 def get_db_connection():
     """Turso Cloud Database එකට Connection එක ලබා දෙන ශ්‍රිතය"""
-    conn = sqlite3.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
-    conn.row_factory = Row
-    return conn
+    raw_conn = sqlite3.connect(f"{TURSO_DB_URL}?auth_token={TURSO_AUTH_TOKEN}")
+    # NOTE: libsql_experimental's connection object does NOT support
+    # `conn.row_factory = Row` (raises AttributeError). We wrap the
+    # connection/cursor instead so `row["col"]`, `row[0]`, and `dict(row)`
+    # all keep working across every endpoint and init_db() query.
+    return _TursoConnectionWrapper(raw_conn)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
