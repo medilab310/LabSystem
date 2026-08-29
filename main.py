@@ -1,6 +1,6 @@
-import sqlite3
+import sqlite3 as stdlib_sqlite
+import libsql
 import os
-import shutil
 import re
 import html
 from datetime import datetime
@@ -12,38 +12,178 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 from contextlib import asynccontextmanager
 
+# We keep the local name `sqlite3` bound to the `libsql` module so every
+# `sqlite3.execute(...)`, `sqlite3.OperationalError`, etc. reference already
+# in this file keeps working unchanged.
+sqlite3 = libsql
+
+# IMPORTANT, found by testing directly against a live libsql connection:
+# libsql does NOT raise sqlite3.OperationalError / IntegrityError like
+# stdlib SQLite does - it raises a plain ValueError for everything
+# (duplicate columns, UNIQUE violations, missing tables, syntax errors,
+# all of it). This file has ~19 `except sqlite3.OperationalError` /
+# `except sqlite3.IntegrityError` guards (idempotent ALTER TABLE ADD
+# COLUMN calls, duplicate-insert guards) that would silently stop
+# catching anything under real Turso traffic if we didn't account for
+# this. Pointing all three names at the same ValueError class means
+# every existing `except sqlite3.OperationalError` / `except
+# sqlite3.IntegrityError` / `except sqlite3.Error` in this file keeps
+# catching exactly what libsql actually throws, with zero call-site
+# changes needed anywhere else in the file.
+sqlite3.OperationalError = ValueError
+sqlite3.IntegrityError = ValueError
+sqlite3.Error = ValueError
+sqlite3.DatabaseError = ValueError
+
 # -------------------------------------------------------------
-# Database Configuration (standard sqlite3, Vercel-safe)
+# Turso Cloud Database Configuration
 # -------------------------------------------------------------
-# Vercel's deployment filesystem is read-only everywhere except /tmp, and
-# /tmp itself is ephemeral (wiped between cold starts / separate function
-# instances - there's no guarantee two requests hit the same instance).
-# The repo ships a seed lab_system.db next to this file; on startup we
-# copy that seed into /tmp (once) and do ALL reads/writes against the
-# /tmp copy from then on, since that's the only writable location.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SEED_DB_PATH = os.path.join(BASE_DIR, "lab_system.db")
-DB_PATH = os.path.join("/tmp", "lab_system.db")
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
+if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
+    raise RuntimeError(
+        "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must both be set as "
+        "environment variables (you've set these in Vercel already - "
+        "this only fires if they're missing locally, e.g. forgetting to "
+        "`vercel env pull` or export them before running uvicorn)."
+    )
 
 
-def _ensure_db_copied():
-    """Copy the bundled lab_system.db into /tmp the first time this
-    instance runs. If no seed db is bundled in the repo, sqlite3.connect()
-    below will simply create a fresh empty one at DB_PATH and init_db()
-    will build the schema into it."""
-    if not os.path.exists(DB_PATH) and os.path.exists(SEED_DB_PATH):
-        try:
-            shutil.copyfile(SEED_DB_PATH, DB_PATH)
-        except OSError:
-            pass
+class LibsqlRow:
+    """
+    Drop-in replacement for sqlite3.Row when working with the libsql
+    client. libsql's Connection object (a Rust/PyO3 object) does not
+    support `conn.row_factory = ...` - it raises AttributeError, since
+    the underlying object doesn't allow arbitrary attribute assignment.
+    Its cursors instead return raw tuples from fetchone()/fetchall().
+
+    This class wraps a raw tuple together with the column names taken
+    from cursor.description, so existing code that does `row["col"]`,
+    `row[0]`, `dict(row)`, `"col" in row.keys()`, or `for v in row` keeps
+    working exactly as it did with sqlite3.Row.
+    """
+    __slots__ = ("_data", "_columns")
+
+    def __init__(self, columns, data):
+        self._columns = columns
+        self._data = data
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            try:
+                idx = self._columns.index(key)
+            except ValueError:
+                raise KeyError(key)
+            return self._data[idx]
+        return self._data[key]
+
+    def keys(self):
+        return list(self._columns)
+
+    def __contains__(self, key):
+        return key in self._columns
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, LibsqlRow):
+            return self._data == other._data
+        return self._data == other
+
+    def __repr__(self):
+        return f"<LibsqlRow {dict(zip(self._columns, self._data))!r}>"
+
+
+class _TursoCursorWrapper:
+    """
+    Wraps a raw libsql cursor so fetchone()/fetchall()/fetchmany() return
+    LibsqlRow objects (built from cursor.description) instead of plain
+    tuples - mirroring sqlite3's Row-based access without needing the
+    unsupported conn.row_factory. Everything else (execute, executemany,
+    description, lastrowid, rowcount, close, ...) is delegated straight
+    through to the underlying raw cursor.
+    """
+
+    def __init__(self, raw_cursor):
+        self._raw_cursor = raw_cursor
+
+    def _columns(self):
+        desc = self._raw_cursor.description
+        return [d[0] for d in desc] if desc else []
+
+    def execute(self, *args, **kwargs):
+        self._raw_cursor.execute(*args, **kwargs)
+        return self
+
+    def executemany(self, *args, **kwargs):
+        self._raw_cursor.executemany(*args, **kwargs)
+        return self
+
+    def executescript(self, *args, **kwargs):
+        self._raw_cursor.executescript(*args, **kwargs)
+        return self
+
+    def fetchone(self):
+        row = self._raw_cursor.fetchone()
+        if row is None:
+            return None
+        return LibsqlRow(self._columns(), row)
+
+    def fetchall(self):
+        columns = self._columns()
+        return [LibsqlRow(columns, r) for r in self._raw_cursor.fetchall()]
+
+    def fetchmany(self, size=None):
+        columns = self._columns()
+        rows = self._raw_cursor.fetchmany(size) if size is not None else self._raw_cursor.fetchmany()
+        return [LibsqlRow(columns, r) for r in rows]
+
+    def __iter__(self):
+        columns = self._columns()
+        for row in self._raw_cursor:
+            yield LibsqlRow(columns, row)
+
+    def __getattr__(self, name):
+        return getattr(self._raw_cursor, name)
+
+
+class _TursoConnectionWrapper:
+    """
+    Thin wrapper around the raw libsql connection. We can't set attributes
+    (like row_factory) directly on the raw connection object, so instead
+    we intercept cursor() to hand back a _TursoCursorWrapper that produces
+    dict/index-accessible rows. Everything else (commit, close, execute,
+    etc.) passes straight through.
+    """
+
+    def __init__(self, raw_conn):
+        self._raw_conn = raw_conn
+
+    def cursor(self):
+        return _TursoCursorWrapper(self._raw_conn.cursor())
+
+    def execute(self, *args, **kwargs):
+        return self.cursor().execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._raw_conn, name)
 
 
 def get_db_connection():
-    """Returns a connection to the writable /tmp copy of the SQLite DB."""
-    _ensure_db_copied()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """
+    Returns a connection to the Turso Cloud database. Connects fresh over
+    HTTP/Hrana on every call (no local file, no embedded replica/sync_url)
+    - this is the correct pattern for Vercel serverless functions, since
+    a replica file wouldn't survive between invocations anyway and would
+    just add a sync cost on every cold start for no benefit.
+    """
+    raw_conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+    return _TursoConnectionWrapper(raw_conn)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -54,6 +194,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Static files folder configuration
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Guarded: Vercel's deployment root is read-only, so os.makedirs() can
 # raise there. We swallow that, and only mount /static if a directory
 # actually ends up existing (e.g. bundled in the repo already) - this
