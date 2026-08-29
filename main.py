@@ -2089,89 +2089,181 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
 # -------------------------------------------------------------
 # 2. PATIENTS LIST DASHBOARD (Smart UI + Fully Fixed Backend)
 # -------------------------------------------------------------
+
+# Cached once per warm process (same pattern as _CACHED_TURSO_CONNECTION
+# above). These PRAGMA/ALTER schema checks used to run on EVERY request
+# to this route - each one its own network round trip to Turso - even
+# though the schema they check only ever changes once, right after a
+# cold start. Checking it once per process instead of once per page
+# load removes 2 extra round trips from every single dashboard request.
+_PATIENTS_DASHBOARD_SCHEMA_READY = False
+_PATIENTS_DASHBOARD_TEST_CODE_COL = None
+_PATIENTS_DASHBOARD_SCHEMA_LOCK = threading.Lock()
+
+# How many patients are shown per page. Kept as a module constant so it
+# is easy to tune (25-50 is the sweet spot: enough to be useful, small
+# enough that the batch queries below stay fast).
+PATIENTS_DASHBOARD_PAGE_SIZE = 25
+
+
+def _ensure_patients_dashboard_schema(conn, cursor):
+    """One-time (per warm process) schema check/migration for the
+    patients-dashboard route. Returns the column on `tests` to display
+    as the "test code" (test_code / code / short_name / name / id,
+    whichever exists first)."""
+    global _PATIENTS_DASHBOARD_SCHEMA_READY, _PATIENTS_DASHBOARD_TEST_CODE_COL
+    if _PATIENTS_DASHBOARD_SCHEMA_READY:
+        return _PATIENTS_DASHBOARD_TEST_CODE_COL
+
+    with _PATIENTS_DASHBOARD_SCHEMA_LOCK:
+        if _PATIENTS_DASHBOARD_SCHEMA_READY:
+            return _PATIENTS_DASHBOARD_TEST_CODE_COL
+
+        cursor.execute("PRAGMA table_info(patient_assigned_tests);")
+        columns = [col[1] for col in cursor.fetchall()]
+        if not columns:
+            cursor.execute("CREATE TABLE patient_assigned_tests (patient_id INTEGER, test_id INTEGER, result TEXT)")
+            conn.commit()
+        elif "result" not in columns:
+            cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN result TEXT;")
+            conn.commit()
+
+        cursor.execute("PRAGMA table_info(tests);")
+        test_cols = [col[1] for col in cursor.fetchall()]
+        test_code_col = "id"
+        for col_candidate in ["test_code", "code", "short_name", "name"]:
+            if col_candidate in test_cols:
+                test_code_col = col_candidate
+                break
+
+        _PATIENTS_DASHBOARD_TEST_CODE_COL = test_code_col
+        _PATIENTS_DASHBOARD_SCHEMA_READY = True
+        return test_code_col
+
+
 @app.get("/patients-dashboard", response_class=HTMLResponse)
 def patients_dashboard(
     request: Request,
     search: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None)
+    end_date: Optional[str] = Query(None),
+    page: int = Query(1, ge=1)
 ):
-    import re
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Tables check
-    cursor.execute("PRAGMA table_info(patient_assigned_tests);")
-    columns = [col[1] for col in cursor.fetchall()]
-    if not columns:
-        cursor.execute("CREATE TABLE patient_assigned_tests (patient_id INTEGER, test_id INTEGER, result TEXT)")
-        conn.commit()
-    elif "result" not in columns:
-        cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN result TEXT;")
-        conn.commit()
 
-    cursor.execute("PRAGMA table_info(tests);")
-    test_cols = [col[1] for col in cursor.fetchall()]
-    test_code_col = "id"
-    for col_candidate in ["test_code", "code", "short_name", "name"]:
-        if col_candidate in test_cols:
-            test_code_col = col_candidate
-            break
+    test_code_col = _ensure_patients_dashboard_schema(conn, cursor)
 
-    query = "SELECT id, title, name, created_at FROM patients WHERE 1=1"
-    params = []
+    # Shared WHERE clause, built once and reused for both the COUNT
+    # query (for pagination) and the actual page fetch, so the two
+    # never drift out of sync with each other.
+    where_sql = "WHERE 1=1"
+    where_params = []
 
     if search and search.strip():
         search_term = f"%{search.strip()}%"
-        query += " AND (CAST(id AS TEXT) LIKE ? OR name LIKE ?)"
-        params.extend([search_term, search_term])
+        where_sql += " AND (CAST(id AS TEXT) LIKE ? OR name LIKE ?)"
+        where_params.extend([search_term, search_term])
 
     if start_date and start_date.strip():
-        query += " AND DATE(created_at) >= ?"
-        params.append(start_date.strip())
+        where_sql += " AND DATE(created_at) >= ?"
+        where_params.append(start_date.strip())
 
     if end_date and end_date.strip():
-        query += " AND DATE(created_at) <= ?"
-        params.append(end_date.strip())
+        where_sql += " AND DATE(created_at) <= ?"
+        where_params.append(end_date.strip())
 
-    query += " ORDER BY id DESC LIMIT 100"
-    cursor.execute(query, params)
+    # 1. Total matching patients (for the pager) - a single lightweight
+    # COUNT(*), never the full row set.
+    cursor.execute(f"SELECT COUNT(*) FROM patients {where_sql}", where_params)
+    total_patients = cursor.fetchone()[0] or 0
+
+    page_size = PATIENTS_DASHBOARD_PAGE_SIZE
+    total_pages = max(1, (total_patients + page_size - 1) // page_size)
+    page = min(max(1, page), total_pages)
+    offset = (page - 1) * page_size
+
+    # 2. Only the current page of patients, and only the columns the
+    # table actually renders (id, title, name, created_at) - not the
+    # entire patients row, and not the entire patient history.
+    query = f"""
+        SELECT id, title, name, created_at
+        FROM patients
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+    """
+    cursor.execute(query, where_params + [page_size, offset])
     patients = cursor.fetchall()
+
+    patient_ids = [pat["id"] for pat in patients]
+
+    # 3. Batch-fetch assigned test codes and verified/pending status for
+    # just this page of patients, in a fixed handful of queries.
+    #
+    # ROOT CAUSE of the 7+ second load: the old version ran a per-patient
+    # loop that fired 3 extra queries for EVERY row on the page (assigned
+    # test codes, assigned-test results, parameter results) - each query
+    # is a full network round trip to Turso, not a local disk read. With
+    # up to 100 patients on screen that was 100 x 3 = 300+ round trips on
+    # a single page load. Below, the whole page's data is fetched with
+    # 3 queries total (regardless of how many patients are on the page),
+    # using WHERE patient_id IN (...) plus in-memory grouping.
+    tests_by_patient = {}
+    verified_patient_ids = set()
+
+    if patient_ids:
+        placeholders = ",".join("?" for _ in patient_ids)
+
+        cursor.execute(f"""
+            SELECT pat.patient_id as patient_id, t.{test_code_col} as test_code
+            FROM patient_assigned_tests pat
+            LEFT JOIN tests t ON pat.test_id = t.id
+            WHERE pat.patient_id IN ({placeholders})
+        """, patient_ids)
+        for row in cursor.fetchall():
+            if row["test_code"]:
+                tests_by_patient.setdefault(row["patient_id"], []).append(str(row["test_code"]))
+
+        cursor.execute(f"""
+            SELECT patient_id, result
+            FROM patient_assigned_tests
+            WHERE patient_id IN ({placeholders})
+        """, patient_ids)
+        for row in cursor.fetchall():
+            p_id_row = row["patient_id"]
+            if p_id_row in verified_patient_ids:
+                continue
+            res_val = str(row["result"] or "")
+            clean_text = re.sub(r'<[^>]*>', '', res_val).replace('&nbsp;', '').strip()
+            if clean_text and clean_text.lower() != "none" and clean_text not in ["", "<p></p>", "<p><br></p>"]:
+                verified_patient_ids.add(p_id_row)
+
+        cursor.execute(f"""
+            SELECT DISTINCT patient_id
+            FROM patient_parameter_results
+            WHERE patient_id IN ({placeholders})
+              AND result_value IS NOT NULL AND TRIM(result_value) != ''
+        """, patient_ids)
+        for row in cursor.fetchall():
+            verified_patient_ids.add(row["patient_id"])
 
     table_rows_html = ""
     for pat in patients:
         p_id = pat["id"]
         ref_no = f"#{p_id}"
-        
+
         title_val = pat["title"] if "title" in pat.keys() and pat["title"] else ""
         name_val = pat["name"] if "name" in pat.keys() and pat["name"] else ""
         patient_name = f"{title_val} {name_val}".strip()
-        
+
         created_at_raw = pat["created_at"] if "created_at" in pat.keys() and pat["created_at"] else ""
         date_str = str(created_at_raw).split()[0] if created_at_raw else "N/A"
 
-        # Assigned tests
-        cursor.execute(f"SELECT t.{test_code_col} as test_code FROM patient_assigned_tests pat LEFT JOIN tests t ON pat.test_id = t.id WHERE pat.patient_id = ?", (p_id,))
-        test_codes_list = [str(t_row["test_code"]) for t_row in cursor.fetchall() if t_row["test_code"]]
+        test_codes_list = tests_by_patient.get(p_id, [])
         tests_display = ", ".join(test_codes_list) if test_codes_list else '<span style="color: #94a3b8; font-style: italic;">No tests</span>'
 
-        has_any_result = False
-        
-        # Check Assigned Tests table
-        cursor.execute("SELECT result FROM patient_assigned_tests WHERE patient_id = ?", (p_id,))
-        for r_row in cursor.fetchall():
-            res_val = str(r_row["result"] or "")
-            clean_text = re.sub(r'<[^>]*>', '', res_val).replace('&nbsp;', '').strip()
-            if clean_text and clean_text.lower() != "none" and clean_text not in ["", "<p></p>", "<p><br></p>"]:
-                has_any_result = True
-                break
-        
-        # Check Parameter Results table
-        if not has_any_result:
-            cursor.execute("SELECT count(*) FROM patient_parameter_results WHERE patient_id = ? AND result_value IS NOT NULL AND TRIM(result_value) != ''", (p_id,))
-            if cursor.fetchone()[0] > 0:
-                has_any_result = True
-
+        has_any_result = p_id in verified_patient_ids
         status_badge = '<span style="background: #27ae60; color: white; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold;">✓ Verified</span>' if has_any_result else '<span style="background: #e74c3c; color: white; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold;">⏳ Pending</span>'
 
         table_rows_html += f"""
@@ -2195,6 +2287,36 @@ def patients_dashboard(
         """
 
     conn.close()
+
+    # Prev/Next pagination controls, preserving the current search/date
+    # filters in the querystring so paging never loses the active filter.
+    def _page_url(target_page):
+        qs = [f"page={target_page}"]
+        if search:
+            qs.append(f"search={quote(search)}")
+        if start_date:
+            qs.append(f"start_date={quote(start_date)}")
+        if end_date:
+            qs.append(f"end_date={quote(end_date)}")
+        return "/patients-dashboard?" + "&".join(qs)
+
+    prev_disabled = "pointer-events:none; opacity:0.4;" if page <= 1 else ""
+    next_disabled = "pointer-events:none; opacity:0.4;" if page >= total_pages else ""
+    range_start = (offset + 1) if total_patients else 0
+    range_end = min(offset + page_size, total_patients)
+
+    pagination_html = f"""
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:16px; flex-wrap:wrap; gap:10px;">
+        <span style="font-size:12.5px; color:#64748b;">
+            Showing {range_start}-{range_end} of {total_patients} patients &nbsp;|&nbsp; Page {page} of {total_pages}
+        </span>
+        <div style="display:flex; gap:8px;">
+            <a href="{_page_url(page - 1)}" style="{prev_disabled} background:#e2e8f0; color:#334155; padding:8px 16px; border-radius:6px; text-decoration:none; font-weight:bold; font-size:13px;">&larr; Previous</a>
+            <a href="{_page_url(page + 1)}" style="{next_disabled} background:#0f4c81; color:white; padding:8px 16px; border-radius:6px; text-decoration:none; font-weight:bold; font-size:13px;">Next &rarr;</a>
+        </div>
+    </div>
+    """
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -2253,6 +2375,8 @@ def patients_dashboard(
                     {table_rows_html}
                 </tbody>
             </table>
+
+            {pagination_html}
         </div>
     </body>
     </html>"""
