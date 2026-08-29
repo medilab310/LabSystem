@@ -161,48 +161,66 @@ class _TursoCursorWrapper:
         return [d[0] for d in desc] if desc else []
 
     def execute(self, *args, **kwargs):
-        try:
-            self._raw_cursor.execute(*args, **kwargs)
-        except Exception:
-            # Don't leave a broken connection cached for every future
-            # request to keep failing against. Drop it so the next
-            # get_db_connection() call creates a fresh one. We deliberately
-            # do NOT retry the write right here - silently re-issuing an
-            # INSERT/UPDATE after an ambiguous network failure risks
-            # executing it twice, which is worse than surfacing this one
-            # error to the caller (existing except sqlite3.OperationalError
-            # / IntegrityError handling elsewhere in this file still works
-            # unchanged, since we re-raise the exact original exception).
-            _reset_db_connection()
-            raise
+        # Serialized against every other statement in the app (see
+        # _CONNECTION_LOCK): FastAPI runs sync routes in a thread pool, so
+        # without this, two concurrent requests could issue raw execute()
+        # calls against the same shared libsql connection at the same
+        # instant. The lock is only held for this one call, never across
+        # calls, so it cannot deadlock a request that forgets to release
+        # anything - it just guarantees no two statements ever hit the
+        # underlying connection at the exact same moment.
+        with _CONNECTION_LOCK:
+            try:
+                self._raw_cursor.execute(*args, **kwargs)
+            except Exception:
+                # Don't leave a broken connection cached for every future
+                # request to keep failing against. Drop it so the next
+                # get_db_connection() call creates a fresh one. We deliberately
+                # do NOT retry the write right here - silently re-issuing an
+                # INSERT/UPDATE after an ambiguous network failure risks
+                # executing it twice, which is worse than surfacing this one
+                # error to the caller (existing except sqlite3.OperationalError
+                # / IntegrityError handling elsewhere in this file still works
+                # unchanged, since we re-raise the exact original exception).
+                _reset_db_connection()
+                raise
         return self
 
     def executemany(self, *args, **kwargs):
-        self._raw_cursor.executemany(*args, **kwargs)
+        with _CONNECTION_LOCK:
+            self._raw_cursor.executemany(*args, **kwargs)
         return self
 
     def executescript(self, *args, **kwargs):
-        self._raw_cursor.executescript(*args, **kwargs)
+        with _CONNECTION_LOCK:
+            self._raw_cursor.executescript(*args, **kwargs)
         return self
 
     def fetchone(self):
-        row = self._raw_cursor.fetchone()
+        with _CONNECTION_LOCK:
+            row = self._raw_cursor.fetchone()
+            columns = self._columns()
         if row is None:
             return None
-        return LibsqlRow(self._columns(), row)
+        return LibsqlRow(columns, row)
 
     def fetchall(self):
-        columns = self._columns()
-        return [LibsqlRow(columns, r) for r in self._raw_cursor.fetchall()]
+        with _CONNECTION_LOCK:
+            columns = self._columns()
+            raw_rows = self._raw_cursor.fetchall()
+        return [LibsqlRow(columns, r) for r in raw_rows]
 
     def fetchmany(self, size=None):
-        columns = self._columns()
-        rows = self._raw_cursor.fetchmany(size) if size is not None else self._raw_cursor.fetchmany()
-        return [LibsqlRow(columns, r) for r in rows]
+        with _CONNECTION_LOCK:
+            columns = self._columns()
+            raw_rows = self._raw_cursor.fetchmany(size) if size is not None else self._raw_cursor.fetchmany()
+        return [LibsqlRow(columns, r) for r in raw_rows]
 
     def __iter__(self):
-        columns = self._columns()
-        for row in self._raw_cursor:
+        with _CONNECTION_LOCK:
+            columns = self._columns()
+            raw_rows = list(self._raw_cursor)
+        for row in raw_rows:
             yield LibsqlRow(columns, row)
 
     def __getattr__(self, name):
@@ -240,6 +258,18 @@ class _TursoConnectionWrapper:
         # connection. Use _reset_db_connection() if you need to force a
         # genuine reconnect (e.g. after detecting the connection is bad).
         pass
+
+    def commit(self):
+        # Same reasoning as _TursoCursorWrapper.execute(): serialize this
+        # against every other statement/commit in the app so one thread's
+        # commit can never fire in the middle of another thread's
+        # not-yet-committed statements on the shared connection.
+        with _CONNECTION_LOCK:
+            self._raw_conn.commit()
+
+    def rollback(self):
+        with _CONNECTION_LOCK:
+            self._raw_conn.rollback()
 
     def __getattr__(self, name):
         return getattr(self._raw_conn, name)
@@ -1119,6 +1149,44 @@ def init_db():
             UNIQUE(patient_id, test_id, parameter_id)
         )
     """)
+
+    # Tombstone table for explicitly-deleted standard-test parameters.
+    #
+    # ROOT CAUSE of "deleted parameters come back": seed_standard_tests_
+    # and_parameters() runs on every cold start (Vercel spins up a fresh
+    # process regularly), and it works by checking "does a parameter with
+    # this name already exist for this test?" - if a user had deleted a
+    # standard parameter (e.g. "Monocytes" under FBC), the very next cold
+    # start saw it missing and silently re-inserted it. This table records
+    # every parameter a user explicitly deletes (by test_id + lower-cased
+    # name) so the seeder can check it and permanently skip re-adding
+    # anything a user chose to remove, while still being able to add
+    # genuinely new standard parameters in future app updates.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS deleted_standard_parameters (
+            test_id INTEGER NOT NULL,
+            param_name_lower TEXT NOT NULL,
+            deleted_at TEXT,
+            PRIMARY KEY (test_id, param_name_lower)
+        )
+    """)
+
+    # Compatibility migrations for tables/columns that used to only be
+    # created lazily inside individual routes (each costing a network
+    # round-trip to Turso on every single page load). Guaranteeing them
+    # here, once per cold start, means those per-route ALTER TABLE guards
+    # are now redundant and safe to skip on the hot paths that had them.
+    cursor.execute("PRAGMA table_info(tests)")
+    tests_columns = {row[1] for row in cursor.fetchall()}
+    if "notes" not in tests_columns:
+        cursor.execute("ALTER TABLE tests ADD COLUMN notes TEXT")
+    if "col_alignments" not in tests_columns:
+        cursor.execute("ALTER TABLE tests ADD COLUMN col_alignments TEXT")
+
+    if "result" not in assigned_columns:
+        cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN result TEXT")
+    if "comment" not in assigned_columns:
+        cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN comment TEXT")
 
     conn.commit()
     conn.close()
@@ -3187,6 +3255,15 @@ def seed_standard_tests_and_parameters():
                         """, (calc_key, param_id))
                     continue
 
+                # Respect an explicit user deletion: never resurrect a
+                # standard parameter the user removed via /delete-parameter.
+                cursor.execute(
+                    "SELECT 1 FROM deleted_standard_parameters WHERE test_id = ? AND param_name_lower = ? LIMIT 1",
+                    (test_id, p_name.strip().lower())
+                )
+                if cursor.fetchone():
+                    continue
+
                 cursor.execute("""
                     INSERT INTO test_parameters
                     (test_id, param_name, unit, ref_range, display_order, default_result,
@@ -3470,13 +3547,11 @@ def manage_test_parameters(test_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    try:
-        cursor.execute("ALTER TABLE test_parameters ADD COLUMN default_result TEXT")
-        cursor.execute("ALTER TABLE test_parameters ADD COLUMN input_type TEXT DEFAULT 'numeric'")
-        cursor.execute("ALTER TABLE test_parameters ADD COLUMN is_bold INTEGER DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # NOTE: default_result / input_type / is_bold used to be ALTER TABLE'd
+    # into existence on every single page view here (3 extra Turso round
+    # trips per visit). seed_standard_tests_and_parameters() now guarantees
+    # these columns exist once at process startup (see init_db/_ensure_column),
+    # so that redundant per-request migration has been removed.
 
     cursor.execute("SELECT test_name FROM tests WHERE id = ?", (test_id,))
     test = cursor.fetchone()
@@ -3779,12 +3854,28 @@ def delete_parameter(param_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Work out which test this parameter belongs to so we can redirect back to it.
-    cursor.execute("SELECT test_id FROM test_parameters WHERE id = ?", (param_id,))
+    # Work out which test this parameter belongs to (and its name, for the
+    # tombstone below) so we can redirect back to it.
+    cursor.execute("SELECT test_id, param_name FROM test_parameters WHERE id = ?", (param_id,))
     row = cursor.fetchone()
     test_id = row[0] if row else None
 
     if row:
+        param_name = row[1] or ""
+        # Tombstone this (test_id, name) pair permanently, so the standard-
+        # test seeder (which runs again on every cold start) never
+        # re-inserts it after the user explicitly deleted it. This is the
+        # actual fix for "deleted parameters still show up" - without this,
+        # a parameter that matches a seeded standard test's parameter list
+        # would silently reappear the next time the app cold-starts.
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO deleted_standard_parameters (test_id, param_name_lower, deleted_at) VALUES (?, ?, ?)",
+                (test_id, param_name.strip().lower(), now_colombo().isoformat())
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # Remove any age/gender reference-range rules tied to this parameter.
         cursor.execute("DELETE FROM param_ref_ranges WHERE param_id = ?", (param_id,))
 
@@ -3812,16 +3903,23 @@ async def update_param_orders(request: Request):
     'Manage Parameters' page (the form referenced by manage_test_parameters).
     """
     form_data = await request.form()
-    test_id = form_data.get("test_id")
+    test_id_raw = form_data.get("test_id")
+    # Bind a real int (not the raw form string) for every test_id
+    # comparison below, removing any ambiguity about how the underlying
+    # driver compares a TEXT-typed bound parameter against an INTEGER
+    # column. test_id keeps its original (possibly-None/invalid) form
+    # so the existing "if test_id" fallbacks below still behave the same.
+    try:
+        test_id = int(test_id_raw)
+    except (TypeError, ValueError):
+        test_id = None
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    try:
-        cursor.execute("ALTER TABLE test_parameters ADD COLUMN is_bold INTEGER DEFAULT 0")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # NOTE: is_bold is now guaranteed to exist by
+    # seed_standard_tests_and_parameters() at process startup, so the
+    # per-request ALTER TABLE that used to live here has been removed.
 
     # Rebuild the order deterministically.  The old implementation accepted
     # duplicate order numbers (e.g. 1,1,2,3), so SQLite could still return
