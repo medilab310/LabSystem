@@ -555,6 +555,7 @@ def login_page(error: str = ""):
         <style>
             body {{ font-family: Arial, sans-serif; background: #f4f7fb; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
             .login-card {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 350px; border-top: 5px solid #0f4c81; }}
+            .login-logo {{ display: block; width: 85px; height: 85px; object-fit: contain; margin: 0 auto 12px auto; }}
             h2 {{ color: #0f4c81; text-align: center; margin-bottom: 5px; font-size: 20px; }}
             p.sub {{ text-align: center; color: #64748b; font-size: 12px; margin-bottom: 20px; }}
             .form-group {{ margin-bottom: 15px; display: flex; flex-direction: column; gap: 5px; }}
@@ -566,6 +567,7 @@ def login_page(error: str = ""):
     </head>
     <body>
         <div class="login-card">
+            <img src="/static/logo.png" alt="Medistar Medical Laboratory Logo" class="login-logo">
             <h2>MEDISTAR MEDICAL LABORATORY</h2>
             <p class="sub">Sign in to your account</p>
             {error_html}
