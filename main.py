@@ -3812,10 +3812,23 @@ def add_main_test(
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Safety checks for columns
+    # Safety checks for columns — each ALTER TABLE guarded independently.
+    # Chaining these in a single try/except is unsafe with libsql: once any
+    # one column already exists, its "duplicate column" error (raised as
+    # ValueError, aliased above to sqlite3.OperationalError) aborts the
+    # whole block, so later ALTERs never get a chance to run. Each column
+    # gets its own try/except so the others always still get applied.
     try:
         cursor.execute("ALTER TABLE tests ADD COLUMN notes TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
         cursor.execute("ALTER TABLE tests ADD COLUMN col_alignments TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
         cursor.execute("ALTER TABLE tests ADD COLUMN test_code TEXT")
         conn.commit()
     except sqlite3.OperationalError:
@@ -3839,6 +3852,18 @@ def add_main_test(
 def edit_test_category_page(test_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Ensure every column this page reads actually exists, independent of
+    # whether /add-main-test has ever run. Each guarded separately so one
+    # already-existing column never blocks the others (see /add-main-test
+    # for why chaining these in a single try/except is unsafe with libsql).
+    for col_def in ("notes TEXT", "col_alignments TEXT", "test_code TEXT"):
+        try:
+            cursor.execute(f"ALTER TABLE tests ADD COLUMN {col_def}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
     cursor.execute("SELECT test_name, price, department, specimen, notes, col_alignments, test_code FROM tests WHERE id = ?", (test_id,))
     test = cursor.fetchone()
     conn.close()
@@ -3853,6 +3878,12 @@ def edit_test_category_page(test_id: int):
     aligns = aligns[:10]
 
     def sel(val, target): return "selected" if val == target else ""
+
+    notes_value = test[4] if test[4] else ""
+    price_value = test[1] if test[1] is not None else 0.0
+    department_value = test[2] if test[2] else ""
+    specimen_value = test[3] if test[3] else ""
+    test_code_value = test[6] if test[6] else ""
 
     return f"""
     <!DOCTYPE html>
@@ -3881,7 +3912,7 @@ def edit_test_category_page(test_id: int):
                 <div class="row">
                     <div style="flex: 1;">
                         <label>Test Code:</label>
-                        <input type="text" name="test_code" value="{test[6] if test[6] else ''}">
+                        <input type="text" name="test_code" value="{test_code_value}">
                     </div>
                     <div style="flex: 2;">
                         <label>Test Category Name:</label>
@@ -3891,20 +3922,20 @@ def edit_test_category_page(test_id: int):
                 <div class="row">
                     <div>
                         <label>Price (Rs):</label>
-                        <input type="number" step="0.01" name="price" value="{test[1]}">
+                        <input type="number" step="0.01" name="price" value="{price_value}">
                     </div>
                     <div>
                         <label>Department:</label>
-                        <input type="text" name="department" value="{test[2]}">
+                        <input type="text" name="department" value="{department_value}">
                     </div>
                     <div>
                         <label>Specimen:</label>
-                        <input type="text" name="specimen" value="{test[3]}">
+                        <input type="text" name="specimen" value="{specimen_value}">
                     </div>
                 </div>
                 <div class="form-group">
                     <label>Notes / Details (Appears below print results):</label>
-                    <textarea name="notes">{test[4]}</textarea>
+                    <textarea name="notes">{notes_value}</textarea>
                 </div>
 
                 <div class="form-group" style="background:#f9f9f9; padding:15px; border-radius:8px; border:1px solid #eee;">
@@ -3962,12 +3993,39 @@ def update_test_category(
     alignments = f"{align_inv},{align_res},{align_flag},{align_unit},{align_ref},{width_inv},{width_res},{width_flag},{width_unit},{width_ref}"
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE tests 
-        SET test_code = ?, test_name = ?, price = ?, department = ?, specimen = ?, notes = ?, col_alignments = ?
-        WHERE id = ?
-    """, (test_code.upper(), test_name.upper(), price, department, specimen, notes, alignments, test_id))
-    conn.commit()
+
+    # Same independent per-column guards as the GET page and /add-main-test,
+    # so saving never fails with "no such column" regardless of DB history.
+    for col_def in ("notes TEXT", "col_alignments TEXT", "test_code TEXT"):
+        try:
+            cursor.execute(f"ALTER TABLE tests ADD COLUMN {col_def}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # Confirm the row still exists before updating, so a stale/bad test_id
+    # gives a clear message instead of a silent no-op update.
+    cursor.execute("SELECT id FROM tests WHERE id = ?", (test_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return HTMLResponse(f"<h3>Test category #{test_id} not found.</h3><a href='/manage-tests'>Back</a>", status_code=404)
+
+    try:
+        cursor.execute("""
+            UPDATE tests 
+            SET test_code = ?, test_name = ?, price = ?, department = ?, specimen = ?, notes = ?, col_alignments = ?
+            WHERE id = ?
+        """, (test_code.upper(), test_name.upper(), price, department, specimen, notes, alignments, test_id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # test_name is UNIQUE - another category already has this exact
+        # name. Fail gracefully instead of a raw 500 error.
+        conn.close()
+        return HTMLResponse(
+            f"<h3>Could not update: another test category is already named '{html.escape(test_name.upper())}'.</h3>"
+            f"<a href='/edit-test-category/{test_id}'>Go Back and Try Again</a>",
+            status_code=409
+        )
     conn.close()
     return RedirectResponse(url="/manage-tests", status_code=303)
 
