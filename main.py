@@ -3,6 +3,7 @@ import libsql
 import os
 import re
 import html
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -87,6 +88,12 @@ if _bad_url_chars or _bad_token_chars:
     )
 
 
+# Process-wide cached connection - see get_db_connection() below for why
+# this is reused across requests instead of reconnecting every time.
+_CACHED_TURSO_CONNECTION = None
+_CONNECTION_LOCK = threading.Lock()
+
+
 class LibsqlRow:
     """
     Drop-in replacement for sqlite3.Row when working with the libsql
@@ -154,7 +161,20 @@ class _TursoCursorWrapper:
         return [d[0] for d in desc] if desc else []
 
     def execute(self, *args, **kwargs):
-        self._raw_cursor.execute(*args, **kwargs)
+        try:
+            self._raw_cursor.execute(*args, **kwargs)
+        except Exception:
+            # Don't leave a broken connection cached for every future
+            # request to keep failing against. Drop it so the next
+            # get_db_connection() call creates a fresh one. We deliberately
+            # do NOT retry the write right here - silently re-issuing an
+            # INSERT/UPDATE after an ambiguous network failure risks
+            # executing it twice, which is worse than surfacing this one
+            # error to the caller (existing except sqlite3.OperationalError
+            # / IntegrityError handling elsewhere in this file still works
+            # unchanged, since we re-raise the exact original exception).
+            _reset_db_connection()
+            raise
         return self
 
     def executemany(self, *args, **kwargs):
@@ -207,20 +227,68 @@ class _TursoConnectionWrapper:
     def execute(self, *args, **kwargs):
         return self.cursor().execute(*args, **kwargs)
 
+    def close(self):
+        # Intentionally a no-op. get_db_connection() now hands out a
+        # single shared, cached connection reused across requests (see
+        # its docstring). Every route in this file calls conn.close()
+        # when it's done with its own queries - previously that was
+        # correct (each route had its own private connection), but now
+        # that would tear down the *shared* connection and break every
+        # request that runs afterward until one got lazily recreated.
+        # We honor the call as "this route is done with the connection
+        # for now" without actually closing the underlying libsql
+        # connection. Use _reset_db_connection() if you need to force a
+        # genuine reconnect (e.g. after detecting the connection is bad).
+        pass
+
     def __getattr__(self, name):
         return getattr(self._raw_conn, name)
 
 
 def get_db_connection():
     """
-    Returns a connection to the Turso Cloud database. Connects fresh over
-    HTTP/Hrana on every call (no local file, no embedded replica/sync_url)
-    - this is the correct pattern for Vercel serverless functions, since
-    a replica file wouldn't survive between invocations anyway and would
-    just add a sync cost on every cold start for no benefit.
+    Returns a connection to the Turso Cloud database.
+
+    Reuses a single lazily-created libsql connection for the lifetime of
+    this warm process/instance, instead of opening a brand-new HTTP/Hrana
+    connection (TCP + TLS + auth handshake) on every single call. This is
+    the main latency cost when talking to a remote Turso replica (even a
+    nearby one like `bom`/Mumbai) - repeating that handshake on every
+    query is far more expensive than reusing one already-open connection.
+
+    This remains safe for serverless: a cold start just lazily creates a
+    fresh connection on first use (exactly like before), and a warm
+    invocation that reuses the same process now skips the handshake
+    entirely. If a query ever fails on the cached connection (network
+    blip, an idle-connection timeout from Turso's edge, etc.), the
+    cursor wrapper invalidates this cache so the very next call gets a
+    brand-new connection - a bad connection never stays cached and
+    failing forever. The failing call itself still raises normally
+    (we don't blind-retry writes in place, since silently re-issuing an
+    INSERT/UPDATE after an ambiguous network failure risks executing it
+    twice).
     """
-    raw_conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
-    return _TursoConnectionWrapper(raw_conn)
+    global _CACHED_TURSO_CONNECTION
+    if _CACHED_TURSO_CONNECTION is None:
+        # Double-checked locking: FastAPI's sync `def` routes run in a
+        # thread pool, so two requests can race to create the first
+        # connection on a cold start. The lock only guards creation - it
+        # is not held during actual query execution, so concurrent
+        # requests still run their queries in parallel once the shared
+        # connection exists.
+        with _CONNECTION_LOCK:
+            if _CACHED_TURSO_CONNECTION is None:
+                raw_conn = libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+                _CACHED_TURSO_CONNECTION = _TursoConnectionWrapper(raw_conn)
+    return _CACHED_TURSO_CONNECTION
+
+
+def _reset_db_connection():
+    """Drop the cached connection so the next get_db_connection() call
+    creates a fresh one. Used when a query fails in a way that suggests
+    the underlying connection itself has gone stale."""
+    global _CACHED_TURSO_CONNECTION
+    _CACHED_TURSO_CONNECTION = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -990,6 +1058,24 @@ def init_db():
             phone TEXT
         )
     """)
+
+    # Indexes for the columns actually filtered/joined on throughout the
+    # app (patient lookups, assigned-test lookups by patient/test,
+    # parameter lookups by test, report joins). Turso/libsql round-trips
+    # over HTTP are far more latency-sensitive than local SQLite, so a
+    # full table scan that was invisible on a local .db file becomes a
+    # real, measurable delay against a remote Mumbai (bom) replica.
+    # CREATE INDEX IF NOT EXISTS is idempotent - safe to run every startup.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pat_patient_id ON patient_assigned_tests(patient_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pat_test_id ON patient_assigned_tests(test_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pat_patient_test ON patient_assigned_tests(patient_id, test_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_test_parameters_test_id ON test_parameters(test_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_results_patient_test_param ON results(patient_id, test_id, param_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_patient_id ON reports(patient_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_test_id ON reports(test_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_report_results_report_id ON report_results(report_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tests_department ON tests(department)")
+    conn.commit()
 
     # Compatibility migrations for databases created by older project versions.
     cursor.execute("PRAGMA table_info(patients)")
@@ -2761,10 +2847,17 @@ def manage_tests(request: Request, dept: str = ""):
     
     tests = cursor.fetchall()
 
+    # Fetch all parameter counts in a single grouped query instead of one
+    # round-trip per test row (previously an N+1 query - a lab with 100
+    # test categories meant 100 extra Turso HTTP round-trips just to
+    # render this page). Missing tests (0 parameters) simply won't appear
+    # as a key, handled by the .get(test_id, 0) default below.
+    cursor.execute("SELECT test_id, COUNT(*) FROM test_parameters GROUP BY test_id")
+    param_counts = {row[0]: row[1] for row in cursor.fetchall()}
+
     test_list_html = ""
     for test_id, test_name, price, department, specimen, test_code in tests:
-        cursor.execute("SELECT COUNT(*) FROM test_parameters WHERE test_id = ?", (test_id,))
-        param_count = cursor.fetchone()[0]
+        param_count = param_counts.get(test_id, 0)
 
         code_badge = f"<span style='background:#0f4c81; color:white; padding:3px 8px; border-radius:4px; font-size:12px; margin-right:8px;'>{test_code}</span>" if test_code else ""
 
