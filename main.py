@@ -38,8 +38,25 @@ sqlite3.DatabaseError = ValueError
 # -------------------------------------------------------------
 # Turso Cloud Database Configuration
 # -------------------------------------------------------------
-TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+def _clean_env(name: str) -> str:
+    """Read an env var and strip surrounding whitespace/newlines.
+
+    Root cause of the `Hrana: http error: InvalidHeaderValue` crash:
+    TURSO_AUTH_TOKEN gets sent straight into the HTTP Authorization
+    header libsql builds for every request, and Vercel's Environment
+    Variables UI (or copy-pasting a JWT out of a terminal/file) can
+    silently attach a trailing newline or space to the pasted value.
+    HTTP header values can't contain control characters like \\n or \\r,
+    so the underlying Rust `http` crate rejects the request outright
+    with InvalidHeaderValue the moment a query actually runs - which is
+    exactly the crash in your traceback.
+    """
+    value = os.getenv(name) or ""
+    return value.strip()
+
+
+TURSO_DATABASE_URL = _clean_env("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = _clean_env("TURSO_AUTH_TOKEN")
 
 if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
     raise RuntimeError(
@@ -47,6 +64,25 @@ if not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
         "environment variables (you've set these in Vercel already - "
         "this only fires if they're missing locally, e.g. forgetting to "
         "`vercel env pull` or export them before running uvicorn)."
+    )
+
+# Extra guard: if stripping the ends wasn't enough, there's a
+# whitespace/control character stuck INSIDE the value - the token was
+# corrupted during copy-paste and stripping can't fix that. Fail with a
+# clear, actionable message instead of the cryptic Hrana crash.
+_bad_url_chars = any(ord(c) < 0x21 or ord(c) == 0x7F for c in TURSO_DATABASE_URL)
+_bad_token_chars = any(ord(c) < 0x21 or ord(c) == 0x7F for c in TURSO_AUTH_TOKEN)
+if _bad_url_chars or _bad_token_chars:
+    bad_var = "TURSO_AUTH_TOKEN" if _bad_token_chars else "TURSO_DATABASE_URL"
+    raise RuntimeError(
+        f"{bad_var} contains a whitespace/control character in the "
+        "middle of the value, not just at the ends - it was likely "
+        "corrupted when pasted into Vercel's Environment Variables UI "
+        "(a stray newline is the usual culprit, e.g. from `cat token.txt` "
+        "including the file's trailing newline). Generate a fresh value "
+        "(`turso db tokens create <db-name>` for the token, `turso db "
+        "show <db-name> --url` for the URL), paste it into Vercel's "
+        "dashboard field directly rather than via a file, and redeploy."
     )
 
 
