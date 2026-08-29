@@ -4,6 +4,7 @@ import os
 import re
 import html
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from typing import Optional
 from fastapi import FastAPI, Form, Request, Query, Response
@@ -245,6 +246,25 @@ if not os.path.isdir(STATIC_DIR):
 
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# -------------------------------------------------------------
+# -------------------------------------------------------------
+# SRI LANKA TIMEZONE (Asia/Colombo, UTC+5:30)
+# -------------------------------------------------------------
+# All "Received On" / "Reported On" / "Printed On" timestamps must reflect
+# Sri Lankan wall-clock time regardless of what timezone the server (or
+# Turso's underlying host) actually runs in. datetime.now(SRI_LANKA_TZ)
+# returns the current moment converted into this timezone directly, so it
+# is correct even if the server's OS clock/timezone is UTC or anything
+# else - unlike bare datetime.now(), which just trusts the server's local
+# settings.
+SRI_LANKA_TZ = ZoneInfo("Asia/Colombo")
+
+
+def now_colombo() -> datetime:
+    """Current date & time, always in Asia/Colombo (UTC+5:30)."""
+    return datetime.now(SRI_LANKA_TZ)
+
 
 # -------------------------------------------------------------
 # RBAC: ROLES & GRANULAR PERMISSIONS
@@ -2308,7 +2328,7 @@ async def add_patient_post(request: Request):
         # Use the server's actual local date/time (not SQLite's built-in
         # CURRENT_TIMESTAMP default, which is UTC) so "Received On" reflects
         # correct local registration time.
-        registration_timestamp = datetime.now().isoformat(timespec="seconds")
+        registration_timestamp = now_colombo().isoformat(timespec="seconds")
 
         cursor.execute("""
             INSERT INTO patients (title, name, age_years, age_months, age_days, gender, phone, doctor, collecting_center, center, created_at)
@@ -4609,7 +4629,7 @@ async def save_specific_test(patient_id: int, test_id: int, request: Request):
         conn.commit()
     except Exception:
         pass
-    save_timestamp = datetime.now().isoformat(timespec="seconds")
+    save_timestamp = now_colombo().isoformat(timespec="seconds")
     
     for key, value in form_data.items():
         if key.startswith("param_"):
@@ -5087,7 +5107,7 @@ async def save_test_results(request: Request):
             conn.commit()
         except:
             pass
-        save_timestamp = datetime.now().isoformat(timespec="seconds")
+        save_timestamp = now_colombo().isoformat(timespec="seconds")
         
         for key, value in form_data.items():
             if key.startswith("result_"):
@@ -5423,7 +5443,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
     # patient's received_on timestamp. NEVER fall back to the current
     # print/system time (datetime.now()) for "Reported On".
     reported_on = rep_parsed if rep_parsed else received_on
-    printed_on = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+    printed_on = now_colombo().strftime("%d/%m/%Y %I:%M %p")
 
     patient_age_days = patient_age_to_days(patient)
     patient_gender = normalize_patient_gender(patient.get("gender"))
