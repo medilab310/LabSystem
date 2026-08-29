@@ -245,7 +245,94 @@ if not os.path.isdir(STATIC_DIR):
 
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    
+
+# -------------------------------------------------------------
+# RBAC: ROLES & GRANULAR PERMISSIONS
+# -------------------------------------------------------------
+# Every permission a user can be individually granted. Keys are what get
+# stored (comma-separated) in users.permissions; labels are only for the
+# checkboxes on the Manage Users screen.
+PERMISSIONS = {
+    "add_patient":   "Add Patient",
+    "add_test":      "Add Test",
+    "manage_tests":  "Manage Tests",
+    "manage_doctors":"Manage Doctors",
+    "manage_centers":"Manage Centers",
+    "reports":       "Reports & Analytics",
+    "manage_users":  "Manage Users",
+}
+
+# Roles that always bypass permission checks entirely, regardless of what
+# is (or isn't) stored in their `permissions` column.
+FULL_ACCESS_ROLES = {"owner", "admin"}
+
+
+def get_current_user(request: Request):
+    """Reads the username/role/permissions cookies set at login and returns
+    a small dict describing the logged-in user. Never raises - callers get
+    a safe "no access" shape if cookies are missing/malformed."""
+    username = request.cookies.get("username", "")
+    role = (request.cookies.get("role", "") or "").strip()
+    perms_raw = request.cookies.get("permissions", "") or ""
+    permissions = {p for p in perms_raw.split(",") if p}
+    return {"username": username, "role": role, "permissions": permissions}
+
+
+def user_has_access(user: dict, permission_key: str) -> bool:
+    """Owner/Admin roles always have full access. Everyone else needs the
+    specific permission key present in their granted permissions."""
+    role_lower = (user.get("role") or "").strip().lower()
+    if role_lower in FULL_ACCESS_ROLES:
+        return True
+    return permission_key in user.get("permissions", set())
+
+
+def render_locked_page(feature_label: str) -> HTMLResponse:
+    """A clean 'Access Denied' screen shown IN PLACE OF the page content
+    when a logged-in user lacks a permission. Navigation tabs stay visible
+    everywhere else in the app - only the restricted page's body is
+    replaced with this, so the layout never breaks."""
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Access Denied</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+            body {{
+                background: #f4f7fe; min-height: 100vh; display: flex;
+                align-items: center; justify-content: center; color: #1b2559;
+            }}
+            .locked-card {{
+                background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px;
+                box-shadow: 0px 8px 24px rgba(0,0,0,0.06); padding: 48px 40px;
+                text-align: center; max-width: 420px;
+            }}
+            .locked-card i {{ font-size: 42px; color: #e53e3e; margin-bottom: 18px; }}
+            .locked-card h2 {{ font-size: 20px; margin-bottom: 10px; }}
+            .locked-card p {{ color: #707eae; font-size: 14px; margin-bottom: 22px; }}
+            .back-btn {{
+                display: inline-block; background: #0d47a1; color: #fff; text-decoration: none;
+                padding: 10px 22px; border-radius: 8px; font-weight: 700; font-size: 14px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="locked-card">
+            <i class="fa-solid fa-lock"></i>
+            <h2>Access Denied</h2>
+            <p>You don't have permission to access <strong>{html.escape(feature_label)}</strong>.
+            Contact your Owner/Admin if you believe this is a mistake.</p>
+            <a href="/dashboard" class="back-btn"><i class="fa-solid fa-arrow-left"></i> Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """, status_code=403)
+
+
 # -------------------------------------------------------------
 # GLOBAL SESSION / CROSS-TAB LOGOUT SYNCHRONIZATION
 # -------------------------------------------------------------
@@ -329,6 +416,7 @@ def logout():
     )
     response.delete_cookie("username")
     response.delete_cookie("role")
+    response.delete_cookie("permissions")
     return response
 
 # -------------------------------------------------------------
@@ -389,7 +477,8 @@ async def login_post(request: Request):
     if username == "admin" and password == "1234":
         resp = RedirectResponse(url="/dashboard", status_code=303)
         resp.set_cookie(key="username", value="admin")
-        resp.set_cookie(key="role", value="admin")
+        resp.set_cookie(key="role", value="owner")
+        resp.set_cookie(key="permissions", value="")  # Owner bypasses checks entirely
         return resp
     
     # 2. Database Check
@@ -402,7 +491,8 @@ async def login_post(request: Request):
                 id INTEGER PRIMARY KEY AUTOINCREMENT, 
                 username TEXT, 
                 password TEXT, 
-                role TEXT
+                role TEXT,
+                permissions TEXT
             )
         """)
         
@@ -411,13 +501,15 @@ async def login_post(request: Request):
         conn.close()
         
         if user:
-            # Role එකක් නැත්නම් default 'staff' විදිහට ගන්නවා
-            user_role = user["role"] if "role" in user.keys() and user["role"] else "staff"
+            # Role එකක් නැත්නම් default 'MLT' විදිහට ගන්නවා
+            user_role = user["role"] if "role" in user.keys() and user["role"] else "MLT"
+            user_permissions = user["permissions"] if "permissions" in user.keys() and user["permissions"] else ""
             
             # හැමෝම Dashboard එකට යවනවා සහ Cookies සෙට් කරනවා
             resp = RedirectResponse(url="/dashboard", status_code=303)
             resp.set_cookie(key="username", value=username)
             resp.set_cookie(key="role", value=user_role)
+            resp.set_cookie(key="permissions", value=user_permissions)
             return resp
             
     except Exception as e:
@@ -436,14 +528,113 @@ async def add_user(request: Request):
     username = form_data.get("username", "").strip()
     password = form_data.get("password", "").strip()
     role = form_data.get("role", "").strip()
-    
+    selected_permissions = form_data.getlist("permissions")
+    permissions_str = ",".join(p for p in selected_permissions if p in PERMISSIONS)
+
     if username and password and role:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", (username, password, role))
+        cursor.execute(
+            "INSERT INTO users (username, password, role, permissions) VALUES (?, ?, ?, ?)",
+            (username, password, role, permissions_str)
+        )
         conn.commit()
         conn.close()
         
+    return RedirectResponse(url="/manage-users", status_code=303)
+
+
+@app.get("/edit-user/{user_id}", response_class=HTMLResponse)
+def edit_user_page(user_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_users"):
+        return render_locked_page("Manage Users")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    u = cursor.fetchone()
+    conn.close()
+    if not u:
+        return HTMLResponse("<h3>User not found.</h3><a href='/manage-users'>Back</a>", status_code=404)
+
+    u_role = (u["role"] if "role" in u.keys() and u["role"] else "MLT")
+    u_perms = set((u["permissions"] if "permissions" in u.keys() and u["permissions"] else "").split(","))
+
+    checkboxes_html = ""
+    for perm_key, perm_label in PERMISSIONS.items():
+        checked = "checked" if perm_key in u_perms else ""
+        checkboxes_html += f"""
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600;">
+            <input type="checkbox" name="permissions" value="{perm_key}" {checked}> {html.escape(perm_label)}
+        </label>
+        """
+
+    role_options = ""
+    for r in ["Owner", "MLT", "Phlebotomist"]:
+        selected = "selected" if r.lower() == u_role.lower() else ""
+        role_options += f'<option value="{r}" {selected}>{r}</option>'
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Edit User</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+            body {{ background: #f4f7fe; color: #1b2559; }}
+            .header {{ background: #0d47a1; color: white; padding: 14px 28px; }}
+            .container {{ padding: 25px; max-width: 500px; margin: auto; }}
+            .card {{ background: #fff; padding: 24px; border-radius: 14px; box-shadow: 0px 8px 24px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }}
+            .form-group {{ margin-bottom: 15px; }}
+            .form-group label {{ display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }}
+            .form-control {{ width: 100%; padding: 10px 14px; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 14px; }}
+            .submit-btn {{ background: #0d47a1; color: white; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 700; cursor: pointer; }}
+        </style>
+    </head>
+    <body>
+        <div class="header"><h2><i class="fa-solid fa-user-pen"></i> Edit User: {html.escape(u["username"])}</h2></div>
+        <div class="container">
+            <div class="card">
+                <form action="/edit-user/{user_id}" method="POST">
+                    <div class="form-group">
+                        <label>Role</label>
+                        <select name="role" class="form-control">
+                            {role_options}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
+                        {checkboxes_html}
+                    </div>
+                    <button type="submit" class="submit-btn"><i class="fa-solid fa-check"></i> Save Changes</button>
+                    <a href="/manage-users" style="margin-left:12px;">Cancel</a>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/edit-user/{user_id}")
+async def edit_user_post(user_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_users"):
+        return render_locked_page("Manage Users")
+
+    form_data = await request.form()
+    role = form_data.get("role", "").strip()
+    selected_permissions = form_data.getlist("permissions")
+    permissions_str = ",".join(p for p in selected_permissions if p in PERMISSIONS)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET role = ?, permissions = ? WHERE id = ?", (role, permissions_str, user_id))
+    conn.commit()
+    conn.close()
     return RedirectResponse(url="/manage-users", status_code=303)
 
 @app.get("/delete-user/{user_id}")
@@ -653,6 +844,19 @@ def init_db():
             password TEXT NOT NULL
         )
     """)
+
+    # RBAC: idempotently add role & permissions columns without losing
+    # existing data. Safe to run every startup — ALTER TABLE ADD COLUMN
+    # fails harmlessly (caught below) if the column already exists.
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'MLT'")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN permissions TEXT DEFAULT ''")
+    except Exception:
+        pass
+    conn.commit()
 
     # 3. Patients Table
     cursor.execute("""
@@ -1280,7 +1484,11 @@ def dashboard():
 # 2. MANAGE USERS ROUTE (100% Crash-Proof & Error-Free)
 # -------------------------------------------------------------
 @app.get("/manage-users", response_class=HTMLResponse)
-def manage_users():
+def manage_users(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_users"):
+        return render_locked_page("Manage Users")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -1295,6 +1503,11 @@ def manage_users():
     ''')
     try:
         cursor.execute("ALTER TABLE users ADD COLUMN role TEXT")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN permissions TEXT")
         conn.commit()
     except Exception:
         pass
@@ -1318,9 +1531,21 @@ def manage_users():
                 u_name = u[1] if len(u) > 1 else "Unknown"
             
             try:
-                u_role = u["role"] if "role" in u.keys() and u["role"] else "admin"
+                u_role = u["role"] if "role" in u.keys() and u["role"] else "MLT"
             except Exception:
-                u_role = "admin"
+                u_role = "MLT"
+
+            try:
+                u_perms_raw = u["permissions"] if "permissions" in u.keys() and u["permissions"] else ""
+            except Exception:
+                u_perms_raw = ""
+            u_perms_set = {p for p in u_perms_raw.split(",") if p}
+            if u_role.strip().lower() in FULL_ACCESS_ROLES:
+                perms_display = "All (Owner)"
+            elif u_perms_set:
+                perms_display = ", ".join(PERMISSIONS.get(p, p) for p in u_perms_set)
+            else:
+                perms_display = "<span style='color:#a0aec0;'>None</span>"
 
             users_rows += f"""
             <tr>
@@ -1331,7 +1556,11 @@ def manage_users():
                         {u_role}
                     </span>
                 </td>
-                <td style="padding: 12px; text-align: center;">
+                <td style="padding: 12px; font-size: 12px;">{perms_display}</td>
+                <td style="padding: 12px; text-align: center; white-space: nowrap;">
+                    <a href="/edit-user/{u_id}" style="color: #0d47a1; text-decoration: none; font-weight: 700; font-size: 12px; background: rgba(13, 71, 161, 0.1); padding: 6px 12px; border-radius: 6px; margin-right: 6px;">
+                        <i class="fa-solid fa-pen"></i> Edit
+                    </a>
                     <a href="/delete-user/{u_id}" onclick="return confirm('Are you sure you want to delete this user?');" style="color: #e53e3e; text-decoration: none; font-weight: 700; font-size: 12px; background: rgba(229, 62, 62, 0.1); padding: 6px 12px; border-radius: 6px;">
                         <i class="fa-solid fa-trash"></i> Delete
                     </a>
@@ -1339,7 +1568,15 @@ def manage_users():
             </tr>
             """
     else:
-        users_rows = '<tr><td colspan="4" style="padding: 20px; text-align: center; color: var(--text-muted);">No users found. Create a new user below.</td></tr>'
+        users_rows = '<tr><td colspan="5" style="padding: 20px; text-align: center; color: var(--text-muted);">No users found. Create a new user below.</td></tr>'
+
+    permission_checkboxes = ""
+    for perm_key, perm_label in PERMISSIONS.items():
+        permission_checkboxes += f"""
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600;">
+            <input type="checkbox" name="permissions" value="{perm_key}"> {html.escape(perm_label)}
+        </label>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -1445,9 +1682,14 @@ def manage_users():
                     <div class="form-group">
                         <label>Role</label>
                         <select name="role" class="form-control">
-                            <option value="admin">Admin</option>
-                            <option value="staff">Staff / Lab Assistant</option>
+                            <option value="Owner">Owner</option>
+                            <option value="MLT" selected>MLT</option>
+                            <option value="Phlebotomist">Phlebotomist</option>
                         </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
+                        {permission_checkboxes}
                     </div>
                     <button type="submit" class="submit-btn"><i class="fa-solid fa-check"></i> Create User</button>
                 </form>
@@ -1462,7 +1704,8 @@ def manage_users():
                             <th>ID</th>
                             <th>Username</th>
                             <th>Role</th>
-                            <th style="text-align: center;">Action</th>
+                            <th>Permissions</th>
+                            <th style="text-align: center;">Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1479,7 +1722,11 @@ def manage_users():
 # 2. REPORTS & ANALYTICS PAGE
 # -------------------------------------------------------------
 @app.get("/reports", response_class=HTMLResponse)
-def reports_page(start_date: str = "", end_date: str = "", report_type: str = "sales"):
+def reports_page(request: Request, start_date: str = "", end_date: str = "", report_type: str = "sales"):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "reports"):
+        return render_locked_page("Reports & Analytics")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -1840,7 +2087,11 @@ def patients_dashboard(
 # 1. REGISTER PATIENT FORM (GET) - Dynamic Doctors & Centers Dropdowns
 # -------------------------------------------------------------
 @app.get("/add-patient", response_class=HTMLResponse)
-def add_patient_page(saved_id: int = None):
+def add_patient_page(request: Request, saved_id: int = None):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "add_patient"):
+        return render_locked_page("Add Patient")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -2044,6 +2295,9 @@ def add_patient_page(saved_id: int = None):
 # -------------------------------------------------------------
 @app.post("/add-patient")
 async def add_patient_post(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "add_patient"):
+        return render_locked_page("Add Patient")
     try:
         form_data = await request.form()
         selected_tests = form_data.getlist("test_ids")
@@ -2096,7 +2350,11 @@ from fastapi import Form
 
 # --- DOCTORS MANAGEMENT ---
 @app.get("/manage-doctors", response_class=HTMLResponse)
-def manage_doctors():
+def manage_doctors(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_doctors"):
+        return render_locked_page("Manage Doctors")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM doctors ORDER BY name")
@@ -2185,7 +2443,11 @@ def add_doctor(code: str = Form(...), name: str = Form(...), specialization: str
 
 # --- COLLECTING CENTERS MANAGEMENT ---
 @app.get("/manage-centers", response_class=HTMLResponse)
-def manage_centers():
+def manage_centers(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_centers"):
+        return render_locked_page("Manage Centers")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM collecting_centers ORDER BY center_name")
@@ -2268,7 +2530,10 @@ def add_center(center_name: str = Form(...), location: str = Form(None), phone: 
 # 3. SELECT PATIENT LIST (Step 1)
 # -------------------------------------------------------------
 @app.get("/add-test-entry", response_class=HTMLResponse)
-def add_test_entry(search: str = "", selected_patient_id: int = None):
+def add_test_entry(request: Request, search: str = "", selected_patient_id: int = None):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "add_test"):
+        return render_locked_page("Add Test")
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -2438,7 +2703,11 @@ def patient_tests(patient_id: int = None, selected_patient_id: int = None):
 # 4. MANAGE TEST CATEGORIES & TEMPLATES
 # -----------------------------
 @app.get("/manage-tests", response_class=HTMLResponse)
-def manage_tests(dept: str = ""):
+def manage_tests(request: Request, dept: str = ""):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_tests"):
+        return render_locked_page("Manage Tests")
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
