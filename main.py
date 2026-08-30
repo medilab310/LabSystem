@@ -4,6 +4,7 @@ import os
 import re
 import html
 import threading
+import secrets
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -378,6 +379,7 @@ PERMISSIONS = {
     "manage_centers":"Manage Centers",
     "reports":       "Reports & Analytics",
     "manage_users":  "Manage Users",
+    "share_reports": "Share Reports",
 }
 
 # Roles that always bypass permission checks entirely, regardless of what
@@ -554,8 +556,8 @@ def login_page(error: str = ""):
         <title>MEDISTAR MEDICAL LABORATORY - Login</title>
         <style>
             body {{ font-family: Arial, sans-serif; background: #f4f7fb; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-            .login-card {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 350px; border-top: 5px solid #0f4c81; }}
-            .login-logo {{ display: block; width: 85px; height: 85px; object-fit: contain; margin: 0 auto 12px auto; }}
+            .login-card {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 400px; border-top: 5px solid #0f4c81; }}
+            .login-logo {{ display: block; width: 180px; height: 180px; object-fit: contain; margin: 0 auto 12px auto; }}
             h2 {{ color: #0f4c81; text-align: center; margin-bottom: 5px; font-size: 20px; }}
             p.sub {{ text-align: center; color: #64748b; font-size: 12px; margin-bottom: 20px; }}
             .form-group {{ margin-bottom: 15px; display: flex; flex-direction: column; gap: 5px; }}
@@ -1091,6 +1093,23 @@ def init_db():
         )
     """)
 
+    # 12. Share Links Table (Shareable WhatsApp report links)
+    # Brand-new, additive-only table - does not touch/alter any existing
+    # table or column, so it carries zero risk to existing patient data.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS share_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            patient_id INTEGER NOT NULL,
+            test_id INTEGER NOT NULL,
+            created_at TEXT,
+            created_by TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_share_links_token ON share_links(token)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_share_links_patient_test ON share_links(patient_id, test_id)")
+    conn.commit()
+
     # Indexes for the columns actually filtered/joined on throughout the
     # app (patient lookups, assigned-test lookups by patient/test,
     # parameter lookups by test, report joins). Turso/libsql round-trips
@@ -1550,6 +1569,9 @@ def dashboard():
                 </a>
                 <a href="/manage-centers" class="action-btn">
                     <i class="fa-solid fa-hospital"></i> Centers
+                </a>
+                <a href="/share-reports" class="action-btn">
+                    <i class="fa-brands fa-whatsapp"></i> Share Reports
                 </a>
                 <!-- User Management Button Added Here -->
                 <a href="/manage-users" class="action-btn">
@@ -2386,6 +2408,47 @@ def patients_dashboard(
 # -------------------------------------------------------------
 # 1. REGISTER PATIENT FORM (GET) - Dynamic Doctors & Centers Dropdowns
 # -------------------------------------------------------------
+@app.get("/api/lookup-patient-by-phone")
+def lookup_patient_by_phone(request: Request, phone: str = ""):
+    """
+    Read-only lookup used by the New Patient form's phone-number auto-fill.
+    Returns the most recently registered patient matching this exact phone
+    number, or found=false if none exists. Never modifies any data.
+    """
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "add_patient"):
+        return {"found": False}
+
+    phone = (phone or "").strip()
+    if not phone:
+        return {"found": False}
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT title, name, age_years, age_months, age_days, gender, doctor, collecting_center "
+        "FROM patients WHERE phone = ? ORDER BY id DESC LIMIT 1",
+        (phone,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return {"found": False}
+
+    return {
+        "found": True,
+        "title": row[0] or "",
+        "name": row[1] or "",
+        "age_years": row[2] if row[2] is not None else 0,
+        "age_months": row[3] if row[3] is not None else 0,
+        "age_days": row[4] if row[4] is not None else 0,
+        "gender": row[5] or "",
+        "doctor": row[6] or "",
+        "collecting_center": row[7] or "",
+    }
+
+
 @app.get("/add-patient", response_class=HTMLResponse)
 def add_patient_page(request: Request, saved_id: int = None):
     current_user = get_current_user(request)
@@ -2504,16 +2567,16 @@ def add_patient_page(request: Request, saved_id: int = None):
                     </div>
                     <div class="col-name">
                         <label>Patient Name:</label>
-                        <input type="text" name="name" required placeholder="Ex: A.B. Perera">
+                        <input type="text" name="name" id="nameInput" required placeholder="Ex: A.B. Perera">
                     </div>
                 </div>
 
                 <div class="form-group">
                     <label>Age (Y / M / D):</label>
                     <div class="age-row">
-                        <input type="number" name="age_years" min="0" value="0" placeholder="Years">
-                        <input type="number" name="age_months" min="0" max="11" value="0" placeholder="Months">
-                        <input type="number" name="age_days" min="0" max="30" value="0" placeholder="Days">
+                        <input type="number" name="age_years" id="ageYearsInput" min="0" value="0" placeholder="Years">
+                        <input type="number" name="age_months" id="ageMonthsInput" min="0" max="11" value="0" placeholder="Months">
+                        <input type="number" name="age_days" id="ageDaysInput" min="0" max="30" value="0" placeholder="Days">
                     </div>
                 </div>
 
@@ -2527,20 +2590,21 @@ def add_patient_page(request: Request, saved_id: int = None):
                     </div>
                     <div style="flex: 1;">
                         <label>Phone Number:</label>
-                        <input type="text" name="phone" placeholder="0771234567">
+                        <input type="text" name="phone" id="phoneInput" placeholder="0771234567" oninput="onPhoneInput()">
+                        <span id="phoneLookupStatus" style="font-size:12px; color:#0f4c81; display:block; margin-top:3px;"></span>
                     </div>
                 </div>
 
                 <div class="form-group row-group">
                     <div style="flex: 1;">
                         <label>Referred Doctor:</label>
-                        <select name="doctor" required>
+                        <select name="doctor" id="doctorSelect" required>
                             {doctor_options}
                         </select>
                     </div>
                     <div style="flex: 1;">
                         <label>Collecting Center:</label>
-                        <select name="collecting_center" required>
+                        <select name="collecting_center" id="centerSelect" required>
                             {center_options}
                         </select>
                     </div>
@@ -2566,6 +2630,52 @@ def add_patient_page(request: Request, saved_id: int = None):
                     gender.value = "Male";
                 }} else if (title === "Mrs." || title === "Miss") {{
                     gender.value = "Female";
+                }}
+            }}
+
+            // Auto-fill by phone number: after a short pause in typing,
+            // look up existing patients with this exact phone number and
+            // fill in the rest of the form. Every filled field stays a
+            // normal, fully editable input - this only pre-populates it.
+            let phoneLookupTimer = null;
+            function onPhoneInput() {{
+                clearTimeout(phoneLookupTimer);
+                const phone = document.getElementById("phoneInput").value.trim();
+                const status = document.getElementById("phoneLookupStatus");
+                if (phone.length < 7) {{
+                    status.textContent = "";
+                    return;
+                }}
+                phoneLookupTimer = setTimeout(() => lookupPatientByPhone(phone), 450);
+            }}
+
+            async function lookupPatientByPhone(phone) {{
+                const status = document.getElementById("phoneLookupStatus");
+                try {{
+                    status.textContent = "Searching...";
+                    const res = await fetch("/api/lookup-patient-by-phone?phone=" + encodeURIComponent(phone));
+                    const data = await res.json();
+                    if (!data.found) {{
+                        status.textContent = "No existing patient found for this number - new record.";
+                        return;
+                    }}
+                    if (data.title) document.getElementById("titleSelect").value = data.title;
+                    if (data.name) document.getElementById("nameInput").value = data.name;
+                    document.getElementById("ageYearsInput").value = data.age_years ?? 0;
+                    document.getElementById("ageMonthsInput").value = data.age_months ?? 0;
+                    document.getElementById("ageDaysInput").value = data.age_days ?? 0;
+                    if (data.gender) document.getElementById("genderSelect").value = data.gender;
+                    if (data.doctor) {{
+                        const doctorSel = document.getElementById("doctorSelect");
+                        if ([...doctorSel.options].some(o => o.value === data.doctor)) doctorSel.value = data.doctor;
+                    }}
+                    if (data.collecting_center) {{
+                        const centerSel = document.getElementById("centerSelect");
+                        if ([...centerSel.options].some(o => o.value === data.collecting_center)) centerSel.value = data.collecting_center;
+                    }}
+                    status.textContent = "Existing patient found - fields auto-filled. You can still edit them.";
+                }} catch (err) {{
+                    status.textContent = "";
                 }}
             }}
 
@@ -5615,6 +5725,228 @@ def report_download(patient_id: int, test_id: int, request: Request):
     )
 
 # -------------------------------------------------------------
+# SHAREABLE REPORT LINKS (for WhatsApp / public sharing)
+# -------------------------------------------------------------
+# Uses the new, additive-only `share_links` table (see init_db). Does not
+# alter report_view/report_download or any existing table - it only maps
+# a random, unguessable token to an existing (patient_id, test_id) pair.
+
+@app.get("/share-reports", response_class=HTMLResponse)
+def share_reports_page(request: Request, q: str = ""):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return render_locked_page("Share Reports")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    search_results_html = ""
+    if q.strip():
+        like = f"%{q.strip()}%"
+        cursor.execute("""
+            SELECT p.id, p.name, p.phone, pat.test_id, t.test_name
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            WHERE p.name LIKE ? OR p.phone LIKE ? OR CAST(p.id AS TEXT) = ?
+            ORDER BY p.id DESC, t.test_name ASC
+            LIMIT 50
+        """, (like, like, q.strip()))
+        rows = cursor.fetchall()
+        if rows:
+            for r in rows:
+                p_id, p_name, p_phone, t_id, t_name = r[0], r[1], r[2], r[3], r[4]
+                search_results_html += f"""
+                <tr>
+                    <td style="padding:10px; border-bottom:1px solid #eee;">#{p_id}</td>
+                    <td style="padding:10px; border-bottom:1px solid #eee; font-weight:600;">{html.escape(p_name or "")}</td>
+                    <td style="padding:10px; border-bottom:1px solid #eee;">{html.escape(p_phone or "")}</td>
+                    <td style="padding:10px; border-bottom:1px solid #eee;">{html.escape(t_name or "")}</td>
+                    <td style="padding:10px; border-bottom:1px solid #eee; text-align:right;">
+                        <form action="/generate-share-link" method="post" style="display:inline;">
+                            <input type="hidden" name="patient_id" value="{p_id}">
+                            <input type="hidden" name="test_id" value="{t_id}">
+                            <button type="submit" style="background:#25D366; color:white; border:none; padding:8px 14px; border-radius:6px; font-weight:bold; cursor:pointer; font-size:12px;">
+                                <i class="fa-brands fa-whatsapp"></i> Generate Link
+                            </button>
+                        </form>
+                    </td>
+                </tr>
+                """
+        else:
+            search_results_html = '<tr><td colspan="5" style="padding:16px; text-align:center; color:#94a3b8;">No matching patients/tests found.</td></tr>'
+
+    cursor.execute("""
+        SELECT sl.token, sl.patient_id, sl.test_id, sl.created_at, p.name, t.test_name
+        FROM share_links sl
+        JOIN patients p ON p.id = sl.patient_id
+        JOIN tests t ON t.id = sl.test_id
+        ORDER BY sl.id DESC
+        LIMIT 20
+    """)
+    recent = cursor.fetchall()
+    conn.close()
+
+    base_url = str(request.base_url).rstrip("/")
+    recent_rows_html = ""
+    for token, p_id, t_id, created_at, p_name, t_name in recent:
+        share_url = f"{base_url}/shared-report/{token}"
+        wa_text = quote(f"Hello, here is your lab report for {t_name}: {share_url}")
+        recent_rows_html += f"""
+        <tr>
+            <td style="padding:10px; border-bottom:1px solid #eee; font-weight:600;">{html.escape(p_name or "")}</td>
+            <td style="padding:10px; border-bottom:1px solid #eee;">{html.escape(t_name or "")}</td>
+            <td style="padding:10px; border-bottom:1px solid #eee;">
+                <input type="text" readonly value="{share_url}" onclick="this.select();"
+                       style="width:100%; padding:6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;">
+            </td>
+            <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; white-space:nowrap;">
+                <a href="https://wa.me/?text={wa_text}" target="_blank"
+                   style="background:#25D366; color:white; padding:6px 10px; text-decoration:none; border-radius:4px; font-size:12px; font-weight:bold; margin-right:5px;">
+                    <i class="fa-brands fa-whatsapp"></i> WhatsApp
+                </a>
+                <a href="{share_url}" target="_blank"
+                   style="background:#0f4c81; color:white; padding:6px 10px; text-decoration:none; border-radius:4px; font-size:12px; font-weight:bold;">
+                    Open
+                </a>
+            </td>
+        </tr>
+        """
+    if not recent_rows_html:
+        recent_rows_html = '<tr><td colspan="4" style="padding:16px; text-align:center; color:#94a3b8;">No share links generated yet.</td></tr>'
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Share Reports</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 30px; }}
+            .container {{ max-width: 1000px; margin: auto; }}
+            .card {{ background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); margin-bottom: 20px; }}
+            h2 {{ color: #0f4c81; margin-top: 0; }}
+            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0f4c81; text-decoration: none; font-weight: bold; }}
+            .search-box {{ display:flex; gap:10px; margin-bottom: 15px; }}
+            .search-box input {{ flex:1; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }}
+            .search-box button {{ background: #0f4c81; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th {{ text-align: left; padding: 10px; background: #f1f5f9; font-size: 13px; color: #334155; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
+            <div class="card">
+                <h2><i class="fa-brands fa-whatsapp"></i> Share Reports</h2>
+                <p style="color:#64748b; font-size:13px;">Search for a patient by name, phone, or ID to generate a secure, shareable report link you can send via WhatsApp.</p>
+                <form class="search-box" method="get" action="/share-reports">
+                    <input type="text" name="q" value="{html.escape(q)}" placeholder="Search by patient name, phone, or ID...">
+                    <button type="submit"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
+                </form>
+                {"<table><tr><th>ID</th><th>Name</th><th>Phone</th><th>Test</th><th style='text-align:right;'>Action</th></tr>" + search_results_html + "</table>" if q.strip() else ""}
+            </div>
+            <div class="card">
+                <h2 style="font-size:18px;">Recently Generated Links</h2>
+                <table>
+                    <tr><th>Patient</th><th>Test</th><th>Link</th><th style="text-align:right;">Share</th></tr>
+                    {recent_rows_html}
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/generate-share-link")
+async def generate_share_link(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return render_locked_page("Share Reports")
+
+    form_data = await request.form()
+    try:
+        patient_id = int(form_data.get("patient_id"))
+        test_id = int(form_data.get("test_id"))
+    except (TypeError, ValueError):
+        return RedirectResponse(url="/share-reports", status_code=303)
+
+    token = secrets.token_urlsafe(24)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO share_links (token, patient_id, test_id, created_at, created_by) VALUES (?, ?, ?, ?, ?)",
+        (token, patient_id, test_id, now_colombo().isoformat(timespec="seconds"), current_user.get("username", ""))
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url="/share-reports", status_code=303)
+
+
+@app.get("/shared-report/{token}", response_class=HTMLResponse)
+def shared_report_view(token: str, request: Request):
+    """
+    Public-facing report page - intentionally requires NO login, since this
+    is the link a patient opens directly from WhatsApp. Access is gated
+    entirely by possession of the random, unguessable token rather than a
+    session, exactly like the pattern already used by the existing QR-code
+    download link on the printed report.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT patient_id, test_id FROM share_links WHERE token = ?", (token,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return HTMLResponse("<h2 style='font-family:Arial; text-align:center; margin-top:80px; color:#e74c3c;'>This report link is invalid or has expired.</h2>", status_code=404)
+
+    patient_id, test_id = row[0], row[1]
+    inner_report = report_view(patient_id, test_id, request)
+    if isinstance(inner_report, HTMLResponse):
+        inner_html = inner_report.body.decode("utf-8")
+    elif isinstance(inner_report, str):
+        inner_html = inner_report
+    else:
+        return inner_report
+
+    # Add a simple "Download PDF" bar above the existing report content,
+    # using the token so the patient never sees/needs the real patient_id
+    # or test_id in their URL bar.
+    download_bar = f"""
+    <div style="max-width:900px; margin:16px auto 0 auto; text-align:center;">
+        <a href="/shared-report/{token}/download"
+           style="display:inline-block; background:#0f4c81; color:white; padding:12px 26px; border-radius:8px; text-decoration:none; font-weight:bold; font-family:Arial, sans-serif;">
+            <i class="fa-solid fa-download"></i> Download Report (PDF)
+        </a>
+    </div>
+    """
+    if "</body>" in inner_html:
+        inner_html = inner_html.replace("</body>", download_bar + "</body>")
+    else:
+        inner_html = inner_html + download_bar
+
+    return HTMLResponse(inner_html)
+
+
+@app.get("/shared-report/{token}/download")
+def shared_report_download(token: str, request: Request):
+    """Public PDF download counterpart to /shared-report/{token}."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT patient_id, test_id FROM share_links WHERE token = ?", (token,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return HTMLResponse("<h2 style='font-family:Arial; text-align:center; margin-top:80px; color:#e74c3c;'>This report link is invalid or has expired.</h2>", status_code=404)
+
+    patient_id, test_id = row[0], row[1]
+    return report_download(patient_id, test_id, request)
+
+# -------------------------------------------------------------
 # PROFESSIONAL LAB REPORT VIEW (Letterhead Background, QR, Sig, Comment Box)
 # -------------------------------------------------------------
 @app.get("/report-letterhead-preview/{patient_id}/{test_id}", response_class=HTMLResponse)
@@ -5836,7 +6168,16 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             n_col=next((c for c in possible_cols if c in cols), "param_name" if "param_name" in cols else cols[1])
             u_col=next((c for c in ["unit","units"] if c in cols),None)
             r_col=next((c for c in ["normal_range","reference_range","ref_range","range","normal","default_ref_range"] if c in cols),None)
-            cursor.execute(f"SELECT * FROM {tbl} WHERE test_id = ? ORDER BY id ASC",(test_id,))
+            # Respect the custom display order saved on the "Manage
+            # Parameters" screen (Save Parameter Order). Not every
+            # possible_tables candidate has a display_order column (some
+            # are legacy/alternate schemas), so only add it to the ORDER
+            # BY when it actually exists - otherwise keep the previous
+            # id-based fallback exactly as before.
+            order_clause = "id ASC"
+            if "display_order" in cols:
+                order_clause = "display_order ASC, id ASC"
+            cursor.execute(f"SELECT * FROM {tbl} WHERE test_id = ? ORDER BY {order_clause}",(test_id,))
             got=cursor.fetchall()
             if got:
                 params=got; name_col=n_col; unit_col=u_col; range_col=r_col; break
