@@ -6351,7 +6351,29 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             "eosinophils": "Absolute Eosinophils",
             "basophils": "Absolute Basophils",
         }
-        diff_rows = ""
+
+        def _abs_diff_row(cells):
+            row_cells = []
+            for idx, (cell_value, cell_align, cell_weight, cell_color) in enumerate(cells):
+                if cell_align == "none":
+                    continue
+                row_cells.append(
+                    f'<td style="width:{col_widths[idx]:.2f}%;padding:4px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.15;">{cell_value}</td>'
+                )
+            return "<tr>" + "".join(row_cells) + "</tr>"
+
+        # Section heading rendered as an ordinary row in the SAME table -
+        # same column widths/alignment as every other row, plain black
+        # bold text (matching the existing "DIFFERENTIAL COUNT" heading
+        # row style above), no separate table, no colored accent border.
+        diff_section_html = _abs_diff_row([
+            ("ABSOLUTE DIFFERENTIAL COUNT", align_inv, "bold", "#000"),
+            ("-", align_res, "normal", "#000"),
+            ("", align_flag, "normal", "#000"),
+            ("", align_unit, "normal", "#333"),
+            ("", align_ref, "normal", "#333"),
+        ])
+
         # Fixed clinical order, regardless of the order parameters happen
         # to be entered/displayed in above.
         for key in DIFFERENTIAL_NAMES:
@@ -6359,36 +6381,26 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 continue
             pct_value = differential_percentages[key]
             absolute_value = (total_wbc_value * pct_value) / 100.0
-            diff_rows += (
-                "<tr>"
-                f'<td style="padding:4px 7px;text-align:left;">{diff_labels[key]}</td>'
-                f'<td style="padding:4px 7px;text-align:center;font-weight:bold;">{absolute_value:.2f}</td>'
-                '<td style="padding:4px 7px;text-align:center;color:#333;">&times;10&sup3;/&micro;L</td>'
-                "</tr>"
-            )
-        if diff_rows:
-            absolute_diff_html = f"""
-            <div class="abs-diff-section" style="margin-top:6px;margin-bottom:4px;">
-                <div style="font-weight:bold;font-size:11.5px;color:#0d47a1;border-bottom:1px solid #0d47a1;padding-bottom:2px;margin-bottom:4px;">
-                    ABSOLUTE DIFFERENTIAL COUNT (Calculated)
-                </div>
-                <table style="width:100%;border-collapse:collapse;font-size:11px;">
-                    <thead>
-                        <tr style="background:#f4f7fe;">
-                            <th style="padding:4px 7px;text-align:left;">Parameter</th>
-                            <th style="padding:4px 7px;text-align:center;">Value</th>
-                            <th style="padding:4px 7px;text-align:center;">Unit</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {diff_rows}
-                    </tbody>
-                </table>
-                <div style="font-size:9px;color:#777;margin-top:2px;">
-                    Calculated as Total WBC &times; Differential % &divide; 100 (equivalent to &times;10&sup9;/L). Auto-generated - not manually entered.
-                </div>
-            </div>
-            """
+            diff_section_html += _abs_diff_row([
+                (diff_labels[key], align_inv, "normal", "#000"),
+                (f"{absolute_value:.2f}", align_res, "normal", "#000"),
+                ("", align_flag, "normal", "#000"),
+                ("&times;10&sup3;/&micro;L", align_unit, "normal", "#333"),
+                ("", align_ref, "normal", "#333"),
+            ])
+
+        # Append directly into the main results table body, so these rows
+        # share its exact column widths/alignment/borders instead of a
+        # separate standalone table.
+        rows_html += diff_section_html
+
+        # Small, subtle footnote below the table - not a table row.
+        absolute_diff_html = (
+            '<div style="font-size:9px;color:#777;margin-top:4px;">'
+            'Calculated as Total WBC &times; Differential % &divide; 100 '
+            '(equivalent to &times;10&sup9;/L). Auto-generated - not manually entered.'
+            '</div>'
+        )
 
     barcode_url = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
     download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
