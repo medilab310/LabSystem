@@ -6219,11 +6219,44 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 params=got; name_col=n_col; unit_col=u_col; range_col=r_col; break
         except (sqlite3.Error,TypeError,ValueError): continue
 
-    rows_html=""
+    rows_html = ""
+    # For the FBC Absolute Differential Count sub-section (fix #2 below).
+    # Populated from whatever gets displayed in the main table above, so
+    # it always matches what the user actually entered - never a second
+    # database read, never anything written back to the DB.
+    total_wbc_value = None
+    differential_percentages = {}  # e.g. "neutrophils" -> 62.0
+    DIFFERENTIAL_NAMES = ["neutrophils", "lymphocytes", "monocytes", "eosinophils", "basophils"]
+
+    def _try_float(value):
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
+    visible_col_count = sum(col_visible) or 1
+
     if params:
         for p in params:
             d=dict(p); p_id=d.get("id")
-            p_name=str(d.get(name_col,"Parameter") or "Parameter").strip()
+
+            # FIX #1: Some parameter rows are deliberately named "." (or
+            # left blank) purely to create a visual gap between groups of
+            # parameters on the report (e.g. separating RBC indices from
+            # the differential count). Previously these rendered as a
+            # literal "." with a normal border. Render them instead as a
+            # clean, borderless spacer row - same vertical gap, nothing
+            # visible.
+            raw_name_val = d.get(name_col)
+            raw_name_str = str(raw_name_val).strip() if raw_name_val is not None else ""
+            if raw_name_str in ("", ".", "-", "_"):
+                rows_html += (
+                    f'<tr><td colspan="{visible_col_count}" '
+                    'style="border:none;padding:0;height:10px;line-height:10px;">&nbsp;</td></tr>'
+                )
+                continue
+
+            p_name=raw_name_str or "Parameter"
             unit=str(d.get(unit_col,"") or "").strip() if unit_col else ""
             default_ref=str(d.get(range_col,"") or "").strip() if range_col else ""
             matched=select_best_ref_range(cursor,int(p_id),patient_gender,patient_age_days) if p_id is not None else None
@@ -6239,6 +6272,23 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                     rr=cursor.fetchone()
                     if rr and rr["result_value"] is not None and str(rr["result_value"]).strip(): res=str(rr["result_value"]).strip()
                 except sqlite3.Error: pass
+
+            # Capture Total WBC / differential % values for the Absolute
+            # Differential Count sub-section, purely in-memory for this
+            # render - never written back to the database.
+            p_name_lower = p_name.lower()
+            if "wbc" in p_name_lower or "white blood cell" in p_name_lower:
+                wbc_val = _try_float(res)
+                if wbc_val is not None:
+                    total_wbc_value = wbc_val
+            else:
+                for diff_name in DIFFERENTIAL_NAMES:
+                    if diff_name in p_name_lower:
+                        pct_val = _try_float(res)
+                        if pct_val is not None:
+                            differential_percentages[diff_name] = pct_val
+                        break
+
             flag,is_abnormal=evaluate_result_flag(res,ref_range)
             result_weight="bold" if is_abnormal else "normal"
             investigation_weight="bold" if int(d.get("is_bold", 0) or 0) else "normal"
@@ -6277,6 +6327,68 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
         rows_html = "<tr>" + "".join(row_cells) + "</tr>"
     else:
         rows_html='<tr><td colspan="5" style="text-align:center;padding:15px;color:#777;border-bottom:none;">No parameters or results found for this test.</td></tr>'
+
+    # -----------------------------------------------------------------
+    # FIX #2: Auto-calculated Absolute Differential Count for FBC.
+    # Purely a render-time calculation from whatever Total WBC / % values
+    # were already displayed above - nothing is written to the database,
+    # and nothing changes for any test other than FBC.
+    # -----------------------------------------------------------------
+    test_code_val = ""
+    try:
+        if test_row and "test_code" in test_row.keys() and test_row["test_code"]:
+            test_code_val = str(test_row["test_code"]).strip().upper()
+    except Exception:
+        pass
+    is_fbc = test_code_val == "FBC" or "FULL BLOOD COUNT" in test_name.upper() or "FBC" in test_name.upper()
+
+    absolute_diff_html = ""
+    if is_fbc and total_wbc_value is not None and differential_percentages:
+        diff_labels = {
+            "neutrophils": "Absolute Neutrophils",
+            "lymphocytes": "Absolute Lymphocytes",
+            "monocytes": "Absolute Monocytes",
+            "eosinophils": "Absolute Eosinophils",
+            "basophils": "Absolute Basophils",
+        }
+        diff_rows = ""
+        # Fixed clinical order, regardless of the order parameters happen
+        # to be entered/displayed in above.
+        for key in DIFFERENTIAL_NAMES:
+            if key not in differential_percentages:
+                continue
+            pct_value = differential_percentages[key]
+            absolute_value = (total_wbc_value * pct_value) / 100.0
+            diff_rows += (
+                "<tr>"
+                f'<td style="padding:4px 7px;text-align:left;">{diff_labels[key]}</td>'
+                f'<td style="padding:4px 7px;text-align:center;font-weight:bold;">{absolute_value:.2f}</td>'
+                '<td style="padding:4px 7px;text-align:center;color:#333;">&times;10&sup3;/&micro;L</td>'
+                "</tr>"
+            )
+        if diff_rows:
+            absolute_diff_html = f"""
+            <div class="abs-diff-section" style="margin-top:6px;margin-bottom:4px;">
+                <div style="font-weight:bold;font-size:11.5px;color:#0d47a1;border-bottom:1px solid #0d47a1;padding-bottom:2px;margin-bottom:4px;">
+                    ABSOLUTE DIFFERENTIAL COUNT (Calculated)
+                </div>
+                <table style="width:100%;border-collapse:collapse;font-size:11px;">
+                    <thead>
+                        <tr style="background:#f4f7fe;">
+                            <th style="padding:4px 7px;text-align:left;">Parameter</th>
+                            <th style="padding:4px 7px;text-align:center;">Value</th>
+                            <th style="padding:4px 7px;text-align:center;">Unit</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {diff_rows}
+                    </tbody>
+                </table>
+                <div style="font-size:9px;color:#777;margin-top:2px;">
+                    Calculated as Total WBC &times; Differential % &divide; 100 (equivalent to &times;10&sup9;/L). Auto-generated - not manually entered.
+                </div>
+            </div>
+            """
 
     barcode_url = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
     download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
@@ -6470,6 +6582,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                     {rows_html}
                 </tbody>
             </table>
+
+            {absolute_diff_html}
 
             {"<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else ""}
             {test_notes_html}
