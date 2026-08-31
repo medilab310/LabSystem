@@ -4918,7 +4918,7 @@ def test_entry_page(patient_id: int, test_id: int):
             param_form_html += f"""
             <div style="display:grid; grid-template-columns: minmax(180px,2fr) minmax(120px,3fr) 100px; margin-bottom: 12px; align-items:center; gap:12px;">
                 <label style="font-weight:600;color:#334155;font-size:14px;">{html.escape(str(p_name_val))}{badge}{ref_html}</label>
-                <input type="text" name="param_{test_id}_{p_id_param}" value="{html.escape(final_val)}" placeholder="{'Auto calculated' if is_calculated else 'Enter result...'}" {calc_attr}>
+                <input type="text" name="param_{test_id}_{p_id_param}" value="{html.escape(final_val)}" placeholder="{'Auto calculated' if is_calculated else 'Enter result...'}" class="param-input" onkeydown="handleParamKeyNav(event, this)" {calc_attr}>
                 {unit_html}
             </div>
             """
@@ -5042,6 +5042,24 @@ def test_entry_page(patient_id: int, test_id: int):
                 .no-print {{ display: none !important; }}
             }}
         </style>
+        <script>
+            // Down Arrow / Enter -> next parameter field, Up Arrow -> previous.
+            // Scoped to the enclosing <form>, and preventDefault() on Enter
+            // stops the form from submitting prematurely.
+            function handleParamKeyNav(event, inputEl) {{
+                if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter") return;
+                event.preventDefault();
+                var scope = inputEl.closest('form') || document;
+                var inputs = Array.prototype.slice.call(scope.querySelectorAll('.param-input'));
+                var idx = inputs.indexOf(inputEl);
+                if (idx === -1) return;
+                var nextIdx = (event.key === "ArrowUp") ? idx - 1 : idx + 1;
+                if (nextIdx >= 0 && nextIdx < inputs.length) {{
+                    inputs[nextIdx].focus();
+                    if (inputs[nextIdx].select) inputs[nextIdx].select();
+                }}
+            }}
+        </script>
     </head>
     <body>
         <div class="container">
@@ -5269,7 +5287,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 for tbl in ["test_parameters", "parameters", "sub_tests", "test_fields"]:
                     for col in ["parameter_name", "name", "param_name"]:
                         try:
-                            cursor.execute(f"SELECT id, {col} as p_name, default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
+                            cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
                             params = cursor.fetchall()
                             if params: break
                         except:
@@ -5348,7 +5366,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                         categories_html += f"""
                         <div style="display: flex; align-items: center; gap: 12px;">
                             <label style="flex: 1; font-size: 13px; font-weight: 600; color: #475569;">{p_name_val}</label>
-                            <input type="text" name="param_{t_id}_{p_id_param}" value="{final_val}" placeholder="Result..." {value_input_attr}>
+                            <input type="text" name="param_{t_id}_{p_id_param}" value="{final_val}" placeholder="Result..." class="param-input" onkeydown="handleParamKeyNav(event, this)" {value_input_attr}>
                         </div>
                         """
                     categories_html += "</div>"
@@ -5445,6 +5463,24 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 field.value = text.substring(0, start) + startTag + text.substring(start, end) + endTag + text.substring(end);
                 field.focus();
                 field.setSelectionRange(start + startTag.length, end + startTag.length);
+            }}
+
+            // Down Arrow / Enter -> next parameter field, Up Arrow -> previous.
+            // Scoped to the enclosing <form> so navigation stays within one
+            // test's group of parameters, and preventDefault() on Enter stops
+            // the form from submitting prematurely.
+            function handleParamKeyNav(event, inputEl) {{
+                if (event.key !== "ArrowDown" && event.key !== "ArrowUp" && event.key !== "Enter") return;
+                event.preventDefault();
+                var scope = inputEl.closest('form') || document;
+                var inputs = Array.prototype.slice.call(scope.querySelectorAll('.param-input'));
+                var idx = inputs.indexOf(inputEl);
+                if (idx === -1) return;
+                var nextIdx = (event.key === "ArrowUp") ? idx - 1 : idx + 1;
+                if (nextIdx >= 0 && nextIdx < inputs.length) {{
+                    inputs[nextIdx].focus();
+                    if (inputs[nextIdx].select) inputs[nextIdx].select();
+                }}
             }}
         </script>
     </head>
