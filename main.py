@@ -2559,7 +2559,7 @@ def add_patient_page(request: Request, saved_id: int = None):
             <form action="/add-patient" method="post">
                 <div class="form-group" style="margin-bottom: 10px;">
                     <label>Manual Bill No.:</label>
-                    <input type="text" name="manual_bill_no" inputmode="numeric" maxlength="4" pattern="[0-9]{1,4}"
+                    <input type="text" name="manual_bill_no" inputmode="numeric" maxlength="4" pattern="[0-9]{{1,4}}"
                            placeholder="e.g. 042" style="max-width: 150px;">
                 </div>
                 <div class="form-group row-group">
@@ -2725,12 +2725,24 @@ async def add_patient_post(request: Request):
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # Safety check for older production databases: make sure the optional
+        # manual bill column exists before the INSERT. This is additive-only
+        # and preserves every existing patient row. The same migration also
+        # runs during startup, but keeping this guard here prevents a first
+        # registration request from failing if the database was deployed
+        # before the startup migration ran.
+        cursor.execute("PRAGMA table_info(patients)")
+        patient_columns = {row[1] for row in cursor.fetchall()}
+        if "manual_bill_no" not in patient_columns:
+            cursor.execute("ALTER TABLE patients ADD COLUMN manual_bill_no TEXT")
+            conn.commit()
+
         # Use the server's actual local date/time (not SQLite's built-in
         # CURRENT_TIMESTAMP default, which is UTC) so "Received On" reflects
         # correct local registration time.
         registration_timestamp = now_colombo().isoformat(timespec="seconds")
 
-        manual_bill_no = (form_data.get("manual_bill_no") or "").strip()
+        manual_bill_no = str(form_data.get("manual_bill_no") or "").strip()
         if manual_bill_no and not re.fullmatch(r"\d{1,4}", manual_bill_no):
             return HTMLResponse("<h3>Invalid Manual Bill No.</h3><p>Please enter 1-4 digits.</p><a href='/add-patient'>Go Back</a>", status_code=400)
 
