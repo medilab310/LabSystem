@@ -1135,6 +1135,11 @@ def init_db():
         cursor.execute("ALTER TABLE patients ADD COLUMN center TEXT DEFAULT 'Main Branch'")
     if "result_status" not in patient_columns:
         cursor.execute("ALTER TABLE patients ADD COLUMN result_status TEXT DEFAULT 'PENDING'")
+    # Additive-only migration for the optional manual bill number.
+    # Existing patient records are untouched and receive NULL/blank until
+    # a manual bill number is entered for a new or edited record.
+    if "manual_bill_no" not in patient_columns:
+        cursor.execute("ALTER TABLE patients ADD COLUMN manual_bill_no TEXT")
 
     cursor.execute("PRAGMA table_info(patient_assigned_tests)")
     assigned_columns = {row[1] for row in cursor.fetchall()}
@@ -2552,6 +2557,11 @@ def add_patient_page(request: Request, saved_id: int = None):
             </h2>
             {success_banner}
             <form action="/add-patient" method="post">
+                <div class="form-group" style="margin-bottom: 10px;">
+                    <label>Manual Bill No.:</label>
+                    <input type="text" name="manual_bill_no" inputmode="numeric" maxlength="4" pattern="[0-9]{1,4}"
+                           placeholder="e.g. 042" style="max-width: 150px;">
+                </div>
                 <div class="form-group row-group">
                     <div class="col-title">
                         <label>Title:</label>
@@ -2720,9 +2730,13 @@ async def add_patient_post(request: Request):
         # correct local registration time.
         registration_timestamp = now_colombo().isoformat(timespec="seconds")
 
+        manual_bill_no = (form_data.get("manual_bill_no") or "").strip()
+        if manual_bill_no and not re.fullmatch(r"\d{1,4}", manual_bill_no):
+            return HTMLResponse("<h3>Invalid Manual Bill No.</h3><p>Please enter 1-4 digits.</p><a href='/add-patient'>Go Back</a>", status_code=400)
+
         cursor.execute("""
-            INSERT INTO patients (title, name, age_years, age_months, age_days, gender, phone, doctor, collecting_center, center, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO patients (title, name, age_years, age_months, age_days, gender, phone, doctor, collecting_center, center, created_at, manual_bill_no)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             form_data.get("title"),
             form_data.get("name"),
@@ -2734,7 +2748,8 @@ async def add_patient_post(request: Request):
             form_data.get("doctor", "None"),
             form_data.get("collecting_center", "Main Branch"),
             form_data.get("collecting_center", "Main Branch"),
-            registration_timestamp
+            registration_timestamp,
+            manual_bill_no or None
         ))
         
         patient_id = cursor.lastrowid
@@ -5562,36 +5577,115 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
 # -------------------------------------------------------------
 @app.post("/update-patient-details")
 async def update_patient_details(request: Request):
+    """Persist demographic edits made from Result Entry / Patient Results.
+
+    The Result Entry form submits one human-readable `age` field (for example
+    `25 Y`), while the report/reference-range logic uses the normalized
+    age_years/age_months/age_days columns. The previous handler only updated
+    `age`, leaving `age_years` unchanged, so the screen could appear to save
+    while reports continued using the old age. This handler updates both the
+    legacy/display age and the normalized age columns in one transaction.
+    """
+    conn = None
     try:
         form_data = await request.form()
-        patient_id = form_data.get("patient_id")
-        if not patient_id:
+        patient_id_raw = (form_data.get("patient_id") or "").strip()
+        if not patient_id_raw:
             return HTMLResponse("<h3>Patient ID missing!</h3>", status_code=400)
-            
-        title = form_data.get("title")
-        name = form_data.get("name")
-        age = form_data.get("age")
-        gender = form_data.get("gender")
-        phone = form_data.get("phone")
-        doctor = form_data.get("doctor")
-        center = form_data.get("center")
-        
+
+        try:
+            patient_id = int(patient_id_raw)
+        except (TypeError, ValueError):
+            return HTMLResponse("<h3>Invalid Patient ID!</h3>", status_code=400)
+
+        title = (form_data.get("title") or "").strip()
+        name = (form_data.get("name") or "").strip()
+        age_raw = (form_data.get("age") or "").strip()
+        gender = (form_data.get("gender") or "").strip()
+        phone = (form_data.get("phone") or "").strip()
+        doctor = (form_data.get("doctor") or "").strip()
+        center = (form_data.get("center") or "").strip()
+
+        if not name:
+            return HTMLResponse("<h3>Patient name is required!</h3>", status_code=400)
+
+        # Normalize the editable age field into the columns used by the
+        # dynamic reference-range and eGFR logic. Supports: `25`, `25 Y`,
+        # `25Y 3M`, and `25Y 3M 5D`. Empty age is allowed.
+        age_years = 0
+        age_months = 0
+        age_days = 0
+        age_db_value = None
+        if age_raw:
+            y_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:y|yr|yrs|year|years)?\b", age_raw, re.I)
+            m_match = re.search(r"(\d+)\s*(?:m|mo|mos|month|months)\b", age_raw, re.I)
+            d_match = re.search(r"(\d+)\s*(?:d|day|days)\b", age_raw, re.I)
+
+            # A plain numeric value means years.
+            if y_match:
+                try:
+                    age_years = int(float(y_match.group(1)))
+                except (TypeError, ValueError):
+                    age_years = 0
+            if m_match:
+                age_months = max(0, min(11, int(m_match.group(1))))
+            if d_match:
+                age_days = max(0, min(30, int(d_match.group(1))))
+
+            if not (y_match or m_match or d_match):
+                plain = re.fullmatch(r"\d+(?:\.\d+)?", age_raw)
+                if not plain:
+                    return HTMLResponse("<h3>Invalid age format!</h3><p>Use e.g. 25 Y or 25Y 3M.</p><a href='/patient-results/%s'>Go Back</a>" % patient_id, status_code=400)
+                age_years = int(float(age_raw))
+
+            # Keep the legacy `age` field numeric for compatibility with the
+            # existing schema and older code paths.
+            age_db_value = age_years
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Update patients table based on standard column names
+
+        # Update all demographic fields used by the existing Result Entry and
+        # Report View routes. Update both center columns because older records
+        # and current registration use collecting_center/center interchangeably.
         cursor.execute("""
-            UPDATE patients 
-            SET title = ?, name = ?, age = ?, gender = ?, phone = ?, doctor = ?, center = ?
+            UPDATE patients
+            SET title = ?,
+                name = ?,
+                age = ?,
+                age_years = ?,
+                age_months = ?,
+                age_days = ?,
+                gender = ?,
+                phone = ?,
+                doctor = ?,
+                collecting_center = ?,
+                center = ?
             WHERE id = ?
-        """, (title, name, age, gender, phone, doctor, center, patient_id))
-        
+        """, (
+            title, name, age_db_value, age_years, age_months, age_days,
+            gender, phone, doctor, center, center, patient_id
+        ))
+
+        if cursor.rowcount == 0:
+            conn.rollback()
+            conn.close()
+            return HTMLResponse("<h3>Patient not found!</h3>", status_code=404)
+
         conn.commit()
         conn.close()
-        
+
+        # The redirected page performs a fresh DB read, so the new details
+        # are immediately visible and report_view will use the new age/gender.
         return RedirectResponse(url=f"/patient-results/{patient_id}?updated=1", status_code=303)
     except Exception as e:
-        return HTMLResponse(content=f"<h3>Error updating patient details: {str(e)}</h3>", status_code=500)
+        if conn is not None:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        return HTMLResponse(content=f"<h3>Error updating patient details: {html.escape(str(e))}</h3>", status_code=500)
 
 # =============================================================
 # 2. SAVE TEST RESULTS ROUTE (Fixed with Comment Support)
@@ -6045,6 +6139,10 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
     )
 
     ref_no = f"Med-{patient.get('id', 0):04d}"
+    manual_bill_no = str(patient.get("manual_bill_no") or "").strip()
+    # Keep the existing reference number unchanged when no manual bill was
+    # entered; otherwise append it exactly once using the requested slash.
+    display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
 
     def format_report_datetime(value):
         if not value or str(value).strip().lower() == "none":
@@ -6541,7 +6639,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                         <td style="width: 34%; font-weight: bold;">{patient_name}</td>
                         <td style="width: 14%; font-weight: bold; color: #000;">Reference No</td>
                         <td style="width: 2%;">:</td>
-                        <td style="width: 34%; font-weight: bold;">{ref_no}</td>
+                        <td style="width: 34%; font-weight: bold;">{display_ref_no}</td>
                     </tr>
                     <tr>
                         <td style="font-weight: bold; color: #000;">Gender / Age</td>
