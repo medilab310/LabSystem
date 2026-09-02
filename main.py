@@ -6595,7 +6595,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 text-align: center; 
                 font-size: 10px !important; 
                 min-width: 350px; 
-                margin-right: -12px; 
+                margin-right: -24px; 
                 display: flex;
                 flex-direction: column;
                 align-items: center;
@@ -6611,7 +6611,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 margin-left: 10px; 
             }}
 
-            .report-footer {{ margin-top: 12px; text-align: center; font-size: 10px !important; font-weight: 700; color: #000; border-top: 1px solid #000; padding-top: 5px; }}
+            .report-footer {{ margin-top: 4px; text-align: center; font-size: 9px !important; font-weight: normal; color: #000; padding-top: 0; }}
 
             @media print {{
                 body {{ background: none; padding: 0; margin: 0; }}
@@ -6646,12 +6646,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             <div class="patient-box">
                 <table class="header-table">
                     <tr>
-                        <td style="width: 14%; font-weight: bold; color: #000;">Patient Name</td>
-                        <td style="width: 2%;">:</td>
-                        <td style="width: 34%; font-weight: bold;">{patient_name}</td>
-                        <td style="width: 14%; font-weight: bold; color: #000;">Reference No</td>
-                        <td style="width: 2%;">:</td>
-                        <td style="width: 34%; font-weight: bold;">{display_ref_no}</td>
+                        <td style="width: 12%; font-weight: bold; color: #000;">Patient Name</td>
+                        <td style="width: 1%;">:</td>
+                        <td style="width: 44%; font-weight: bold;">{patient_name}</td>
+                        <td style="width: 10%; font-weight: bold; color: #000;">Reference No</td>
+                        <td style="width: 1%;">:</td>
+                        <td style="width: 32%; font-weight: bold;">{display_ref_no}</td>
                     </tr>
                     <tr>
                         <td style="font-weight: bold; color: #000;">Gender / Age</td>
@@ -6718,14 +6718,13 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 </div>
                 <div class="sig-wrapper-new">
                     <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" onerror="this.style.display='none';">
-                    <b style="margin-bottom: 1px;">S.P.Jananga</b>
-                    <span style="font-size: 10px; color: #222; margin-bottom: 1px; display: block;">Medical Laboratory Technologist (MLT)</span>
-                    <span style="font-size: 10px; color: #444; display: block;">SLMC No 2867</span>
+                    <b style="margin-bottom: 1px; font-size: 9px !important;">S.P.Jananga</b>
+                    <span style="font-size: 9px !important; color: #222; margin-bottom: 1px; display: block;">Medical Laboratory Technologist (MLT)</span>
+                    <span style="font-size: 9px !important; color: #444; display: block;">SLMC No 2867</span>
+                    <div class="report-footer">
+                        Printed on: {printed_on}
+                    </div>
                 </div>
-            </div>
-
-            <div class="report-footer">
-                Printed on: {printed_on}
             </div>
         </div>
 
