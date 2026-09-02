@@ -2743,8 +2743,8 @@ async def add_patient_post(request: Request):
         registration_timestamp = now_colombo().isoformat(timespec="seconds")
 
         manual_bill_no = str(form_data.get("manual_bill_no") or "").strip()
-        if manual_bill_no and not re.fullmatch(r"\d{1,4}", manual_bill_no):
-            return HTMLResponse("<h3>Invalid Manual Bill No.</h3><p>Please enter 1-4 digits.</p><a href='/add-patient'>Go Back</a>", status_code=400)
+        if manual_bill_no and len(manual_bill_no) > 10:
+            return HTMLResponse("<h3>Invalid Manual Bill No.</h3><p>Manual Bill No. must be 10 characters or less.</p><a href='/add-patient'>Go Back</a>", status_code=400)
 
         cursor.execute("""
             INSERT INTO patients (title, name, age_years, age_months, age_days, gender, phone, doctor, collecting_center, center, created_at, manual_bill_no)
