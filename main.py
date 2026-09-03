@@ -6625,8 +6625,6 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 box-sizing: border-box; 
                 box-shadow: 0 4px 15px rgba(0,0,0,0.15); 
                 position: relative; 
-                display: flex;
-                flex-direction: column;
             }}
             
             .top-barcode-container {{ text-align: right; margin-bottom: 8px; }}
@@ -6647,26 +6645,17 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
             .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
 
-            /* Bottom block (QR + MLT/Signature) pushed down to the very
-               bottom of the page for typical (single-page) reports, using
-               the standard CSS "sticky footer" pattern: .report-page is
-               now a column flexbox, and margin-top:auto absorbs any
-               leftover vertical space, pushing this block to the bottom.
-               Critically, this degrades safely for long reports (many
-               parameters): if the report content already fills or
-               exceeds one page, the auto margin simply collapses to ~0
-               and this block sits right after the table instead of
-               being forced to the bottom - so it can never overlap the
-               report table's own content, unlike a fixed/absolute
-               bottom position would.
-               margin-bottom: 45mm lifts the whole block clear of the
-               bottom edge so it sits above the pre-printed letterhead
-               paper's bottom zone instead of overlapping it. Scoped to
-               just this block - the page's own padding (and therefore
-               the rest of the report layout) is untouched. */
+            /* Footer (QR + MLT/Signature + Printed On) now sits in plain,
+               natural document flow directly below the "END OF REPORT"
+               line - no forced bottom positioning, no sticky-footer flex
+               trick, no fixed offset. A short report ends with a compact
+               footer right after its short table; a long, multi-parameter
+               report (e.g. FBC) simply flows the footer further down the
+               page, exactly where the content naturally ends. This is
+               what keeps long reports from overflowing or triggering
+               awkward forced page breaks. */
             .report-bottom-fixed {{
-                margin-top: auto;
-                margin-bottom: 45mm;
+                margin-top: 18px;
                 width: 100%;
             }}
             .bottom-section {{ 
@@ -6812,7 +6801,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             <hr class="section-divider">
             <div class="end-report-text">*** END OF REPORT ***</div>
 
-            <!-- Bottom Section: pinned to page bottom. QR Left, MLT/Signature + Printed-on Right -->
+            <!-- Footer: QR Left, MLT/Signature + Printed-on Right. Sits
+                 directly below "END OF REPORT" in normal document flow. -->
             <div class="report-bottom-fixed">
                 <div class="bottom-section">
                     <div class="qr-container">
