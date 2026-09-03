@@ -6169,7 +6169,7 @@ def report_letterhead_preview(patient_id: int, test_id: int, request: Request):
 
 
 @app.get("/report-view/{patient_id}/{test_id}", response_class=HTMLResponse)
-def report_view(patient_id: int, test_id: int, request: Request, letterhead: int = 1):
+def report_view(patient_id: int, test_id: int, request: Request, letterhead: int = 0):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -6653,6 +6653,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             .report-note, .report-test-note {{ margin-top: 10px; padding: 0; font-size: 10px !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 12px 0 8px 0; letter-spacing: 0.7px; }}
+            .section-divider {{ border: none; border-top: 1px solid #999; margin: 14px 0 10px 0; }}
 
             /* Bottom block (QR + MLT/Signature) pushed down to the very
                bottom of the page for typical (single-page) reports, using
@@ -6665,9 +6666,15 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                and this block sits right after the table instead of
                being forced to the bottom - so it can never overlap the
                report table's own content, unlike a fixed/absolute
-               bottom position would. */
+               bottom position would.
+               margin-bottom: 45mm lifts the whole block clear of the
+               bottom edge so it sits above the pre-printed letterhead
+               paper's bottom zone instead of overlapping it. Scoped to
+               just this block - the page's own padding (and therefore
+               the rest of the report layout) is untouched. */
             .report-bottom-fixed {{
                 margin-top: auto;
+                margin-bottom: 45mm;
                 width: 100%;
             }}
             .bottom-section {{ 
@@ -6810,6 +6817,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
 
             {"<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else ""}
             {test_notes_html}
+            <hr class="section-divider">
             <div class="end-report-text">*** END OF REPORT ***</div>
 
             <!-- Bottom Section: pinned to page bottom. QR Left, MLT/Signature + Printed-on Right -->
