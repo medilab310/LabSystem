@@ -6485,7 +6485,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 if cell_align == "none":
                     continue
                 row_cells.append(
-                    f'<td style="width:{col_widths[idx]:.2f}%;padding:4px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.15;">{cell_value}</td>'
+                    f'<td style="width:{col_widths[idx]:.2f}%;padding:2px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.1;">{cell_value}</td>'
                 )
             rows_html += "<tr>" + "".join(row_cells) + "</tr>"
     elif main_result_val:
@@ -6503,7 +6503,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             if cell_align == "none":
                 continue
             row_cells.append(
-                f'<td style="width:{col_widths[idx]:.2f}%;padding:4px 7px;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.15;">{cell_value}</td>'
+                f'<td style="width:{col_widths[idx]:.2f}%;padding:2px 7px;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.1;">{cell_value}</td>'
             )
         rows_html = "<tr>" + "".join(row_cells) + "</tr>"
     else:
@@ -6539,7 +6539,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 if cell_align == "none":
                     continue
                 row_cells.append(
-                    f'<td style="width:{col_widths[idx]:.2f}%;padding:4px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.15;">{cell_value}</td>'
+                    f'<td style="width:{col_widths[idx]:.2f}%;padding:2px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.1;">{cell_value}</td>'
                 )
             return "<tr>" + "".join(row_cells) + "</tr>"
 
@@ -6574,14 +6574,6 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
         # share its exact column widths/alignment/borders instead of a
         # separate standalone table.
         rows_html += diff_section_html
-
-        # Small, subtle footnote below the table - not a table row.
-        absolute_diff_html = (
-            '<div style="font-size:9px;color:#777;margin-top:4px;">'
-            'Calculated as Total WBC &times; Differential % &divide; 100 '
-            '(equivalent to &times;10&sup9;/L). Auto-generated - not manually entered.'
-            '</div>'
-        )
 
     barcode_url = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
     download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
@@ -6652,8 +6644,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             
             .report-note, .report-test-note {{ margin-top: 10px; padding: 0; font-size: 10px !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
 
-            .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 12px 0 8px 0; letter-spacing: 0.7px; }}
-            .section-divider {{ border: none; border-top: 1px solid #999; margin: 14px 0 10px 0; }}
+            .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
+            .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
 
             /* Bottom block (QR + MLT/Signature) pushed down to the very
                bottom of the page for typical (single-page) reports, using
