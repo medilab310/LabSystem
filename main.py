@@ -2804,6 +2804,12 @@ def manage_doctors(request: Request):
             <td>{d['name']}</td>
             <td>{d['specialization'] or '-'}</td>
             <td>{d['phone'] or '-'}</td>
+            <td style="text-align:center;">
+                <a href="/delete-doctor/{d['id']}" onclick="return confirm('Delete this doctor? Existing patient records/reports that already reference this doctor by name are not affected.');"
+                   style="color:#e53e3e; text-decoration:none; font-weight:700; font-size:12px; background:rgba(229,62,62,0.1); padding:5px 10px; border-radius:5px;">
+                    <i class="fa-solid fa-trash"></i> Delete
+                </a>
+            </td>
         </tr>
     """ for d in doctors])
 
@@ -2812,6 +2818,7 @@ def manage_doctors(request: Request):
     <html>
     <head>
         <title>Manage Doctors</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 20px; }}
             .container {{ max-width: 700px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
@@ -2857,8 +2864,9 @@ def manage_doctors(request: Request):
                     <th>Name</th>
                     <th>Specialization</th>
                     <th>Phone</th>
+                    <th style="text-align:center;">Action</th>
                 </tr>
-                {rows if rows else '<tr><td colspan="4" style="text-align:center;">No doctors added yet.</td></tr>'}
+                {rows if rows else '<tr><td colspan="5" style="text-align:center;">No doctors added yet.</td></tr>'}
             </table>
         </div>
     </body>
@@ -2875,6 +2883,25 @@ def add_doctor(code: str = Form(...), name: str = Form(...), specialization: str
         conn.commit()
     except sqlite3.IntegrityError:
         pass # Code එක කලින් තිබුණොත් ignore කරයි
+    conn.close()
+    return RedirectResponse(url="/manage-doctors", status_code=303)
+
+
+@app.get("/delete-doctor/{doctor_id}")
+def delete_doctor(doctor_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_doctors"):
+        return render_locked_page("Manage Doctors")
+
+    # Safe delete: patients.doctor stores the doctor's NAME as plain text
+    # (not a foreign key to doctors.id), so removing a doctor from this
+    # list only affects future selection - it cannot alter or break any
+    # existing patient record or previously generated report, since those
+    # already have the doctor's name saved directly on them.
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM doctors WHERE id = ?", (doctor_id,))
+    conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-doctors", status_code=303)
 
@@ -2896,6 +2923,12 @@ def manage_centers(request: Request):
             <td>{c['center_name']}</td>
             <td>{c['location'] or '-'}</td>
             <td>{c['phone'] or '-'}</td>
+            <td style="text-align:center;">
+                <a href="/delete-center/{c['id']}" onclick="return confirm('Delete this collecting center? Existing patient records/reports that already reference this center by name are not affected.');"
+                   style="color:#e53e3e; text-decoration:none; font-weight:700; font-size:12px; background:rgba(229,62,62,0.1); padding:5px 10px; border-radius:5px;">
+                    <i class="fa-solid fa-trash"></i> Delete
+                </a>
+            </td>
         </tr>
     """ for c in centers])
 
@@ -2904,6 +2937,7 @@ def manage_centers(request: Request):
     <html>
     <head>
         <title>Manage Collecting Centers</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 20px; }}
             .container {{ max-width: 700px; margin: auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
@@ -2944,8 +2978,9 @@ def manage_centers(request: Request):
                     <th>Center Name</th>
                     <th>Location</th>
                     <th>Phone</th>
+                    <th style="text-align:center;">Action</th>
                 </tr>
-                {rows if rows else '<tr><td colspan="3" style="text-align:center;">No collecting centers added yet.</td></tr>'}
+                {rows if rows else '<tr><td colspan="4" style="text-align:center;">No collecting centers added yet.</td></tr>'}
             </table>
         </div>
     </body>
@@ -2958,6 +2993,26 @@ def add_center(center_name: str = Form(...), location: str = Form(None), phone: 
     cursor = conn.cursor()
     cursor.execute("INSERT INTO collecting_centers (center_name, location, phone) VALUES (?, ?, ?)", 
                    (center_name, location, phone))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/manage-centers", status_code=303)
+
+
+@app.get("/delete-center/{center_id}")
+def delete_center(center_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_centers"):
+        return render_locked_page("Manage Centers")
+
+    # Safe delete: patients.collecting_center/center store the center's
+    # NAME as plain text (not a foreign key to collecting_centers.id), so
+    # removing a center from this list only affects future selection - it
+    # cannot alter or break any existing patient record or previously
+    # generated report, since those already have the center name saved
+    # directly on them.
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM collecting_centers WHERE id = ?", (center_id,))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-centers", status_code=303)
@@ -5309,21 +5364,37 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 main_result = t["result"] if t["result"] else ""
                 test_comment = t["comment"] if "comment" in t.keys() and t["comment"] else ""
                 
-                # Fetch parameters dynamically
+                # Fetch parameters dynamically, respecting the saved custom
+                # display order. Tries "display_order ASC, id ASC" first;
+                # only falls back to the old "id ASC" ordering if the
+                # candidate table/column combination doesn't have a
+                # display_order column (legacy schema compatibility - same
+                # defensive try/except pattern already used for
+                # default_result below).
                 params = []
                 for tbl in ["test_parameters", "parameters", "sub_tests", "test_fields"]:
                     for col in ["parameter_name", "name", "param_name"]:
                         try:
-                            cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
+                            cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY display_order ASC, id ASC", (t_id,))
                             params = cursor.fetchall()
                             if params: break
                         except:
                             try:
-                                cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
+                                cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
                                 params = cursor.fetchall()
                                 if params: break
                             except:
-                                continue
+                                try:
+                                    cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY display_order ASC, id ASC", (t_id,))
+                                    params = cursor.fetchall()
+                                    if params: break
+                                except:
+                                    try:
+                                        cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
+                                        params = cursor.fetchall()
+                                        if params: break
+                                    except:
+                                        continue
                     if params: break
                 
                 # Pre-fetch existing parameter values & determine lock status
@@ -6562,6 +6633,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 box-sizing: border-box; 
                 box-shadow: 0 4px 15px rgba(0,0,0,0.15); 
                 position: relative; 
+                display: flex;
+                flex-direction: column;
             }}
             
             .top-barcode-container {{ text-align: right; margin-bottom: 8px; }}
@@ -6581,21 +6654,40 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 12px 0 8px 0; letter-spacing: 0.7px; }}
 
-            /* SHIFTED ENTIRE BLOCK FURTHER RIGHT */
+            /* Bottom block (QR + MLT/Signature) pushed down to the very
+               bottom of the page for typical (single-page) reports, using
+               the standard CSS "sticky footer" pattern: .report-page is
+               now a column flexbox, and margin-top:auto absorbs any
+               leftover vertical space, pushing this block to the bottom.
+               Critically, this degrades safely for long reports (many
+               parameters): if the report content already fills or
+               exceeds one page, the auto margin simply collapses to ~0
+               and this block sits right after the table instead of
+               being forced to the bottom - so it can never overlap the
+               report table's own content, unlike a fixed/absolute
+               bottom position would. */
+            .report-bottom-fixed {{
+                margin-top: auto;
+                width: 100%;
+            }}
             .bottom-section {{ 
                 display: flex; 
                 justify-content: space-between; 
                 align-items: flex-end; 
-                margin-top: 6px; 
                 width: 100%; 
             }}
             .qr-container img {{ width: 75px; height: 75px; }}
             
             .sig-wrapper-new {{ 
                 text-align: center; 
-                font-size: 10px !important; 
-                min-width: 350px; 
-                margin-right: -12px; 
+                font-size: 8.5px !important; 
+                min-width: 300px; 
+                /* Shifted further toward the right margin. Capped at the
+                   page's own printable width (A4, 15mm side padding) -
+                   pushing it further would cut the signature block off
+                   the printed page, so this is the maximum safe rightward
+                   offset that still prints in full. */
+                margin-right: -10mm; 
                 display: flex;
                 flex-direction: column;
                 align-items: center;
@@ -6611,7 +6703,16 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 margin-left: 10px; 
             }}
 
-            .report-footer {{ margin-top: 12px; text-align: center; font-size: 10px !important; font-weight: 700; color: #000; border-top: 1px solid #000; padding-top: 5px; }}
+            /* "Printed on" now sits directly under the MLT/signature
+               block (not centered under the whole page), with a
+               one-line gap, and no divider line above it. */
+            .printed-on-line {{
+                margin-top: 14px;
+                text-align: center;
+                font-size: 8.5px !important;
+                font-weight: 700;
+                color: #000;
+            }}
 
             @media print {{
                 body {{ background: none; padding: 0; margin: 0; }}
@@ -6711,21 +6812,20 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             {test_notes_html}
             <div class="end-report-text">*** END OF REPORT ***</div>
 
-            <!-- Bottom Section: QR Left, Signature Right -->
-            <div class="bottom-section">
-                <div class="qr-container">
-                    <img src="{qr_url}" alt="QR Code">
+            <!-- Bottom Section: pinned to page bottom. QR Left, MLT/Signature + Printed-on Right -->
+            <div class="report-bottom-fixed">
+                <div class="bottom-section">
+                    <div class="qr-container">
+                        <img src="{qr_url}" alt="QR Code">
+                    </div>
+                    <div class="sig-wrapper-new">
+                        <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" onerror="this.style.display='none';">
+                        <b style="margin-bottom: 1px;">S.P.Jananga</b>
+                        <span style="font-size: 8.5px; color: #222; margin-bottom: 1px; display: block;">Medical Laboratory Technologist (MLT)</span>
+                        <span style="font-size: 8.5px; color: #444; display: block;">SLMC No 2867</span>
+                        <div class="printed-on-line">Printed on: {printed_on}</div>
+                    </div>
                 </div>
-                <div class="sig-wrapper-new">
-                    <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" onerror="this.style.display='none';">
-                    <b style="margin-bottom: 1px;">S.P.Jananga</b>
-                    <span style="font-size: 10px; color: #222; margin-bottom: 1px; display: block;">Medical Laboratory Technologist (MLT)</span>
-                    <span style="font-size: 10px; color: #444; display: block;">SLMC No 2867</span>
-                </div>
-            </div>
-
-            <div class="report-footer">
-                Printed on: {printed_on}
             </div>
         </div>
 
