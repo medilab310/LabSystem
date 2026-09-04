@@ -394,6 +394,8 @@ DEFAULT_PRINT_SETTINGS = {
     "footer_gap_px": 18,
     "page_side_margin_mm": 15,
     "default_letterhead": 0,
+    "patient_box_font_size_px": 11,
+    "patient_box_padding_px": 4,
 }
 
 
@@ -410,7 +412,8 @@ def get_print_settings() -> dict:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT row_padding_px, base_font_size_px, header_font_size_px,
-                   line_height, footer_gap_px, page_side_margin_mm, default_letterhead
+                   line_height, footer_gap_px, page_side_margin_mm, default_letterhead,
+                   patient_box_font_size_px, patient_box_padding_px
             FROM system_print_settings WHERE id = 1
         """)
         row = cursor.fetchone()
@@ -1180,10 +1183,31 @@ def init_db():
             updated_at TEXT
         )
     """)
+
+    # Safe, additive column migration for the Patient Details Box layout
+    # controls. Each ALTER TABLE is guarded independently (not chained in
+    # one try/except - see the /add-main-test and /edit-test-category
+    # fixes earlier in this file for why chaining is unsafe with libsql:
+    # once one column already exists, its error would abort the whole
+    # block and the other ALTER would never run). Existing rows
+    # automatically receive the DEFAULT value SQLite applies for a
+    # constant DEFAULT on ADD COLUMN, so this never leaves NULLs behind
+    # on your already-seeded settings row.
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN patient_box_font_size_px INTEGER DEFAULT 11")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN patient_box_padding_px INTEGER DEFAULT 4")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute("""
         INSERT OR IGNORE INTO system_print_settings
-            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, updated_at)
-        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, NULL)
+            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, patient_box_font_size_px, patient_box_padding_px, updated_at)
+        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, 11, 4, NULL)
     """)
     conn.commit()
 
@@ -6324,6 +6348,18 @@ def print_settings_page(request: Request, saved: int = 0):
                             <span class="hint">Left/right printable margin (top space is fixed for the letterhead zone).</span>
                         </div>
                     </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Patient Box Font Size (px)</label>
+                            <input type="number" name="patient_box_font_size_px" min="7" max="16" step="1" value="{s['patient_box_font_size_px']}">
+                            <span class="hint">Text size for Name, Age, Reference No, etc.</span>
+                        </div>
+                        <div class="field">
+                            <label>Patient Box Padding (px)</label>
+                            <input type="number" name="patient_box_padding_px" min="0" max="15" step="1" value="{s['patient_box_padding_px']}">
+                            <span class="hint">Vertical spacing inside the patient details box.</span>
+                        </div>
+                    </div>
                     <div class="toggle-row">
                         <input type="checkbox" id="default_letterhead" name="default_letterhead" value="1" {"checked" if s['default_letterhead'] else ""} style="width:18px; height:18px;">
                         <label for="default_letterhead" style="margin:0; font-size:14px;">Show digital letterhead by default when opening a report</label>
@@ -6356,6 +6392,8 @@ async def print_settings_save(request: Request):
     footer_gap_px = int(_clamp(form_data.get("footer_gap_px"), 0, 60, DEFAULT_PRINT_SETTINGS["footer_gap_px"]))
     page_side_margin_mm = int(_clamp(form_data.get("page_side_margin_mm"), 5, 30, DEFAULT_PRINT_SETTINGS["page_side_margin_mm"]))
     default_letterhead = 1 if form_data.get("default_letterhead") else 0
+    patient_box_font_size_px = int(_clamp(form_data.get("patient_box_font_size_px"), 7, 16, DEFAULT_PRINT_SETTINGS["patient_box_font_size_px"]))
+    patient_box_padding_px = int(_clamp(form_data.get("patient_box_padding_px"), 0, 15, DEFAULT_PRINT_SETTINGS["patient_box_padding_px"]))
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -6363,10 +6401,12 @@ async def print_settings_save(request: Request):
         UPDATE system_print_settings
         SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
-            default_letterhead = ?, updated_at = ?
+            default_letterhead = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
+            updated_at = ?
         WHERE id = 1
     """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
           footer_gap_px, page_side_margin_mm, default_letterhead,
+          patient_box_font_size_px, patient_box_padding_px,
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -6387,11 +6427,13 @@ def print_settings_reset(request: Request):
         UPDATE system_print_settings
         SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
-            default_letterhead = ?, updated_at = ?
+            default_letterhead = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
+            updated_at = ?
         WHERE id = 1
     """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
           d["line_height"], d["footer_gap_px"], d["page_side_margin_mm"],
-          d["default_letterhead"], now_colombo().isoformat(timespec="seconds")))
+          d["default_letterhead"], d["patient_box_font_size_px"], d["patient_box_padding_px"],
+          now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/print-settings?saved=1", status_code=303)
@@ -6867,6 +6909,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 --dynamic-line-height: {print_settings['line_height']};
                 --dynamic-footer-gap: {print_settings['footer_gap_px']}px;
                 --dynamic-side-margin: {print_settings['page_side_margin_mm']}mm;
+                --dynamic-patient-font: {print_settings['patient_box_font_size_px']}px;
+                --dynamic-patient-padding: {print_settings['patient_box_padding_px']}px;
             }}
             body {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size); background: #f0f2f5; margin: 0; padding: 20px; color: #000; }}
             .report-page, .report-page * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size) !important; }}
@@ -6890,8 +6934,49 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             .top-barcode-container img {{ height: 30px; width: 155px; object-fit: fill; display: block; margin-left: auto; }}
 
             .patient-box {{ border: 1px solid #333; border-radius: 3px; padding: 10px 15px; margin-bottom: 12px; background: rgba(255,255,255,0.9); }}
-            .header-table {{ width: 100%; border-collapse: collapse; font-size: var(--dynamic-font-size); }}
-            .header-table td {{ padding: 3px 4px; vertical-align: middle; }}
+
+            /* Patient Details Box: strict table layout so the two columns
+               stay evenly balanced (50/50) and every colon lines up
+               vertically down both the left and right sides, regardless
+               of how long a value (doctor name, center name, etc.) is.
+               table-layout:fixed forces the browser/WeasyPrint to honor
+               the <colgroup> widths exactly instead of recalculating
+               column widths from cell content - without this, a long
+               value can silently widen its column and throw the colon
+               alignment off between rows. */
+            .header-table {{ 
+                width: 100%; 
+                border-collapse: collapse; 
+                table-layout: fixed; 
+                font-size: var(--dynamic-patient-font) !important; 
+            }}
+            .header-table td {{ 
+                padding: var(--dynamic-patient-padding) 4px; 
+                vertical-align: middle; 
+                overflow: hidden;
+                text-overflow: ellipsis;
+                font-size: var(--dynamic-patient-font) !important;
+            }}
+            /* Label cells: never wrap ("Gender / Age" must stay on one
+               line) and always bold/black for consistent hierarchy. */
+            .header-table td.hlabel {{ 
+                font-weight: bold; 
+                color: #000; 
+                white-space: nowrap; 
+            }}
+            /* Colon cells: fixed narrow width via colgroup, centered, so
+               every colon in a column sits at the exact same horizontal
+               position across all rows. */
+            .header-table td.hcolon {{ 
+                text-align: center; 
+                white-space: nowrap; 
+            }}
+            /* Value cells: allowed to wrap for unusually long text
+               (long doctor/center names) rather than overflowing the box. */
+            .header-table td.hvalue {{ 
+                overflow-wrap: break-word; 
+                word-break: break-word; 
+            }}
             
             .test-title-bar {{ text-align: center; font-weight: bold; font-size: var(--dynamic-header-font-size); margin: 8px 0 5px 0; color: #000; text-transform: uppercase; letter-spacing: 0.5px; }}
 
@@ -6993,45 +7078,53 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
 
             <div class="patient-box">
                 <table class="header-table">
+                    <colgroup>
+                        <col style="width:14%;">
+                        <col style="width:2%;">
+                        <col style="width:34%;">
+                        <col style="width:14%;">
+                        <col style="width:2%;">
+                        <col style="width:34%;">
+                    </colgroup>
                     <tr>
-                        <td style="width: 14%; font-weight: bold; color: #000;">Patient Name</td>
-                        <td style="width: 2%;">:</td>
-                        <td style="width: 34%; font-weight: bold;">{patient_name}</td>
-                        <td style="width: 14%; font-weight: bold; color: #000;">Reference No</td>
-                        <td style="width: 2%;">:</td>
-                        <td style="width: 34%; font-weight: bold;">{display_ref_no}</td>
+                        <td class="hlabel">Patient Name</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue" style="font-weight: bold;">{patient_name}</td>
+                        <td class="hlabel">Reference No</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue" style="font-weight: bold;">{display_ref_no}</td>
                     </tr>
                     <tr>
-                        <td style="font-weight: bold; color: #000;">Gender / Age</td>
-                        <td>:</td>
-                        <td>{gender_age}</td>
-                        <td style="font-weight: bold; color: #000;">Received On</td>
-                        <td>:</td>
-                        <td>{received_on}</td>
+                        <td class="hlabel">Gender / Age</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{gender_age}</td>
+                        <td class="hlabel">Received On</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{received_on}</td>
                     </tr>
                     <tr>
-                        <td style="font-weight: bold; color: #000;">Referred By</td>
-                        <td>:</td>
-                        <td>{doctor}</td>
-                        <td style="font-weight: bold; color: #000;">Reported On</td>
-                        <td>:</td>
-                        <td>{reported_on}</td>
+                        <td class="hlabel">Referred By</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{doctor}</td>
+                        <td class="hlabel">Reported On</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{reported_on}</td>
                     </tr>
                     <tr>
-                        <td style="font-weight: bold; color: #000;">Center</td>
-                        <td>:</td>
-                        <td>{center}</td>
-                        <td style="font-weight: bold; color: #000;">Department</td>
-                        <td>:</td>
-                        <td>{department}</td>
+                        <td class="hlabel">Center</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{center}</td>
+                        <td class="hlabel">Department</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{department}</td>
                     </tr>
                     <tr>
                         <td></td>
                         <td></td>
                         <td></td>
-                        <td style="font-weight: bold; color: #000;">Specimen</td>
-                        <td>:</td>
-                        <td>{specimen}</td>
+                        <td class="hlabel">Specimen</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{specimen}</td>
                     </tr>
                 </table>
             </div>
