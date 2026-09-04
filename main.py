@@ -380,7 +380,57 @@ PERMISSIONS = {
     "reports":       "Reports & Analytics",
     "manage_users":  "Manage Users",
     "share_reports": "Share Reports",
+    "print_settings":"Print Layout Settings",
 }
+
+# -------------------------------------------------------------
+# PRINT LAYOUT SETTINGS (dashboard-configurable report styling)
+# -------------------------------------------------------------
+DEFAULT_PRINT_SETTINGS = {
+    "row_padding_px": 4,
+    "base_font_size_px": 11,
+    "header_font_size_px": 11,
+    "line_height": 1.25,
+    "footer_gap_px": 18,
+    "page_side_margin_mm": 15,
+    "default_letterhead": 0,
+}
+
+
+def get_print_settings() -> dict:
+    """
+    Reads the single system_print_settings row. Deliberately defensive:
+    if the table/row is ever missing, or the DB is briefly unreachable,
+    this falls back to DEFAULT_PRINT_SETTINGS instead of raising - a
+    settings lookup problem must never be able to break report
+    generation or printing.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT row_padding_px, base_font_size_px, header_font_size_px,
+                   line_height, footer_gap_px, page_side_margin_mm, default_letterhead
+            FROM system_print_settings WHERE id = 1
+        """)
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            keys = list(DEFAULT_PRINT_SETTINGS.keys())
+            return {k: (row[i] if row[i] is not None else DEFAULT_PRINT_SETTINGS[k]) for i, k in enumerate(keys)}
+    except Exception:
+        pass
+    return dict(DEFAULT_PRINT_SETTINGS)
+
+
+def _clamp(value, lo, hi, default):
+    """Small helper to keep saved print settings within sane, safe ranges
+    regardless of what gets submitted from the form."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, value))
 
 # Roles that always bypass permission checks entirely, regardless of what
 # is (or isn't) stored in their `permissions` column.
@@ -1110,6 +1160,33 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_share_links_patient_test ON share_links(patient_id, test_id)")
     conn.commit()
 
+    # 13. Print Layout Settings Table (dashboard-configurable report styling)
+    # Brand-new, additive-only table - does not touch/alter any existing
+    # table or column. Deliberately a single-row "singleton" table
+    # (CHECK (id = 1)) since these are global print preferences, not
+    # per-user settings. Seeded once with sensible defaults; safe to run
+    # on every startup since INSERT OR IGNORE is a no-op once the row
+    # already exists, so it never overwrites an admin's saved settings.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_print_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            row_padding_px INTEGER DEFAULT 4,
+            base_font_size_px INTEGER DEFAULT 11,
+            header_font_size_px INTEGER DEFAULT 11,
+            line_height REAL DEFAULT 1.25,
+            footer_gap_px INTEGER DEFAULT 18,
+            page_side_margin_mm INTEGER DEFAULT 15,
+            default_letterhead INTEGER DEFAULT 0,
+            updated_at TEXT
+        )
+    """)
+    cursor.execute("""
+        INSERT OR IGNORE INTO system_print_settings
+            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, updated_at)
+        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, NULL)
+    """)
+    conn.commit()
+
     # Indexes for the columns actually filtered/joined on throughout the
     # app (patient lookups, assigned-test lookups by patient/test,
     # parameter lookups by test, report joins). Turso/libsql round-trips
@@ -1577,6 +1654,9 @@ def dashboard():
                 </a>
                 <a href="/share-reports" class="action-btn">
                     <i class="fa-brands fa-whatsapp"></i> Share Reports
+                </a>
+                <a href="/print-settings" class="action-btn">
+                    <i class="fa-solid fa-sliders"></i> Print Settings
                 </a>
                 <!-- User Management Button Added Here -->
                 <a href="/manage-users" class="action-btn">
@@ -6159,6 +6239,163 @@ def shared_report_download(token: str, request: Request):
     patient_id, test_id = row[0], row[1]
     return report_download(patient_id, test_id, request)
 
+
+# -------------------------------------------------------------
+# PRINT LAYOUT SETTINGS (dashboard-configurable report styling)
+# -------------------------------------------------------------
+@app.get("/print-settings", response_class=HTMLResponse)
+def print_settings_page(request: Request, saved: int = 0):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "print_settings"):
+        return render_locked_page("Print Layout Settings")
+
+    s = get_print_settings()
+    success_banner = (
+        '<div style="background:#dcfce7; color:#166534; padding:10px 16px; border-radius:8px; margin-bottom:18px; font-weight:600; font-size:14px;">'
+        '<i class="fa-solid fa-circle-check"></i> Print settings saved. New reports will use these values immediately.'
+        '</div>'
+    ) if saved else ""
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Print Layout Settings</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 30px; margin: 0; }}
+            .container {{ max-width: 700px; margin: auto; }}
+            .card {{ background: white; padding: 28px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); }}
+            h2 {{ color: #0f4c81; margin-top: 0; }}
+            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0f4c81; text-decoration: none; font-weight: bold; }}
+            .field-row {{ display: flex; gap: 18px; margin-bottom: 18px; }}
+            .field {{ flex: 1; }}
+            .field label {{ display: block; font-size: 13px; font-weight: 700; color: #334155; margin-bottom: 6px; }}
+            .field .hint {{ font-size: 11px; color: #94a3b8; font-weight: 400; display: block; margin-top: 3px; }}
+            .field input[type="number"] {{ width: 100%; padding: 9px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; box-sizing: border-box; }}
+            .toggle-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 20px; padding: 12px; background: #f8fafc; border-radius: 8px; }}
+            .save-btn {{ background: #0f4c81; color: white; border: none; padding: 11px 26px; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 14px; }}
+            .reset-link {{ margin-left: 14px; color: #64748b; font-size: 13px; text-decoration: none; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
+            <div class="card">
+                <h2><i class="fa-solid fa-sliders"></i> Print Layout Settings</h2>
+                <p style="color:#64748b; font-size:13px; margin-top:-8px;">
+                    Adjust how printed/PDF lab reports look, without touching any code. Changes apply to every report immediately.
+                </p>
+                {success_banner}
+                <form action="/print-settings" method="post">
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Table Row Padding (px)</label>
+                            <input type="number" name="row_padding_px" min="0" max="15" step="1" value="{s['row_padding_px']}">
+                            <span class="hint">Vertical spacing inside each result row. Higher = less squeezed.</span>
+                        </div>
+                        <div class="field">
+                            <label>Line Height</label>
+                            <input type="number" name="line_height" min="1.0" max="2.0" step="0.05" value="{s['line_height']}">
+                            <span class="hint">Space between wrapped lines of text within a row.</span>
+                        </div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Base Font Size (px)</label>
+                            <input type="number" name="base_font_size_px" min="7" max="16" step="1" value="{s['base_font_size_px']}">
+                            <span class="hint">Test parameter & result text size.</span>
+                        </div>
+                        <div class="field">
+                            <label>Header Font Size (px)</label>
+                            <input type="number" name="header_font_size_px" min="7" max="16" step="1" value="{s['header_font_size_px']}">
+                            <span class="hint">Column header text size (Investigation, Result, etc).</span>
+                        </div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Footer Bottom Gap (px)</label>
+                            <input type="number" name="footer_gap_px" min="0" max="60" step="1" value="{s['footer_gap_px']}">
+                            <span class="hint">Space above the QR/signature footer block.</span>
+                        </div>
+                        <div class="field">
+                            <label>Page Side Margins (mm)</label>
+                            <input type="number" name="page_side_margin_mm" min="5" max="30" step="1" value="{s['page_side_margin_mm']}">
+                            <span class="hint">Left/right printable margin (top space is fixed for the letterhead zone).</span>
+                        </div>
+                    </div>
+                    <div class="toggle-row">
+                        <input type="checkbox" id="default_letterhead" name="default_letterhead" value="1" {"checked" if s['default_letterhead'] else ""} style="width:18px; height:18px;">
+                        <label for="default_letterhead" style="margin:0; font-size:14px;">Show digital letterhead by default when opening a report</label>
+                    </div>
+                    <button type="submit" class="save-btn"><i class="fa-solid fa-check"></i> Save Settings</button>
+                    <a href="/print-settings-reset" class="reset-link" onclick="return confirm('Reset all print settings to defaults?');">Reset to defaults</a>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/print-settings")
+async def print_settings_save(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "print_settings"):
+        return render_locked_page("Print Layout Settings")
+
+    form_data = await request.form()
+
+    # Every value is clamped to a safe range server-side (not just via the
+    # HTML min/max attributes, which a user could bypass) so a bad/garbled
+    # submission can never produce a broken or unreadable report layout.
+    row_padding_px = int(_clamp(form_data.get("row_padding_px"), 0, 15, DEFAULT_PRINT_SETTINGS["row_padding_px"]))
+    base_font_size_px = int(_clamp(form_data.get("base_font_size_px"), 7, 16, DEFAULT_PRINT_SETTINGS["base_font_size_px"]))
+    header_font_size_px = int(_clamp(form_data.get("header_font_size_px"), 7, 16, DEFAULT_PRINT_SETTINGS["header_font_size_px"]))
+    line_height = _clamp(form_data.get("line_height"), 1.0, 2.0, DEFAULT_PRINT_SETTINGS["line_height"])
+    footer_gap_px = int(_clamp(form_data.get("footer_gap_px"), 0, 60, DEFAULT_PRINT_SETTINGS["footer_gap_px"]))
+    page_side_margin_mm = int(_clamp(form_data.get("page_side_margin_mm"), 5, 30, DEFAULT_PRINT_SETTINGS["page_side_margin_mm"]))
+    default_letterhead = 1 if form_data.get("default_letterhead") else 0
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE system_print_settings
+        SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
+            line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
+            default_letterhead = ?, updated_at = ?
+        WHERE id = 1
+    """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
+          footer_gap_px, page_side_margin_mm, default_letterhead,
+          now_colombo().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(url="/print-settings?saved=1", status_code=303)
+
+
+@app.get("/print-settings-reset")
+def print_settings_reset(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "print_settings"):
+        return render_locked_page("Print Layout Settings")
+
+    d = DEFAULT_PRINT_SETTINGS
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE system_print_settings
+        SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
+            line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
+            default_letterhead = ?, updated_at = ?
+        WHERE id = 1
+    """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
+          d["line_height"], d["footer_gap_px"], d["page_side_margin_mm"],
+          d["default_letterhead"], now_colombo().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/print-settings?saved=1", status_code=303)
+
 # -------------------------------------------------------------
 # PROFESSIONAL LAB REPORT VIEW (Letterhead Background, QR, Sig, Comment Box)
 # -------------------------------------------------------------
@@ -6169,7 +6406,15 @@ def report_letterhead_preview(patient_id: int, test_id: int, request: Request):
 
 
 @app.get("/report-view/{patient_id}/{test_id}", response_class=HTMLResponse)
-def report_view(patient_id: int, test_id: int, request: Request, letterhead: int = 0):
+def report_view(patient_id: int, test_id: int, request: Request, letterhead: Optional[int] = None):
+    # Resolve letterhead state: an explicit query param (?letterhead=0/1)
+    # always wins (preserves the existing toggle/link behavior exactly);
+    # only when no explicit value is given do we fall back to the
+    # admin-configured default from Print Layout Settings.
+    print_settings = get_print_settings()
+    if letterhead is None:
+        letterhead = print_settings["default_letterhead"]
+
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -6485,7 +6730,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 if cell_align == "none":
                     continue
                 row_cells.append(
-                    f'<td style="width:{col_widths[idx]:.2f}%;padding:2px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.1;">{cell_value}</td>'
+                    f'<td style="width:{col_widths[idx]:.2f}%;padding:var(--dynamic-row-padding) 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:var(--dynamic-line-height);">{cell_value}</td>'
                 )
             rows_html += "<tr>" + "".join(row_cells) + "</tr>"
     elif main_result_val:
@@ -6503,7 +6748,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             if cell_align == "none":
                 continue
             row_cells.append(
-                f'<td style="width:{col_widths[idx]:.2f}%;padding:2px 7px;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.1;">{cell_value}</td>'
+                f'<td style="width:{col_widths[idx]:.2f}%;padding:var(--dynamic-row-padding) 7px;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:var(--dynamic-line-height);">{cell_value}</td>'
             )
         rows_html = "<tr>" + "".join(row_cells) + "</tr>"
     else:
@@ -6539,7 +6784,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 if cell_align == "none":
                     continue
                 row_cells.append(
-                    f'<td style="width:{col_widths[idx]:.2f}%;padding:2px 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:1.1;">{cell_value}</td>'
+                    f'<td style="width:{col_widths[idx]:.2f}%;padding:var(--dynamic-row-padding) 7px;border-bottom:none;text-align:{cell_align};font-weight:{cell_weight};color:{cell_color};line-height:var(--dynamic-line-height);">{cell_value}</td>'
                 )
             return "<tr>" + "".join(row_cells) + "</tr>"
 
@@ -6609,8 +6854,22 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
     <head>
         <title>MEDISTAR MEDICAL LABORATORY - Lab Report - {patient_name}</title>
         <style>
-            body {{ font-family: Verdana, Geneva, sans-serif !important; font-size: 10px; background: #f0f2f5; margin: 0; padding: 20px; color: #000; }}
-            .report-page, .report-page * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: 10px !important; }}
+            /* Print Layout Settings, admin-configurable at /print-settings.
+               Every dynamic value in this stylesheet reads from these
+               variables instead of a hardcoded literal, so a saved
+               setting takes effect on every report immediately with no
+               code changes. Falls back safely via get_print_settings()
+               if the settings row is ever missing (see that function). */
+            :root {{
+                --dynamic-row-padding: {print_settings['row_padding_px']}px;
+                --dynamic-font-size: {print_settings['base_font_size_px']}px;
+                --dynamic-header-font-size: {print_settings['header_font_size_px']}px;
+                --dynamic-line-height: {print_settings['line_height']};
+                --dynamic-footer-gap: {print_settings['footer_gap_px']}px;
+                --dynamic-side-margin: {print_settings['page_side_margin_mm']}mm;
+            }}
+            body {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size); background: #f0f2f5; margin: 0; padding: 20px; color: #000; }}
+            .report-page, .report-page * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size) !important; }}
             .action-bar {{ max-width: 800px; margin: 0 auto 15px auto; background: white; padding: 10px 20px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
             .btn {{ background: #333; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; text-decoration: none; font-size: 13px; }}
             .btn:hover {{ background: #000; }}
@@ -6621,7 +6880,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                 margin: 0 auto; 
                 background: white; 
                 {screen_bg_css}
-                padding: 38mm 15mm 15mm 15mm; 
+                padding: 38mm var(--dynamic-side-margin) 15mm var(--dynamic-side-margin); 
                 box-sizing: border-box; 
                 box-shadow: 0 4px 15px rgba(0,0,0,0.15); 
                 position: relative; 
@@ -6631,16 +6890,16 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
             .top-barcode-container img {{ height: 30px; width: 155px; object-fit: fill; display: block; margin-left: auto; }}
 
             .patient-box {{ border: 1px solid #333; border-radius: 3px; padding: 10px 15px; margin-bottom: 12px; background: rgba(255,255,255,0.9); }}
-            .header-table {{ width: 100%; border-collapse: collapse; font-size: 10px; }}
+            .header-table {{ width: 100%; border-collapse: collapse; font-size: var(--dynamic-font-size); }}
             .header-table td {{ padding: 3px 4px; vertical-align: middle; }}
             
-            .test-title-bar {{ text-align: center; font-weight: bold; font-size: 10px; margin: 8px 0 5px 0; color: #000; text-transform: uppercase; letter-spacing: 0.5px; }}
+            .test-title-bar {{ text-align: center; font-weight: bold; font-size: var(--dynamic-header-font-size); margin: 8px 0 5px 0; color: #000; text-transform: uppercase; letter-spacing: 0.5px; }}
 
-            .report-table {{ width: 100%; border-collapse: collapse; margin-top: 3px; font-size: 10px; table-layout: fixed; }}
-            .report-table th {{ background: none; color: #000; border-top: 1px solid #000; border-bottom: 1px solid #000; padding: 4px 7px; font-size: 10px !important; font-weight: bold; box-sizing: border-box; line-height: 1.15; }}
-            .report-table td {{ box-sizing: border-box; overflow-wrap: anywhere; word-break: normal; line-height: 1.15; }}
+            .report-table {{ width: 100%; border-collapse: collapse; margin-top: 3px; font-size: var(--dynamic-font-size); table-layout: fixed; }}
+            .report-table th {{ background: none; color: #000; border-top: 1px solid #000; border-bottom: 1px solid #000; padding: var(--dynamic-row-padding) 7px; font-size: var(--dynamic-header-font-size) !important; font-weight: bold; box-sizing: border-box; line-height: var(--dynamic-line-height); }}
+            .report-table td {{ box-sizing: border-box; overflow-wrap: anywhere; word-break: normal; line-height: var(--dynamic-line-height); }}
             
-            .report-note, .report-test-note {{ margin-top: 10px; padding: 0; font-size: 10px !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
+            .report-note, .report-test-note {{ margin-top: 10px; padding: 0; font-size: var(--dynamic-font-size) !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
             .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
@@ -6655,7 +6914,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: int
                what keeps long reports from overflowing or triggering
                awkward forced page breaks. */
             .report-bottom-fixed {{
-                margin-top: 18px;
+                margin-top: var(--dynamic-footer-gap);
                 width: 100%;
             }}
             .bottom-section {{ 
