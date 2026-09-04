@@ -6935,44 +6935,53 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
 
             .patient-box {{ border: 1px solid #333; border-radius: 3px; padding: 10px 15px; margin-bottom: 12px; background: rgba(255,255,255,0.9); }}
 
-            /* Patient Details Box: strict table layout so the two columns
-               stay evenly balanced (50/50) and every colon lines up
-               vertically down both the left and right sides, regardless
-               of how long a value (doctor name, center name, etc.) is.
-               table-layout:fixed forces the browser/WeasyPrint to honor
-               the <colgroup> widths exactly instead of recalculating
-               column widths from cell content - without this, a long
-               value can silently widen its column and throw the colon
-               alignment off between rows. */
+            /* Patient Details Box: table-layout AUTO (not fixed) so the
+               browser/WeasyPrint's standard table layout algorithm sizes
+               each column to fit its actual content, borrowing space from
+               columns that don't need it. This is what lets the box scale
+               comfortably to 12-14px+ font sizes: a nowrap label like
+               "Reference No" or "Gender / Age" will never be truncated or
+               forced to wrap, because auto-layout always widens a column
+               to fit non-wrapping content rather than clipping it - it
+               only ever falls back to the <colgroup> percentages below as
+               a starting proportion, then grows columns as needed. Colon
+               alignment stays fully guaranteed either way: every row
+               shares the exact same 6 column widths, since it's one
+               table, so column 2's colon lines up down every row, and
+               column 5's colon lines up down every row. */
             .header-table {{ 
                 width: 100%; 
                 border-collapse: collapse; 
-                table-layout: fixed; 
+                table-layout: auto; 
                 font-size: var(--dynamic-patient-font) !important; 
             }}
             .header-table td {{ 
-                padding: var(--dynamic-patient-padding) 4px; 
+                padding: var(--dynamic-patient-padding) 6px; 
                 vertical-align: middle; 
-                overflow: hidden;
-                text-overflow: ellipsis;
                 font-size: var(--dynamic-patient-font) !important;
             }}
             /* Label cells: never wrap ("Gender / Age" must stay on one
-               line) and always bold/black for consistent hierarchy. */
+               line) and always bold/black for consistent hierarchy. No
+               overflow:hidden here - with table-layout:auto the column
+               simply grows to fit this text instead of ever needing to
+               clip it. */
             .header-table td.hlabel {{ 
                 font-weight: bold; 
                 color: #000; 
                 white-space: nowrap; 
             }}
-            /* Colon cells: fixed narrow width via colgroup, centered, so
-               every colon in a column sits at the exact same horizontal
-               position across all rows. */
+            /* Colon cells: sized to their content (just ":"), so they
+               stay compact and centered - every colon in a column sits
+               at the exact same horizontal position across all rows. */
             .header-table td.hcolon {{ 
                 text-align: center; 
                 white-space: nowrap; 
+                width: 1%;
             }}
-            /* Value cells: allowed to wrap for unusually long text
-               (long doctor/center names) rather than overflowing the box. */
+            /* Value cells: get all remaining space (auto-layout gives
+               unclaimed width to the most flexible columns), and still
+               wrap gracefully for unusually long text rather than
+               overflowing the box. */
             .header-table td.hvalue {{ 
                 overflow-wrap: break-word; 
                 word-break: break-word; 
@@ -7079,12 +7088,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             <div class="patient-box">
                 <table class="header-table">
                     <colgroup>
-                        <col style="width:14%;">
-                        <col style="width:2%;">
-                        <col style="width:34%;">
-                        <col style="width:14%;">
-                        <col style="width:2%;">
-                        <col style="width:34%;">
+                        <col style="width:16%;">
+                        <col style="width:1%;">
+                        <col style="width:33%;">
+                        <col style="width:16%;">
+                        <col style="width:1%;">
+                        <col style="width:33%;">
                     </colgroup>
                     <tr>
                         <td class="hlabel">Patient Name</td>
