@@ -7098,31 +7098,36 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                     <tr>
                         <td class="hlabel">Patient Name</td>
                         <td class="hcolon">:</td>
-                        <td class="hvalue" style="font-weight: bold;">{patient_name}</td>
-                        <td class="hlabel">Reference No</td>
-                        <td class="hcolon">:</td>
-                        <td class="hvalue" style="font-weight: bold;">{display_ref_no}</td>
+                        <td class="hvalue" colspan="4" style="font-weight: bold;">{patient_name}</td>
                     </tr>
                     <tr>
                         <td class="hlabel">Gender / Age</td>
                         <td class="hcolon">:</td>
                         <td class="hvalue">{gender_age}</td>
-                        <td class="hlabel">Received On</td>
+                        <td class="hlabel">Reference No</td>
                         <td class="hcolon">:</td>
-                        <td class="hvalue">{received_on}</td>
+                        <td class="hvalue" style="font-weight: bold;">{display_ref_no}</td>
                     </tr>
                     <tr>
                         <td class="hlabel">Referred By</td>
                         <td class="hcolon">:</td>
                         <td class="hvalue">{doctor}</td>
-                        <td class="hlabel">Reported On</td>
+                        <td class="hlabel">Received On</td>
                         <td class="hcolon">:</td>
-                        <td class="hvalue">{reported_on}</td>
+                        <td class="hvalue">{received_on}</td>
                     </tr>
                     <tr>
                         <td class="hlabel">Center</td>
                         <td class="hcolon">:</td>
                         <td class="hvalue">{center}</td>
+                        <td class="hlabel">Reported On</td>
+                        <td class="hcolon">:</td>
+                        <td class="hvalue">{reported_on}</td>
+                    </tr>
+                    <tr>
+                        <td></td>
+                        <td></td>
+                        <td></td>
                         <td class="hlabel">Department</td>
                         <td class="hcolon">:</td>
                         <td class="hvalue">{department}</td>
