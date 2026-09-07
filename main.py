@@ -396,6 +396,8 @@ DEFAULT_PRINT_SETTINGS = {
     "default_letterhead": 0,
     "patient_box_font_size_px": 11,
     "patient_box_padding_px": 4,
+    "mlt_signature_font_size_px": 9,
+    "mlt_details_font_size_px": 8,
 }
 
 
@@ -413,7 +415,8 @@ def get_print_settings() -> dict:
         cursor.execute("""
             SELECT row_padding_px, base_font_size_px, header_font_size_px,
                    line_height, footer_gap_px, page_side_margin_mm, default_letterhead,
-                   patient_box_font_size_px, patient_box_padding_px
+                   patient_box_font_size_px, patient_box_padding_px,
+                   mlt_signature_font_size_px, mlt_details_font_size_px
             FROM system_print_settings WHERE id = 1
         """)
         row = cursor.fetchone()
@@ -1203,11 +1206,21 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN mlt_signature_font_size_px INTEGER DEFAULT 9")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN mlt_details_font_size_px INTEGER DEFAULT 8")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute("""
         INSERT OR IGNORE INTO system_print_settings
-            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, patient_box_font_size_px, patient_box_padding_px, updated_at)
-        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, 11, 4, NULL)
+            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, patient_box_font_size_px, patient_box_padding_px, mlt_signature_font_size_px, mlt_details_font_size_px, updated_at)
+        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, 11, 4, 9, 8, NULL)
     """)
     conn.commit()
 
@@ -6360,6 +6373,18 @@ def print_settings_page(request: Request, saved: int = 0):
                             <span class="hint">Vertical spacing inside the patient details box.</span>
                         </div>
                     </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>MLT Signature Font Size (px)</label>
+                            <input type="number" name="mlt_signature_font_size_px" min="6" max="20" step="1" value="{s['mlt_signature_font_size_px']}">
+                            <span class="hint">Size of the signed technologist's name under the signature image.</span>
+                        </div>
+                        <div class="field">
+                            <label>MLT Details Font Size (px)</label>
+                            <input type="number" name="mlt_details_font_size_px" min="6" max="20" step="1" value="{s['mlt_details_font_size_px']}">
+                            <span class="hint">Size of the designation and registration number lines below the name.</span>
+                        </div>
+                    </div>
                     <div class="toggle-row">
                         <input type="checkbox" id="default_letterhead" name="default_letterhead" value="1" {"checked" if s['default_letterhead'] else ""} style="width:18px; height:18px;">
                         <label for="default_letterhead" style="margin:0; font-size:14px;">Show digital letterhead by default when opening a report</label>
@@ -6394,6 +6419,8 @@ async def print_settings_save(request: Request):
     default_letterhead = 1 if form_data.get("default_letterhead") else 0
     patient_box_font_size_px = int(_clamp(form_data.get("patient_box_font_size_px"), 7, 16, DEFAULT_PRINT_SETTINGS["patient_box_font_size_px"]))
     patient_box_padding_px = int(_clamp(form_data.get("patient_box_padding_px"), 0, 15, DEFAULT_PRINT_SETTINGS["patient_box_padding_px"]))
+    mlt_signature_font_size_px = int(_clamp(form_data.get("mlt_signature_font_size_px"), 6, 20, DEFAULT_PRINT_SETTINGS["mlt_signature_font_size_px"]))
+    mlt_details_font_size_px = int(_clamp(form_data.get("mlt_details_font_size_px"), 6, 20, DEFAULT_PRINT_SETTINGS["mlt_details_font_size_px"]))
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -6402,11 +6429,13 @@ async def print_settings_save(request: Request):
         SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
             default_letterhead = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
+            mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
           footer_gap_px, page_side_margin_mm, default_letterhead,
           patient_box_font_size_px, patient_box_padding_px,
+          mlt_signature_font_size_px, mlt_details_font_size_px,
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -6428,11 +6457,13 @@ def print_settings_reset(request: Request):
         SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
             default_letterhead = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
+            mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
           d["line_height"], d["footer_gap_px"], d["page_side_margin_mm"],
           d["default_letterhead"], d["patient_box_font_size_px"], d["patient_box_padding_px"],
+          d["mlt_signature_font_size_px"], d["mlt_details_font_size_px"],
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -6911,6 +6942,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 --dynamic-side-margin: {print_settings['page_side_margin_mm']}mm;
                 --dynamic-patient-font: {print_settings['patient_box_font_size_px']}px;
                 --dynamic-patient-padding: {print_settings['patient_box_padding_px']}px;
+                --dynamic-mlt-signature-font: {print_settings['mlt_signature_font_size_px']}px;
+                --dynamic-mlt-details-font: {print_settings['mlt_details_font_size_px']}px;
             }}
             body {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size); background: #f0f2f5; margin: 0; padding: 20px; color: #000; }}
             .report-page, .report-page * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size) !important; }}
@@ -7021,7 +7054,6 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             
             .sig-wrapper-new {{ 
                 text-align: center; 
-                font-size: 8.5px !important; 
                 min-width: 300px; 
                 /* Shifted further toward the right margin. Capped at the
                    page's own printable width (A4, 15mm side padding) -
@@ -7042,6 +7074,22 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 margin-top: -45px; 
                 margin-bottom: -32px; 
                 margin-left: 10px; 
+            }}
+            /* MLT Signature: the technologist's typed name under the
+               signature image. Independently adjustable at
+               /print-settings so it can be made larger/smaller without
+               touching the "MLT Details" lines below it. */
+            .mlt-name {{
+                font-size: var(--dynamic-mlt-signature-font) !important;
+                margin-bottom: 1px;
+                display: block;
+            }}
+            /* MLT Details: designation ("Medical Laboratory Technologist
+               (MLT)") and registration number lines. Independently
+               adjustable at /print-settings, separate from the name. */
+            .mlt-details {{
+                font-size: var(--dynamic-mlt-details-font) !important;
+                display: block;
             }}
 
             /* "Printed on" now sits directly under the MLT/signature
@@ -7088,12 +7136,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             <div class="patient-box">
                 <table class="header-table">
                     <colgroup>
-                        <col style="width:16%;">
+                        <col style="width:12%;">
                         <col style="width:1%;">
-                        <col style="width:33%;">
-                        <col style="width:16%;">
+                        <col style="width:40%;">
+                        <col style="width:12%;">
                         <col style="width:1%;">
-                        <col style="width:33%;">
+                        <col style="width:34%;">
                     </colgroup>
                     <tr>
                         <td class="hlabel">Patient Name</td>
@@ -7171,9 +7219,9 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                     </div>
                     <div class="sig-wrapper-new">
                         <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" onerror="this.style.display='none';">
-                        <b style="margin-bottom: 1px;">S.P.Jananga</b>
-                        <span style="font-size: 8.5px; color: #222; margin-bottom: 1px; display: block;">Medical Laboratory Technologist (MLT)</span>
-                        <span style="font-size: 8.5px; color: #444; display: block;">SLMC No 2867</span>
+                        <b class="mlt-name">S.P.Jananga</b>
+                        <span class="mlt-details" style="color: #222;">Medical Laboratory Technologist (MLT)</span>
+                        <span class="mlt-details" style="color: #444;">SLMC No 2867</span>
                         <div class="printed-on-line">Printed on: {printed_on}</div>
                     </div>
                 </div>
