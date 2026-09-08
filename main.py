@@ -398,6 +398,7 @@ DEFAULT_PRINT_SETTINGS = {
     "patient_box_padding_px": 4,
     "mlt_signature_font_size_px": 9,
     "mlt_details_font_size_px": 8,
+    "show_printed_on": 1,
 }
 
 
@@ -416,7 +417,8 @@ def get_print_settings() -> dict:
             SELECT row_padding_px, base_font_size_px, header_font_size_px,
                    line_height, footer_gap_px, page_side_margin_mm, default_letterhead,
                    patient_box_font_size_px, patient_box_padding_px,
-                   mlt_signature_font_size_px, mlt_details_font_size_px
+                   mlt_signature_font_size_px, mlt_details_font_size_px,
+                   show_printed_on
             FROM system_print_settings WHERE id = 1
         """)
         row = cursor.fetchone()
@@ -1062,7 +1064,8 @@ def init_db():
             test_name TEXT UNIQUE NOT NULL,
             price REAL DEFAULT 0.0,
             department TEXT,
-            specimen TEXT
+            specimen TEXT,
+            show_fia_graph INTEGER DEFAULT 0
         )
     """)
 
@@ -1183,6 +1186,7 @@ def init_db():
             footer_gap_px INTEGER DEFAULT 18,
             page_side_margin_mm INTEGER DEFAULT 15,
             default_letterhead INTEGER DEFAULT 0,
+            show_printed_on INTEGER DEFAULT 1,
             updated_at TEXT
         )
     """)
@@ -1216,11 +1220,22 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN show_printed_on INTEGER DEFAULT 1")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE tests ADD COLUMN show_fia_graph INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute("""
         INSERT OR IGNORE INTO system_print_settings
-            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, patient_box_font_size_px, patient_box_padding_px, mlt_signature_font_size_px, mlt_details_font_size_px, updated_at)
-        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, 11, 4, 9, 8, NULL)
+            (id, row_padding_px, base_font_size_px, header_font_size_px, line_height, footer_gap_px, page_side_margin_mm, default_letterhead, patient_box_font_size_px, patient_box_padding_px, mlt_signature_font_size_px, mlt_details_font_size_px, show_printed_on, updated_at)
+        VALUES (1, 4, 11, 11, 1.25, 18, 15, 0, 11, 4, 9, 8, 1, NULL)
     """)
     conn.commit()
 
@@ -1367,11 +1382,11 @@ def dashboard():
             p_phone = phone if phone else 'N/A'
             recent_rows += f"""
             <tr>
-                <td style="padding: 10px 12px; font-weight: 700;">#{p_id}</td>
-                <td style="padding: 10px 12px; font-weight: 600;">{title} {name}</td>
-                <td style="padding: 10px 12px; opacity: 0.8;">{p_phone}</td>
-                <td style="padding: 10px 12px;">{doctor}</td>
-                <td style="padding: 10px 12px; text-align: center;">
+                <td style="padding: 5px 8px; font-weight: 700;">#{p_id}</td>
+                <td style="padding: 5px 8px; font-weight: 600;">{title} {name}</td>
+                <td style="padding: 5px 8px; opacity: 0.8;">{p_phone}</td>
+                <td style="padding: 5px 8px;">{doctor}</td>
+                <td style="padding: 5px 8px; text-align: center;">
                     <a href="/patient-results/{p_id}" class="view-btn"><i class="fa-solid fa-eye"></i> View</a>
                 </td>
             </tr>
@@ -1585,10 +1600,10 @@ def dashboard():
                 background: var(--table-header);
                 color: white;
                 text-align: left;
-                padding: 10px 12px;
+                padding: 5px 8px;
                 font-weight: 600;
             }}
-            .compact-table td {{ padding: 10px 12px; border-bottom: 1px solid var(--border-color); }}
+            .compact-table td {{ padding: 5px 8px; border-bottom: 1px solid var(--border-color); }}
             .compact-table tr:hover {{ background-color: rgba(0,0,0,0.02); }}
 
             .view-btn {{
@@ -3484,6 +3499,10 @@ def manage_tests(request: Request, dept: str = ""):
                     <input type="text" name="department" placeholder="Department (e.g. Biochemistry)">
                     <input type="text" name="specimen" placeholder="Specimen (e.g. Blood, Urine)">
                 </div>
+                <label style="display:flex;align-items:center;gap:8px;margin:8px 0 12px;font-size:13px;font-weight:700;color:#0f4c81;">
+                    <input type="checkbox" name="show_fia_graph" value="1" style="width:18px;height:18px;">
+                    Show FIA Graph on final report for this test
+                </label>
 
                 <!-- Notes / Description Section with Formatting Toolbar -->
                 <div>
@@ -4426,6 +4445,7 @@ def add_main_test(
     department: str = Form(""), 
     specimen: str = Form(""), 
     notes: str = Form(""),
+    show_fia_graph: Optional[str] = Form(None),
     align_inv: str = Form("left"),
     align_res: str = Form("center"),
     align_flag: str = Form("center"),
@@ -4459,12 +4479,17 @@ def add_main_test(
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    try:
+        cursor.execute("ALTER TABLE tests ADD COLUMN show_fia_graph INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     try:
         cursor.execute("""
-            INSERT INTO tests (test_code, test_name, price, department, specimen, notes, col_alignments) 
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (test_code.upper(), test_name.upper(), price, department, specimen, notes, alignments))
+            INSERT INTO tests (test_code, test_name, price, department, specimen, notes, col_alignments, show_fia_graph) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (test_code.upper(), test_name.upper(), price, department, specimen, notes, alignments, 1 if show_fia_graph else 0))
         conn.commit()
     except sqlite3.IntegrityError:
         pass
@@ -4483,14 +4508,14 @@ def edit_test_category_page(test_id: int):
     # whether /add-main-test has ever run. Each guarded separately so one
     # already-existing column never blocks the others (see /add-main-test
     # for why chaining these in a single try/except is unsafe with libsql).
-    for col_def in ("notes TEXT", "col_alignments TEXT", "test_code TEXT"):
+    for col_def in ("notes TEXT", "col_alignments TEXT", "test_code TEXT", "show_fia_graph INTEGER DEFAULT 0"):
         try:
             cursor.execute(f"ALTER TABLE tests ADD COLUMN {col_def}")
             conn.commit()
         except sqlite3.OperationalError:
             pass
 
-    cursor.execute("SELECT test_name, price, department, specimen, notes, col_alignments, test_code FROM tests WHERE id = ?", (test_id,))
+    cursor.execute("SELECT test_name, price, department, specimen, notes, col_alignments, test_code, COALESCE(show_fia_graph, 0) FROM tests WHERE id = ?", (test_id,))
     test = cursor.fetchone()
     conn.close()
 
@@ -4510,6 +4535,7 @@ def edit_test_category_page(test_id: int):
     department_value = test[2] if test[2] else ""
     specimen_value = test[3] if test[3] else ""
     test_code_value = test[6] if test[6] else ""
+    show_fia_graph_value = bool(test[7]) if len(test) > 7 else False
 
     return f"""
     <!DOCTYPE html>
@@ -4563,6 +4589,12 @@ def edit_test_category_page(test_id: int):
                     <label>Notes / Details (Appears below print results):</label>
                     <textarea name="notes">{notes_value}</textarea>
                 </div>
+                <div class="form-group" style="padding:10px 12px;border:1px solid #dbeafe;background:#f8fbff;border-radius:7px;">
+                    <label style="display:flex;align-items:center;gap:8px;margin:0;color:#0f4c81;">
+                        <input type="checkbox" name="show_fia_graph" value="1" style="width:18px;height:18px;" {"checked" if show_fia_graph_value else ""}>
+                        Show FIA Graph on final report for this test
+                    </label>
+                </div>
 
                 <div class="form-group" style="background:#f9f9f9; padding:15px; border-radius:8px; border:1px solid #eee;">
                     <label style="color:#0f4c81;">Report Column Alignments & Widths:</label>
@@ -4611,6 +4643,7 @@ def update_test_category(
     test_code: str = Form(""),
     test_name: str = Form(...), price: float = Form(0.0), 
     department: str = Form(""), specimen: str = Form(""), notes: str = Form(""),
+    show_fia_graph: Optional[str] = Form(None),
     align_inv: str = Form("left"), align_res: str = Form("center"),
     align_flag: str = Form("center"), align_unit: str = Form("left"), align_ref: str = Form("left"),
     width_inv: float = Form(38), width_res: float = Form(13), width_flag: float = Form(8),
@@ -4622,7 +4655,7 @@ def update_test_category(
 
     # Same independent per-column guards as the GET page and /add-main-test,
     # so saving never fails with "no such column" regardless of DB history.
-    for col_def in ("notes TEXT", "col_alignments TEXT", "test_code TEXT"):
+    for col_def in ("notes TEXT", "col_alignments TEXT", "test_code TEXT", "show_fia_graph INTEGER DEFAULT 0"):
         try:
             cursor.execute(f"ALTER TABLE tests ADD COLUMN {col_def}")
             conn.commit()
@@ -4639,9 +4672,9 @@ def update_test_category(
     try:
         cursor.execute("""
             UPDATE tests 
-            SET test_code = ?, test_name = ?, price = ?, department = ?, specimen = ?, notes = ?, col_alignments = ?
+            SET test_code = ?, test_name = ?, price = ?, department = ?, specimen = ?, notes = ?, col_alignments = ?, show_fia_graph = ?
             WHERE id = ?
-        """, (test_code.upper(), test_name.upper(), price, department, specimen, notes, alignments, test_id))
+        """, (test_code.upper(), test_name.upper(), price, department, specimen, notes, alignments, 1 if show_fia_graph else 0, test_id))
         conn.commit()
     except sqlite3.IntegrityError:
         # test_name is UNIQUE - another category already has this exact
@@ -5070,14 +5103,18 @@ def test_entry_page(patient_id: int, test_id: int):
     
     # Input field attributes: If already saved (has_results), make them disabled (Locked)
     if has_results:
-        input_attr = 'disabled style="flex: 3; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"'
+        input_attr = 'disabled style="flex: 3; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"'
     else:
-        input_attr = 'style="flex: 3; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; transition: border-color 0.2s;"'
+        input_attr = 'style="flex: 3; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; transition: border-color 0.2s;"'
 
     if params:
         for p in params:
             p_id_param = p["id"]
             p_name_val = p["p_name"]
+            # Structural spacer parameters are intentionally preserved in the
+            # database and final report, but hidden from Result Entry.
+            if str(p_name_val or "").strip() in {"", ".", "-", "_"}:
+                continue
             unit_val = p["unit"] or ""
             is_calculated = bool(p["is_calculated"]) if "is_calculated" in p.keys() else False
 
@@ -5105,7 +5142,7 @@ def test_entry_page(patient_id: int, test_id: int):
             final_val = p_val.strip() if str(p_val).strip() != "" else default_val
 
             if is_calculated:
-                calc_attr = 'readonly style="flex: 3; padding: 10px 12px; border: 1px solid #93c5fd; border-radius: 6px; font-size: 14px; background: #eff6ff; color: #1d4ed8; font-weight: 700;"'
+                calc_attr = 'readonly style="flex: 3; padding: 5px 8px; border: 1px solid #93c5fd; border-radius: 6px; font-size: 14px; background: #eff6ff; color: #1d4ed8; font-weight: 700;"'
                 badge = '<span style="background:#dbeafe;color:#1d4ed8;padding:3px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px;">AUTO</span>'
             else:
                 calc_attr = input_attr
@@ -5115,14 +5152,14 @@ def test_entry_page(patient_id: int, test_id: int):
             unit_html = f'<span style="min-width:90px;font-size:12px;color:#64748b;">{html.escape(str(unit_val))}</span>' if unit_val else '<span style="min-width:90px;"></span>'
 
             param_form_html += f"""
-            <div style="display:grid; grid-template-columns: minmax(180px,2fr) minmax(120px,3fr) 100px; margin-bottom: 12px; align-items:center; gap:12px;">
+            <div style="display:grid; grid-template-columns: minmax(180px,2fr) minmax(120px,3fr) 100px; margin-bottom: 4px; align-items:center; gap:6px;">
                 <label style="font-weight:600;color:#334155;font-size:14px;">{html.escape(str(p_name_val))}{badge}{ref_html}</label>
                 <input type="text" name="param_{test_id}_{p_id_param}" value="{html.escape(final_val)}" placeholder="{'Auto calculated' if is_calculated else 'Enter result...'}" class="param-input" onkeydown="handleParamKeyNav(event, this)" {calc_attr}>
                 {unit_html}
             </div>
             """
     else:
-        main_input_attr = 'disabled style="width: 100%; padding: 10px 12px; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"' if has_results else 'style="width: 100%; padding: 10px 12px; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none;"'
+        main_input_attr = 'disabled style="width: 100%; padding: 5px 8px; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"' if has_results else 'style="width: 100%; padding: 5px 8px; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none;"'
         param_form_html += f"""
         <div style="margin-bottom: 15px;">
             <input type="text" name="result_{test_id}" value="{main_result_val}" placeholder="Enter test result..." {main_input_attr}>
@@ -5242,6 +5279,14 @@ def test_entry_page(patient_id: int, test_id: int):
             }}
         </style>
         <script>
+            // Preserve Result Entry position/context across save redirects and
+            // report navigation so multi-test workflows never jump to top.
+            const resultEntryScrollKey = "result-entry-scroll:{patient_id}:{test_id}";
+            window.addEventListener("beforeunload", () => sessionStorage.setItem(resultEntryScrollKey, String(window.scrollY || 0)));
+            window.addEventListener("DOMContentLoaded", () => {{
+                const y = sessionStorage.getItem(resultEntryScrollKey);
+                if (y !== null) requestAnimationFrame(() => window.scrollTo(0, Number(y) || 0));
+            }});
             // Down Arrow / Enter -> next parameter field, Up Arrow -> previous.
             // Scoped to the enclosing <form>, and preventDefault() on Enter
             // stops the form from submitting prematurely.
@@ -5265,7 +5310,7 @@ def test_entry_page(patient_id: int, test_id: int):
             <!-- Top Navigation Bar (Back Link & View Professional Report Button) -->
             <div class="no-print" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <a href="/patient-results/{patient_id}" class="back-link">&larr; Back to Patient Overview</a>
-                <a href="/report-view/{patient_id}/{test_id}" target="_blank" class="btn-report">
+                <a href="/report-view/{patient_id}/{test_id}" target="_blank" class="btn-report" onclick="sessionStorage.setItem(resultEntryScrollKey, String(window.scrollY || 0));">
                     📄 View Professional Report
                 </a>
             </div>
@@ -5285,7 +5330,7 @@ def test_entry_page(patient_id: int, test_id: int):
                 {reset_section_html}
                 
                <div style="text-align: center; margin-top: 12px;">
-        <a href="/report-view/{patient_id}/{test_id}" target="_blank" class="btn-print no-print" style="text-decoration: none; display: inline-block; line-height: normal;">
+        <a href="/report-view/{patient_id}/{test_id}" target="_blank" class="btn-print no-print" onclick="sessionStorage.setItem(resultEntryScrollKey, String(window.scrollY || 0));" style="text-decoration: none; display: inline-block; line-height: normal;">
             📄 View & Print Professional Report
         </a>
     </div>
@@ -5305,9 +5350,9 @@ def update_patient_info(patient_id: int, patient_title: str = Form(...), patient
     try:
         cursor.execute("""
             UPDATE patients 
-            SET title = ?, name = ?, phone = ?, doctor = ?, age_years = ?, center = ?, gender = ?
+            SET title = ?, name = ?, phone = ?, doctor = ?, age_years = ?, age = ?, center = ?, gender = ?
             WHERE id = ?
-        """, (patient_title, patient_name, patient_phone, patient_doctor, patient_age, patient_center, patient_gender, patient_id))
+        """, (patient_title, patient_name, patient_phone, patient_doctor, patient_age, patient_age, patient_center, patient_gender, patient_id))
         conn.commit()
     except Exception as e:
         try:
@@ -6386,6 +6431,10 @@ def print_settings_page(request: Request, saved: int = 0):
                         </div>
                     </div>
                     <div class="toggle-row">
+                        <input type="checkbox" id="show_printed_on" name="show_printed_on" value="1" {"checked" if s.get('show_printed_on', 1) else ""} style="width:18px; height:18px;">
+                        <label for="show_printed_on" style="margin:0; font-size:14px;">Show “Printed on” date/time on reports</label>
+                    </div>
+                    <div class="toggle-row">
                         <input type="checkbox" id="default_letterhead" name="default_letterhead" value="1" {"checked" if s['default_letterhead'] else ""} style="width:18px; height:18px;">
                         <label for="default_letterhead" style="margin:0; font-size:14px;">Show digital letterhead by default when opening a report</label>
                     </div>
@@ -6417,6 +6466,7 @@ async def print_settings_save(request: Request):
     footer_gap_px = int(_clamp(form_data.get("footer_gap_px"), 0, 60, DEFAULT_PRINT_SETTINGS["footer_gap_px"]))
     page_side_margin_mm = int(_clamp(form_data.get("page_side_margin_mm"), 5, 30, DEFAULT_PRINT_SETTINGS["page_side_margin_mm"]))
     default_letterhead = 1 if form_data.get("default_letterhead") else 0
+    show_printed_on = 1 if form_data.get("show_printed_on") else 0
     patient_box_font_size_px = int(_clamp(form_data.get("patient_box_font_size_px"), 7, 16, DEFAULT_PRINT_SETTINGS["patient_box_font_size_px"]))
     patient_box_padding_px = int(_clamp(form_data.get("patient_box_padding_px"), 0, 15, DEFAULT_PRINT_SETTINGS["patient_box_padding_px"]))
     mlt_signature_font_size_px = int(_clamp(form_data.get("mlt_signature_font_size_px"), 6, 20, DEFAULT_PRINT_SETTINGS["mlt_signature_font_size_px"]))
@@ -6428,12 +6478,12 @@ async def print_settings_save(request: Request):
         UPDATE system_print_settings
         SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
-            default_letterhead = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
+            default_letterhead = ?, show_printed_on = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
-          footer_gap_px, page_side_margin_mm, default_letterhead,
+          footer_gap_px, page_side_margin_mm, default_letterhead, show_printed_on,
           patient_box_font_size_px, patient_box_padding_px,
           mlt_signature_font_size_px, mlt_details_font_size_px,
           now_colombo().isoformat(timespec="seconds")))
@@ -6456,13 +6506,13 @@ def print_settings_reset(request: Request):
         UPDATE system_print_settings
         SET row_padding_px = ?, base_font_size_px = ?, header_font_size_px = ?,
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
-            default_letterhead = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
+            default_letterhead = ?, show_printed_on = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
           d["line_height"], d["footer_gap_px"], d["page_side_margin_mm"],
-          d["default_letterhead"], d["patient_box_font_size_px"], d["patient_box_padding_px"],
+          d["default_letterhead"], d["show_printed_on"], d["patient_box_font_size_px"], d["patient_box_padding_px"],
           d["mlt_signature_font_size_px"], d["mlt_details_font_size_px"],
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
@@ -6490,6 +6540,13 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
 
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COALESCE(show_fia_graph, 0) FROM tests WHERE id = ?", (test_id,))
+        _fia_row = cursor.fetchone()
+        show_fia_graph = bool(_fia_row[0]) if _fia_row else False
+    except Exception:
+        show_fia_graph = False
 
     # Base URL for static images (Fixes 404 Not Found error for letterhead & signature)
     base_url_str = str(request.base_url).rstrip("/")
@@ -6893,6 +6950,31 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
         # separate standalone table.
         rows_html += diff_section_html
 
+    # Optional FIA graph is test-configurable, never hardcoded to HbA1c.
+    # It is intentionally placed below the results table; the configured
+    # test notes/comments occupy the left side and the graph the right.
+    fia_layout_html = ""
+    if show_fia_graph:
+        fia_layout_html = f"""
+        <div class='fia-layout'>
+            <div class='fia-description'>
+                {test_notes_html or ("<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else "")}
+            </div>
+            <div class='fia-graph-wrap'>
+                <div class='fia-graph-title'>FLUORESCENCE IMMUNOASSAY (FIA) GRAPH</div>
+                <svg viewBox='0 0 420 180' class='fia-graph' role='img' aria-label='Fluorescence Immunoassay graph'>
+                    <line x1='35' y1='150' x2='400' y2='150' stroke='#111' stroke-width='1.5'/>
+                    <line x1='35' y1='15' x2='35' y2='150' stroke='#111' stroke-width='1.5'/>
+                    <path d='M45 142 C95 140, 115 130, 150 95 S215 25, 265 42 S325 120, 390 138' fill='none' stroke='#111' stroke-width='2.2'/>
+                    <line x1='210' y1='20' x2='210' y2='150' stroke='#555' stroke-dasharray='4 4'/>
+                    <text x='215' y='32' font-size='11'>Result marker</text>
+                    <text x='175' y='172' font-size='11'>Reaction / Time</text>
+                    <text x='10' y='18' font-size='11'>Signal</text>
+                </svg>
+            </div>
+        </div>
+        """
+
     barcode_url = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
     download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
     qr_data = quote(download_url, safe="")
@@ -7040,6 +7122,13 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                page, exactly where the content naturally ends. This is
                what keeps long reports from overflowing or triggering
                awkward forced page breaks. */
+            .fia-layout {{ display:flex; gap:12px; margin-top:10px; align-items:stretch; }}
+            .fia-description {{ flex:1 1 52%; min-width:0; padding:8px 10px; border:1px solid #222; }}
+            .fia-graph-wrap {{ flex:1 1 48%; min-width:0; padding:8px; border:1px solid #222; }}
+            .fia-graph-title {{ text-align:center; font-size:9px !important; font-weight:700; margin-bottom:4px; }}
+            .fia-graph {{ width:100%; height:auto; display:block; }}
+            @media print {{ .fia-layout {{ break-inside: avoid; page-break-inside: avoid; }} }}
+
             .report-bottom-fixed {{
                 margin-top: var(--dynamic-footer-gap);
                 width: 100%;
@@ -7205,8 +7294,9 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
 
             {absolute_diff_html}
 
-            {"<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else ""}
-            {test_notes_html}
+            {"" if show_fia_graph else ("<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else "")}
+            {"" if show_fia_graph else test_notes_html}
+            {fia_layout_html}
             <hr class="section-divider">
             <div class="end-report-text">*** END OF REPORT ***</div>
 
@@ -7222,7 +7312,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                         <b class="mlt-name">S.P.Jananga</b>
                         <span class="mlt-details" style="color: #222;">Medical Laboratory Technologist (MLT)</span>
                         <span class="mlt-details" style="color: #444;">SLMC No 2867</span>
-                        <div class="printed-on-line">Printed on: {printed_on}</div>
+                        {"<div class=\"printed-on-line\">Printed on: " + printed_on + "</div>" if print_settings.get("show_printed_on", 1) else ""}
                     </div>
                 </div>
             </div>
