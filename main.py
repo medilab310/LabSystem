@@ -6960,27 +6960,26 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
         rows_html += diff_section_html
 
     # Optional FIA graph is test-configurable, never hardcoded to HbA1c.
-    # It is intentionally placed below the results table; the configured
-    # test notes/comments occupy the left side and the graph the right.
-    fia_layout_html = ""
+    # It now renders INLINE, beside the results table itself (not as a
+    # separate block below it) - the table + graph sit side by side as
+    # one row. Notes/comments are no longer tied to this block and are
+    # rendered normally in their usual place below the table, exactly as
+    # when the FIA graph is off. Graph markup itself (the <path>/<line>
+    # elements plotting the reaction curve) is untouched.
+    fia_graph_only_html = ""
     if show_fia_graph:
-        fia_layout_html = f"""
-        <div class='fia-layout'>
-            <div class='fia-description'>
-                {test_notes_html or ("<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else "")}
-            </div>
-            <div class='fia-graph-wrap'>
-                <div class='fia-graph-title'>FLUORESCENCE IMMUNOASSAY (FIA) GRAPH</div>
-                <svg viewBox='0 0 420 180' class='fia-graph' role='img' aria-label='Fluorescence Immunoassay graph'>
-                    <line x1='35' y1='150' x2='400' y2='150' stroke='#111' stroke-width='1.5'/>
-                    <line x1='35' y1='15' x2='35' y2='150' stroke='#111' stroke-width='1.5'/>
-                    <path d='M45 142 C95 140, 115 130, 150 95 S215 25, 265 42 S325 120, 390 138' fill='none' stroke='#111' stroke-width='2.2'/>
-                    <line x1='210' y1='20' x2='210' y2='150' stroke='#555' stroke-dasharray='4 4'/>
-                    <text x='215' y='32' font-size='11'>Result marker</text>
-                    <text x='175' y='172' font-size='11'>Reaction / Time</text>
-                    <text x='10' y='18' font-size='11'>Signal</text>
-                </svg>
-            </div>
+        fia_graph_only_html = f"""
+        <div class='fia-graph-wrap'>
+            <div class='fia-graph-title'>FLUORESCENCE IMMUNOASSAY (FIA) GRAPH</div>
+            <svg viewBox='0 0 420 180' class='fia-graph' role='img' aria-label='Fluorescence Immunoassay graph'>
+                <line x1='35' y1='150' x2='400' y2='150' stroke='#111' stroke-width='1.5'/>
+                <line x1='35' y1='15' x2='35' y2='150' stroke='#111' stroke-width='1.5'/>
+                <path d='M45 142 C95 140, 115 130, 150 95 S215 25, 265 42 S325 120, 390 138' fill='none' stroke='#111' stroke-width='2.2'/>
+                <line x1='210' y1='20' x2='210' y2='150' stroke='#555' stroke-dasharray='4 4'/>
+                <text x='215' y='32' font-size='11'>Result marker</text>
+                <text x='175' y='172' font-size='11'>Reaction / Time</text>
+                <text x='10' y='18' font-size='11'>Signal</text>
+            </svg>
         </div>
         """
 
@@ -7131,80 +7130,47 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                page, exactly where the content naturally ends. This is
                what keeps long reports from overflowing or triggering
                awkward forced page breaks. */
-            /* FIA layout fix: the root cause of the border-overlap/text-
-               overflow bug was that .fia-description and .fia-graph-wrap
-               never set box-sizing:border-box. Under the default
-               content-box model, each box's PADDING and BORDER get added
-               ON TOP OF its flex-basis percentage - so 52% + 48% of
-               padding/border-inflated boxes actually exceeded 100% of
-               the container's width combined, forcing the two boxes to
-               collide/overlap. box-sizing:border-box makes the declared
-               percentage the box's TRUE outer width (padding and border
-               included), which is what guarantees they sit cleanly
-               side-by-side with a real gap between them. */
-            .fia-layout {{ 
+            /* FIA graph is now rendered INLINE beside the results table
+               itself (not as a separate block below it). .fia-inline-row
+               is only applied when the graph is on for this test - when
+               it's off, .report-table renders exactly as before, full
+               width, completely unaffected. box-sizing:border-box on
+               every box here is what guarantees the table column and the
+               graph box sit cleanly side by side without colliding. */
+            .fia-inline-row {{ 
                 display: flex; 
                 flex-wrap: wrap; 
                 gap: 15px; 
-                margin-top: 10px; 
                 align-items: flex-start; 
                 box-sizing: border-box; 
                 width: 100%; 
             }}
-            /* Left side: plain, unboxed content - no border, no
-               background, no padding. Just the description/interpretation
-               table flowing naturally. It takes whatever width remains
-               after the small graph box on the right claims its own
-               fixed, compact width. */
-            .fia-description {{ 
+            .fia-table-col {{ 
                 flex: 1 1 auto; 
                 min-width: 0; 
-                padding: 0; 
-                border: none; 
-                background: transparent; 
-                overflow: hidden; 
-                font-size: 9px !important; 
-            }}
-            /* Table safety rules kept even without a visible box border,
-               so long interpretation text still wraps within its own
-               column instead of running into the graph box on the right. */
-            .fia-description table {{ 
-                width: 100% !important; 
-                table-layout: fixed; 
-                border-collapse: collapse; 
-                font-size: 9px !important; 
-            }}
-            .fia-description table td, .fia-description table th {{ 
-                word-wrap: break-word; 
-                overflow-wrap: break-word; 
-                padding: 2px 4px; 
                 box-sizing: border-box; 
-                vertical-align: top; 
-                font-size: 9px !important; 
             }}
-            .fia-description table td:first-child, .fia-description table th:first-child {{ width: 30%; }}
-            .fia-description table td:last-child, .fia-description table th:last-child {{ width: 70%; }}
-            /* Right side: small, fixed-width box that hugs the SVG
-               tightly. flex:0 0 <width> means it never grows or shrinks
-               from this size regardless of how much room the left side
-               needs, and align-items:flex-start on .fia-layout (above)
-               stops it from being stretched to match the left column's
-               height - so there's no leftover empty white space inside
-               the box, just the title + graph with minimal padding
-               around them. */
+            /* Right side: a fixed-width box that hugs the SVG closely.
+               Sized up slightly from the previous standalone version
+               (190px -> 230px) for better legibility now that it sits
+               directly beside the result row instead of underneath a
+               long block of text. align-items:flex-start on
+               .fia-inline-row (above) stops it from being stretched to
+               match the table's full height, so there's no leftover
+               empty white space inside the box. */
             .fia-graph-wrap {{ 
-                flex: 0 0 190px; 
-                max-width: 190px; 
+                flex: 0 0 230px; 
+                max-width: 230px; 
                 box-sizing: border-box; 
-                padding: 4px 5px; 
+                padding: 6px 8px; 
                 border: 1px solid #222; 
             }}
-            .fia-graph-title {{ text-align:center; font-size:8px !important; font-weight:700; margin-bottom:2px; }}
+            .fia-graph-title {{ text-align:center; font-size:8.5px !important; font-weight:700; margin-bottom:3px; }}
             /* SVG itself is untouched (viewBox + width:100% already make
                it scale cleanly and responsively) - only its wrapper's
-               box model was ever the problem. */
+               box model and size were ever adjusted. */
             .fia-graph {{ width:100%; height:auto; display:block; }}
-            @media print {{ .fia-layout {{ break-inside: avoid; page-break-inside: avoid; }} }}
+            @media print {{ .fia-inline-row {{ break-inside: avoid; page-break-inside: avoid; }} }}
 
             .report-bottom-fixed {{
                 margin-top: var(--dynamic-footer-gap);
@@ -7354,26 +7320,29 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
 
             <div class="test-title-bar">{test_name}</div>
 
-            <table class="report-table">
-                <thead>
-                    <tr>
-                        {f'<th style="width:{col_widths[0]:.2f}%;text-align:{align_inv};">Investigation</th>' if align_inv != "none" else ""}
-                        {f'<th style="width:{col_widths[1]:.2f}%;text-align:{align_res};">Result</th>' if align_res != "none" else ""}
-                        {f'<th style="width:{col_widths[2]:.2f}%;text-align:{align_flag};">Flag</th>' if align_flag != "none" else ""}
-                        {f'<th style="width:{col_widths[3]:.2f}%;text-align:{align_unit};">Unit</th>' if align_unit != "none" else ""}
-                        {f'<th style="width:{col_widths[4]:.2f}%;text-align:{align_ref};">Reference Range</th>' if align_ref != "none" else ""}
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows_html}
-                </tbody>
-            </table>
+            <div class="{'fia-inline-row' if show_fia_graph else ''}">
+                <div class="{'fia-table-col' if show_fia_graph else ''}">
+                    <table class="report-table">
+                        <thead>
+                            <tr>
+                                {f'<th style="width:{col_widths[0]:.2f}%;text-align:{align_inv};">Investigation</th>' if align_inv != "none" else ""}
+                                {f'<th style="width:{col_widths[1]:.2f}%;text-align:{align_res};">Result</th>' if align_res != "none" else ""}
+                                {f'<th style="width:{col_widths[2]:.2f}%;text-align:{align_flag};">Flag</th>' if align_flag != "none" else ""}
+                                {f'<th style="width:{col_widths[3]:.2f}%;text-align:{align_unit};">Unit</th>' if align_unit != "none" else ""}
+                                {f'<th style="width:{col_widths[4]:.2f}%;text-align:{align_ref};">Reference Range</th>' if align_ref != "none" else ""}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows_html}
+                        </tbody>
+                    </table>
+                    {absolute_diff_html}
+                </div>
+                {fia_graph_only_html}
+            </div>
 
-            {absolute_diff_html}
-
-            {"" if show_fia_graph else ("<div class='report-note'><b>Note:</b> " + comment_text + "</div>" if comment_text else "")}
-            {"" if show_fia_graph else test_notes_html}
-            {fia_layout_html}
+            {("<div class='report-note'><b>Note:</b> " + comment_text + "</div>") if comment_text else ""}
+            {test_notes_html}
             <hr class="section-divider">
             <div class="end-report-text">*** END OF REPORT ***</div>
 
