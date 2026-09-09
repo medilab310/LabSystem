@@ -7006,7 +7006,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     # Graph content: a Color-Banded Reference Range Gauge (replaces the
     # earlier signal/reaction-curve mockup). Bands follow standard HbA1c
     # interpretation - Green <5.6% (normal), Yellow 5.6-7.0%
-    # (pre-diabetes), Red >7.0% (diabetes range) - with a pointer marking
+    # (pre-diabetes), Red >10% (diabetes range) - with a pointer marking
     # the patient's own result. Scale is fixed at 4.0-10.0% so the three
     # bands stay proportioned and legible at this box's fixed size;
     # results outside that range clamp the pointer to the nearest edge
