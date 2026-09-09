@@ -7170,7 +7170,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                awkward blank gap before the notes/guidelines text below.
                This tightens the gap specifically in that case only -
                every other test's note spacing above is untouched. */
-            .fia-inline-row + .report-note, .fia-inline-row + .report-test-note {{ margin-top: 2px; }}
+            .fia-inline-row + .report-note, .fia-inline-row + .report-test-note {{ margin-top: -5px; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
             .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
@@ -7221,12 +7221,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 flex: 0 0 230px; 
                 max-width: 230px; 
                 margin-left: auto;
-                /* Slight downward nudge so the gauge's top/vertical
-                   center lines up naturally with the results table's
-                   actual data row, rather than sitting flush with the
-                   very top of the flex row (above the table's own
-                   header-row padding/border). */
-                margin-top: 10px;
+                /* Downward nudge so the gauge's top/vertical center
+                   lines up naturally with the middle/lower portion of
+                   the results table's actual data row, rather than
+                   sitting flush with the very top of the flex row
+                   (above the table's own header-row padding/border). */
+                margin-top: 28px;
                 box-sizing: border-box; 
                 padding: 6px 8px; 
                 border: 1px solid #222; 
