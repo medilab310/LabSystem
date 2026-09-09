@@ -613,14 +613,42 @@ def login_page(error: str = ""):
     <head>
         <title>MEDISTAR MEDICAL LABORATORY - Login</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f7fb; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-            .login-card {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 400px; border-top: 5px solid #0f4c81; }}
+            body {{ 
+                font-family: Arial, sans-serif; 
+                margin: 0; 
+                min-height: 100vh; 
+                display: flex; 
+                justify-content: center; 
+                align-items: center; 
+                /* Full-screen medical background photo with a dark-blue
+                   gradient overlay layered on top of it (not a separate
+                   div - the gradient is just the first background-image
+                   layer, painted over the photo beneath it). Swap the
+                   url() below for your own asset at any time (e.g. a
+                   licensed Unsplash photo URL) - everything else in this
+                   rule stays the same. */
+                background-image: linear-gradient(135deg, rgba(14, 53, 90, 0.85), rgba(10, 30, 55, 0.90)), url('/static/bg-lab.jpg');
+                background-size: cover; 
+                background-position: center; 
+                background-repeat: no-repeat; 
+                background-attachment: fixed; 
+                background-color: #0a1e37; /* fallback tone if the image is missing/still loading */
+            }}
+            .login-card {{ 
+                background: white; 
+                padding: 30px; 
+                border-radius: 12px; 
+                box-shadow: 0 15px 35px rgba(0,0,0,0.25); 
+                width: 400px; 
+                border-top: 5px solid #0f4c81; 
+            }}
             .login-logo {{ display: block; width: 180px; height: 180px; object-fit: contain; margin: 0 auto 12px auto; }}
             h2 {{ color: #0f4c81; text-align: center; margin-bottom: 5px; font-size: 20px; }}
             p.sub {{ text-align: center; color: #64748b; font-size: 12px; margin-bottom: 20px; }}
             .form-group {{ margin-bottom: 15px; display: flex; flex-direction: column; gap: 5px; }}
             label {{ font-size: 12px; font-weight: bold; color: #64748b; }}
-            input {{ padding: 10px; border: 1px solid #cbd5e1; border-radius: 5px; outline: none; font-size: 14px; }}
+            input {{ padding: 10px; border: 1px solid #cbd5e1; border-radius: 5px; outline: none; font-size: 14px; background: #fff; color: #0f172a; }}
+            input:focus {{ border-color: #0f4c81; box-shadow: 0 0 0 3px rgba(15, 76, 129, 0.12); }}
             .btn-login {{ background: #0f4c81; color: white; border: none; padding: 10px; border-radius: 5px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 10px; font-size: 14px; }}
             .btn-login:hover {{ background: #0c3d6d; }}
         </style>
