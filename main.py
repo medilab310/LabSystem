@@ -7147,29 +7147,27 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 flex-wrap: wrap; 
                 gap: 15px; 
                 margin-top: 10px; 
-                align-items: stretch; 
+                align-items: flex-start; 
                 box-sizing: border-box; 
                 width: 100%; 
             }}
+            /* Left side: plain, unboxed content - no border, no
+               background, no padding. Just the description/interpretation
+               table flowing naturally. It takes whatever width remains
+               after the small graph box on the right claims its own
+               fixed, compact width. */
             .fia-description {{ 
-                flex: 0 1 52%; 
-                max-width: 52%; 
-                box-sizing: border-box; 
+                flex: 1 1 auto; 
                 min-width: 0; 
-                padding: 6px 8px; 
-                border: 1px solid #222; 
+                padding: 0; 
+                border: none; 
+                background: transparent; 
                 overflow: hidden; 
                 font-size: 9px !important; 
             }}
-            /* Any table rendered inside the guidelines block (e.g. the
-               "HbA1c Interpretation Guidelines" table configured in the
-               test's Notes) gets forced to a safe, self-contained layout:
-               table-layout:fixed locks it to the container's own width
-               instead of growing to fit its content, and word-wrap on
-               every cell guarantees long interpretation text wraps
-               inside its own cell rather than bleeding past the box's
-               right border. Explicit column widths (30% / 70%) match the
-               "Range" vs "Interpretation & Description" column pattern. */
+            /* Table safety rules kept even without a visible box border,
+               so long interpretation text still wraps within its own
+               column instead of running into the graph box on the right. */
             .fia-description table {{ 
                 width: 100% !important; 
                 table-layout: fixed; 
@@ -7186,15 +7184,22 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             }}
             .fia-description table td:first-child, .fia-description table th:first-child {{ width: 30%; }}
             .fia-description table td:last-child, .fia-description table th:last-child {{ width: 70%; }}
+            /* Right side: small, fixed-width box that hugs the SVG
+               tightly. flex:0 0 <width> means it never grows or shrinks
+               from this size regardless of how much room the left side
+               needs, and align-items:flex-start on .fia-layout (above)
+               stops it from being stretched to match the left column's
+               height - so there's no leftover empty white space inside
+               the box, just the title + graph with minimal padding
+               around them. */
             .fia-graph-wrap {{ 
-                flex: 0 1 45%; 
-                max-width: 45%; 
+                flex: 0 0 190px; 
+                max-width: 190px; 
                 box-sizing: border-box; 
-                min-width: 0; 
-                padding: 6px 8px; 
+                padding: 4px 5px; 
                 border: 1px solid #222; 
             }}
-            .fia-graph-title {{ text-align:center; font-size:9px !important; font-weight:700; margin-bottom:4px; }}
+            .fia-graph-title {{ text-align:center; font-size:8px !important; font-weight:700; margin-bottom:2px; }}
             /* SVG itself is untouched (viewBox + width:100% already make
                it scale cleanly and responsively) - only its wrapper's
                box model was ever the problem. */
