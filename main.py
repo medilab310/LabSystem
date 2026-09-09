@@ -5103,9 +5103,9 @@ def test_entry_page(patient_id: int, test_id: int):
     
     # Input field attributes: If already saved (has_results), make them disabled (Locked)
     if has_results:
-        input_attr = 'disabled style="flex: 3; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"'
+        input_attr = 'disabled style="flex: 3; padding: 3px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"'
     else:
-        input_attr = 'style="flex: 3; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; transition: border-color 0.2s;"'
+        input_attr = 'style="flex: 3; padding: 3px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; transition: border-color 0.2s;"'
 
     if params:
         for p in params:
@@ -5142,7 +5142,7 @@ def test_entry_page(patient_id: int, test_id: int):
             final_val = p_val.strip() if str(p_val).strip() != "" else default_val
 
             if is_calculated:
-                calc_attr = 'readonly style="flex: 3; padding: 5px 8px; border: 1px solid #93c5fd; border-radius: 6px; font-size: 14px; background: #eff6ff; color: #1d4ed8; font-weight: 700;"'
+                calc_attr = 'readonly style="flex: 3; padding: 3px 8px; border: 1px solid #93c5fd; border-radius: 6px; font-size: 14px; background: #eff6ff; color: #1d4ed8; font-weight: 700;"'
                 badge = '<span style="background:#dbeafe;color:#1d4ed8;padding:3px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px;">AUTO</span>'
             else:
                 calc_attr = input_attr
@@ -5152,7 +5152,7 @@ def test_entry_page(patient_id: int, test_id: int):
             unit_html = f'<span style="min-width:90px;font-size:12px;color:#64748b;">{html.escape(str(unit_val))}</span>' if unit_val else '<span style="min-width:90px;"></span>'
 
             param_form_html += f"""
-            <div style="display:grid; grid-template-columns: minmax(180px,2fr) minmax(120px,3fr) 100px; margin-bottom: 4px; align-items:center; gap:6px;">
+            <div style="display:grid; grid-template-columns: minmax(180px,2fr) minmax(120px,3fr) 100px; margin-bottom: 2px; align-items:center; gap:6px;">
                 <label style="font-weight:600;color:#334155;font-size:14px;">{html.escape(str(p_name_val))}{badge}{ref_html}</label>
                 <input type="text" name="param_{test_id}_{p_id_param}" value="{html.escape(final_val)}" placeholder="{'Auto calculated' if is_calculated else 'Enter result...'}" class="param-input" onkeydown="handleParamKeyNav(event, this)" {calc_attr}>
                 {unit_html}
@@ -5565,6 +5565,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 for p_item in params:
                     p_id_param = p_item["id"]
                     p_name_val = p_item["p_name"]
+                    # Structural spacer parameters (blank, ".", "-", "_")
+                    # are intentionally preserved in the database and on
+                    # the final report, but hidden here on Result Entry -
+                    # there's nothing meaningful to type into a separator.
+                    if str(p_name_val or "").strip() in {"", ".", "-", "_"}:
+                        continue
                     default_val = p_item["default_ref_range"] if "default_ref_range" in p_item.keys() and p_item["default_ref_range"] else ""
                     p_val = ""
                     try:
@@ -5579,9 +5585,9 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 has_results = bool(main_result and str(main_result).strip()) or has_saved_param_value
 
                 if has_results:
-                    value_input_attr = 'disabled style="flex: 2; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; outline: none; background: #f1f5f9; color: #64748b; cursor: not-allowed;"'
+                    value_input_attr = 'disabled style="flex: 2; padding: 5px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; outline: none; background: #f1f5f9; color: #64748b; cursor: not-allowed;"'
                 else:
-                    value_input_attr = 'style="flex: 2; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; outline: none;"'
+                    value_input_attr = 'style="flex: 2; padding: 5px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; outline: none;"'
 
                 lock_badge_html = '<span style="background:#fef3c7; color:#b45309; padding:3px 10px; border-radius:12px; font-size:11px; font-weight:700;"><i class="fa-solid fa-lock"></i> Locked</span>' if has_results else ""
 
@@ -5594,13 +5600,13 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 """ if has_results else ""
 
                 categories_html += f"""
-                <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 16px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.03);">
+                <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.03);">
                     <form action="/save-test-results" method="post" style="margin: 0;">
                         <input type="hidden" name="patient_id" value="{p_id}">
                         <input type="hidden" name="test_id" value="{t_id}">
                         <input type="hidden" name="assigned_id" value="{assigned_id}">
                         
-                        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #f1f5f9; padding-bottom: 12px; margin-bottom: 15px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #f1f5f9; padding-bottom: 8px; margin-bottom: 10px;">
                             <div style="display: flex; align-items: center; gap: 10px;">
                                 <strong style="color: #0f172a; font-size: 15px;"><i class="fa-solid fa-vial"></i> {t_name}</strong>
                                 {lock_badge_html}
@@ -5619,12 +5625,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 """
                 
                 if params:
-                    categories_html += f"""<div style="display: grid; gap: 10px; margin-bottom: 12px;">"""
+                    categories_html += f"""<div style="display: grid; gap: 4px; margin-bottom: 8px;">"""
                     for p_id_param, p_name_val, default_val, p_val in param_values:
                         final_val = p_val if p_val != "" else default_val
                         
                         categories_html += f"""
-                        <div style="display: flex; align-items: center; gap: 12px;">
+                        <div style="display: flex; align-items: center; gap: 12px; padding: 2px 0;">
                             <label style="flex: 1; font-size: 13px; font-weight: 600; color: #475569;">{p_name_val}</label>
                             <input type="text" name="param_{t_id}_{p_id_param}" value="{final_val}" placeholder="Result..." class="param-input" onkeydown="handleParamKeyNav(event, this)" {value_input_attr}>
                         </div>
@@ -5757,6 +5763,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 <!-- LEFT SIDE: Editable Patient Info Form -->
                 <div class="card-box" style="height: fit-content;">
                     <h3><span><i class="fa-solid fa-user-pen"></i> Edit Patient Info</span> <span style="font-size: 12px; opacity: 0.7;">#{p_id}</span></h3>
+                    <div style="font-size:15px; font-weight:700; color:#0f172a; margin:-10px 0 16px 0;">{p_title} {p_name}</div>
                     <form action="/update-patient-details" method="post">
                         <input type="hidden" name="patient_id" value="{p_id}">
                         <div class="row-2">
@@ -5765,9 +5772,11 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                                 <select name="title">
                                     <option value="Mr." {"selected" if p_title == "Mr." else ""}>Mr.</option>
                                     <option value="Mrs." {"selected" if p_title == "Mrs." else ""}>Mrs.</option>
-                                    <option value="Miss." {"selected" if p_title == "Miss." else ""}>Miss.</option>
-                                    <option value="Baby." {"selected" if p_title == "Baby." else ""}>Baby.</option>
+                                    <option value="Miss" {"selected" if p_title == "Miss" else ""}>Miss</option>
+                                    <option value="Rev." {"selected" if p_title == "Rev." else ""}>Rev.</option>
                                     <option value="Dr." {"selected" if p_title == "Dr." else ""}>Dr.</option>
+                                    <option value="Master" {"selected" if p_title == "Master" else ""}>Master</option>
+                                    <option value="Baby" {"selected" if p_title == "Baby" else ""}>Baby</option>
                                 </select>
                             </div>
                             <div class="form-group">
