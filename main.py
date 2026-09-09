@@ -6977,7 +6977,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     #
     # Graph content: a Color-Banded Reference Range Gauge (replaces the
     # earlier signal/reaction-curve mockup). Bands follow standard HbA1c
-    # interpretation - Green <5.7% (normal), Yellow 5.7-7.0%
+    # interpretation - Green <5.6% (normal), Yellow 5.6-7.0%
     # (pre-diabetes), Red >7.0% (diabetes range) - with a pointer marking
     # the patient's own result. Scale is fixed at 4.0-10.0% so the three
     # bands stay proportioned and legible at this box's fixed size;
@@ -6988,7 +6988,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     if show_fia_graph:
         GAUGE_MIN, GAUGE_MAX = 4.0, 10.0
         GAUGE_X0, GAUGE_X1 = 40, 400
-        GREEN_YELLOW_CUT, YELLOW_RED_CUT = 5.7, 7.0
+        GREEN_YELLOW_CUT, YELLOW_RED_CUT = 5.6, 7.0
         BAR_Y, BAR_H = 70, 28
 
         def _gauge_x(value):
@@ -7164,6 +7164,13 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             .report-table td {{ box-sizing: border-box; overflow-wrap: anywhere; word-break: normal; line-height: var(--dynamic-line-height); }}
             
             .report-note, .report-test-note {{ margin-top: 10px; padding: 0; font-size: var(--dynamic-font-size) !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
+            /* When a FIA gauge is present, the row's height is driven by
+               the (taller) gauge box rather than a typically much
+               shorter single-parameter table, which otherwise leaves an
+               awkward blank gap before the notes/guidelines text below.
+               This tightens the gap specifically in that case only -
+               every other test's note spacing above is untouched. */
+            .fia-inline-row + .report-note, .fia-inline-row + .report-test-note {{ margin-top: 2px; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
             .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
@@ -7214,6 +7221,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 flex: 0 0 230px; 
                 max-width: 230px; 
                 margin-left: auto;
+                /* Slight downward nudge so the gauge's top/vertical
+                   center lines up naturally with the results table's
+                   actual data row, rather than sitting flush with the
+                   very top of the flex row (above the table's own
+                   header-row padding/border). */
+                margin-top: 10px;
                 box-sizing: border-box; 
                 padding: 6px 8px; 
                 border: 1px solid #222; 
