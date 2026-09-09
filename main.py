@@ -399,6 +399,10 @@ DEFAULT_PRINT_SETTINGS = {
     "mlt_signature_font_size_px": 9,
     "mlt_details_font_size_px": 8,
     "show_printed_on": 1,
+    "fia_margin_top_px": 0,
+    "fia_margin_bottom_px": 0,
+    "fia_margin_left_px": 0,
+    "fia_margin_right_px": 0,
 }
 
 
@@ -418,7 +422,8 @@ def get_print_settings() -> dict:
                    line_height, footer_gap_px, page_side_margin_mm, default_letterhead,
                    patient_box_font_size_px, patient_box_padding_px,
                    mlt_signature_font_size_px, mlt_details_font_size_px,
-                   show_printed_on
+                   show_printed_on,
+                   fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px
             FROM system_print_settings WHERE id = 1
         """)
         row = cursor.fetchone()
@@ -1215,6 +1220,10 @@ def init_db():
             page_side_margin_mm INTEGER DEFAULT 15,
             default_letterhead INTEGER DEFAULT 0,
             show_printed_on INTEGER DEFAULT 1,
+            fia_margin_top_px INTEGER DEFAULT 0,
+            fia_margin_bottom_px INTEGER DEFAULT 0,
+            fia_margin_left_px INTEGER DEFAULT 0,
+            fia_margin_right_px INTEGER DEFAULT 0,
             updated_at TEXT
         )
     """)
@@ -1250,6 +1259,29 @@ def init_db():
         pass
     try:
         cursor.execute("ALTER TABLE system_print_settings ADD COLUMN show_printed_on INTEGER DEFAULT 1")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # FIA Graph Box position fine-tuning (admin-adjustable nudges, all
+    # default to 0 = no change from the existing hardcoded layout).
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN fia_margin_top_px INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN fia_margin_bottom_px INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN fia_margin_left_px INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN fia_margin_right_px INTEGER DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -6475,6 +6507,38 @@ def print_settings_page(request: Request, saved: int = 0):
                         <input type="checkbox" id="default_letterhead" name="default_letterhead" value="1" {"checked" if s['default_letterhead'] else ""} style="width:18px; height:18px;">
                         <label for="default_letterhead" style="margin:0; font-size:14px;">Show digital letterhead by default when opening a report</label>
                     </div>
+
+                    <h3 style="color:#0f4c81; font-size:15px; margin:26px 0 4px 0; border-top:1px solid #e2e8f0; padding-top:18px;">
+                        <i class="fa-solid fa-arrows-up-down-left-right"></i> FIA Graph Box Position
+                    </h3>
+                    <p style="color:#64748b; font-size:12px; margin-top:-2px;">
+                        Fine-tune nudges (in px) for the HbA1c/FIA gauge box on the report - no CSS editing needed. All default to 0 (no change from the current position).
+                    </p>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Margin Top (px)</label>
+                            <input type="number" name="fia_margin_top_px" min="-50" max="100" step="1" value="{s['fia_margin_top_px']}">
+                            <span class="hint">Positive = nudge down, negative = nudge up.</span>
+                        </div>
+                        <div class="field">
+                            <label>Margin Bottom (px)</label>
+                            <input type="number" name="fia_margin_bottom_px" min="-50" max="100" step="1" value="{s['fia_margin_bottom_px']}">
+                            <span class="hint">Extra space reserved below the graph box.</span>
+                        </div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Margin Left (px)</label>
+                            <input type="number" name="fia_margin_left_px" min="-100" max="100" step="1" value="{s['fia_margin_left_px']}">
+                            <span class="hint">Positive = nudge right, negative = nudge left.</span>
+                        </div>
+                        <div class="field">
+                            <label>Margin Right (px)</label>
+                            <input type="number" name="fia_margin_right_px" min="-50" max="100" step="1" value="{s['fia_margin_right_px']}">
+                            <span class="hint">Extra space reserved to the right of the graph box (pulls it left from the page edge).</span>
+                        </div>
+                    </div>
+
                     <button type="submit" class="save-btn"><i class="fa-solid fa-check"></i> Save Settings</button>
                     <a href="/print-settings-reset" class="reset-link" onclick="return confirm('Reset all print settings to defaults?');">Reset to defaults</a>
                 </form>
@@ -6508,6 +6572,10 @@ async def print_settings_save(request: Request):
     patient_box_padding_px = int(_clamp(form_data.get("patient_box_padding_px"), 0, 15, DEFAULT_PRINT_SETTINGS["patient_box_padding_px"]))
     mlt_signature_font_size_px = int(_clamp(form_data.get("mlt_signature_font_size_px"), 6, 20, DEFAULT_PRINT_SETTINGS["mlt_signature_font_size_px"]))
     mlt_details_font_size_px = int(_clamp(form_data.get("mlt_details_font_size_px"), 6, 20, DEFAULT_PRINT_SETTINGS["mlt_details_font_size_px"]))
+    fia_margin_top_px = int(_clamp(form_data.get("fia_margin_top_px"), -50, 100, DEFAULT_PRINT_SETTINGS["fia_margin_top_px"]))
+    fia_margin_bottom_px = int(_clamp(form_data.get("fia_margin_bottom_px"), -50, 100, DEFAULT_PRINT_SETTINGS["fia_margin_bottom_px"]))
+    fia_margin_left_px = int(_clamp(form_data.get("fia_margin_left_px"), -100, 100, DEFAULT_PRINT_SETTINGS["fia_margin_left_px"]))
+    fia_margin_right_px = int(_clamp(form_data.get("fia_margin_right_px"), -50, 100, DEFAULT_PRINT_SETTINGS["fia_margin_right_px"]))
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -6517,12 +6585,14 @@ async def print_settings_save(request: Request):
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
             default_letterhead = ?, show_printed_on = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
+            fia_margin_top_px = ?, fia_margin_bottom_px = ?, fia_margin_left_px = ?, fia_margin_right_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
           footer_gap_px, page_side_margin_mm, default_letterhead, show_printed_on,
           patient_box_font_size_px, patient_box_padding_px,
           mlt_signature_font_size_px, mlt_details_font_size_px,
+          fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px,
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -6545,12 +6615,14 @@ def print_settings_reset(request: Request):
             line_height = ?, footer_gap_px = ?, page_side_margin_mm = ?,
             default_letterhead = ?, show_printed_on = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
+            fia_margin_top_px = ?, fia_margin_bottom_px = ?, fia_margin_left_px = ?, fia_margin_right_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
           d["line_height"], d["footer_gap_px"], d["page_side_margin_mm"],
           d["default_letterhead"], d["show_printed_on"], d["patient_box_font_size_px"], d["patient_box_padding_px"],
           d["mlt_signature_font_size_px"], d["mlt_details_font_size_px"],
+          d["fia_margin_top_px"], d["fia_margin_bottom_px"], d["fia_margin_left_px"], d["fia_margin_right_px"],
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -7052,7 +7124,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 <text x='{GAUGE_X0}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='start'>&lt;{GREEN_YELLOW_CUT:.1f}</text>
                 <text x='{green_end_x:.1f}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='middle'>{GREEN_YELLOW_CUT:.1f}</text>
                 <text x='{yellow_end_x:.1f}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='middle'>{YELLOW_RED_CUT:.1f}</text>
-                <text x='{GAUGE_X1}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='end'>&gt;{YELLOW_RED_CUT:.1f}</text>
+                <text x='{GAUGE_X1}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='end'>&gt;{GAUGE_MAX:.1f}</text>
                 <text x='210' y='170' font-size='9.5' text-anchor='middle'>Green: Normal &#160;&#160; Yellow: Pre-diabetes &#160;&#160; Red: Diabetes range</text>
             </svg>
         </div>
@@ -7109,6 +7181,10 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 --dynamic-patient-padding: {print_settings['patient_box_padding_px']}px;
                 --dynamic-mlt-signature-font: {print_settings['mlt_signature_font_size_px']}px;
                 --dynamic-mlt-details-font: {print_settings['mlt_details_font_size_px']}px;
+                --dynamic-fia-margin-top: {print_settings['fia_margin_top_px']}px;
+                --dynamic-fia-margin-bottom: {print_settings['fia_margin_bottom_px']}px;
+                --dynamic-fia-margin-left: {print_settings['fia_margin_left_px']}px;
+                --dynamic-fia-margin-right: {print_settings['fia_margin_right_px']}px;
             }}
             body {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size); background: #f0f2f5; margin: 0; padding: 20px; color: #000; }}
             .report-page, .report-page * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size) !important; }}
@@ -7253,8 +7329,20 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                    lines up naturally with the middle/lower portion of
                    the results table's actual data row, rather than
                    sitting flush with the very top of the flex row
-                   (above the table's own header-row padding/border). */
-                margin-top: 28px;
+                   (above the table's own header-row padding/border).
+                   The base 28px is fixed layout; the admin-configurable
+                   --dynamic-fia-margin-* variables (set at /print-settings)
+                   layer additional fine-tuning on top without needing any
+                   CSS edits. margin-right eats into the space that
+                   margin-left:auto would otherwise claim, nudging the box
+                   left from the page edge; the "left" nudge uses relative
+                   positioning instead, since margin-left itself is
+                   reserved for the auto right-alignment above. */
+                margin-top: calc(28px + var(--dynamic-fia-margin-top));
+                margin-bottom: var(--dynamic-fia-margin-bottom);
+                margin-right: var(--dynamic-fia-margin-right);
+                position: relative;
+                left: var(--dynamic-fia-margin-left);
                 box-sizing: border-box; 
                 padding: 6px 8px; 
                 border: 1px solid #222; 
