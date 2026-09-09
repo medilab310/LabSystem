@@ -6793,6 +6793,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     differential_percentages = {}  # e.g. "neutrophils" -> 62.0
     DIFFERENTIAL_NAMES = ["neutrophils", "lymphocytes", "monocytes", "eosinophils", "basophils"]
 
+    # Numeric result used to place the pointer on the FIA reference-range
+    # gauge below (when show_fia_graph is on for this test). Captured from
+    # whichever parameter's result is the first to parse as a number -
+    # correct for FIA-graph tests, which are single-parameter (e.g. HbA1c).
+    fia_result_value = None
+
     def _try_float(value):
         try:
             return float(str(value).strip())
@@ -6855,6 +6861,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                         break
 
             flag,is_abnormal=evaluate_result_flag(res,ref_range)
+            if fia_result_value is None:
+                fia_result_value = _try_float(res)
             result_weight="bold" if is_abnormal else "normal"
             investigation_weight="bold" if int(d.get("is_bold", 0) or 0) else "normal"
             cells = [
@@ -6874,6 +6882,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             rows_html += "<tr>" + "".join(row_cells) + "</tr>"
     elif main_result_val:
         flag,is_abnormal=evaluate_result_flag(main_result_val,"")
+        fia_result_value = _try_float(main_result_val)
         weight="bold" if is_abnormal else "normal"
         cells = [
             (html.escape(test_name), align_inv, "normal", "#000"),
@@ -6960,25 +6969,63 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
         rows_html += diff_section_html
 
     # Optional FIA graph is test-configurable, never hardcoded to HbA1c.
-    # It now renders INLINE, beside the results table itself (not as a
+    # It renders INLINE, beside the results table itself (not as a
     # separate block below it) - the table + graph sit side by side as
-    # one row. Notes/comments are no longer tied to this block and are
+    # one row. Notes/comments are not tied to this block and are
     # rendered normally in their usual place below the table, exactly as
-    # when the FIA graph is off. Graph markup itself (the <path>/<line>
-    # elements plotting the reaction curve) is untouched.
+    # when the FIA graph is off.
+    #
+    # Graph content: a Color-Banded Reference Range Gauge (replaces the
+    # earlier signal/reaction-curve mockup). Bands follow standard HbA1c
+    # interpretation - Green <5.7% (normal), Yellow 5.7-7.0%
+    # (pre-diabetes), Red >7.0% (diabetes range) - with a pointer marking
+    # the patient's own result. Scale is fixed at 4.0-10.0% so the three
+    # bands stay proportioned and legible at this box's fixed size;
+    # results outside that range clamp the pointer to the nearest edge
+    # (they still land visibly in the green or red band, just at its
+    # outer edge) rather than being drawn off the gauge.
     fia_graph_only_html = ""
     if show_fia_graph:
+        GAUGE_MIN, GAUGE_MAX = 4.0, 10.0
+        GAUGE_X0, GAUGE_X1 = 40, 400
+        GREEN_YELLOW_CUT, YELLOW_RED_CUT = 5.7, 7.0
+        BAR_Y, BAR_H = 70, 28
+
+        def _gauge_x(value):
+            v = max(GAUGE_MIN, min(GAUGE_MAX, value))
+            frac = (v - GAUGE_MIN) / (GAUGE_MAX - GAUGE_MIN)
+            return GAUGE_X0 + frac * (GAUGE_X1 - GAUGE_X0)
+
+        green_end_x = _gauge_x(GREEN_YELLOW_CUT)
+        yellow_end_x = _gauge_x(YELLOW_RED_CUT)
+
+        pointer_x = _gauge_x(fia_result_value) if fia_result_value is not None else None
+        result_label = f"{fia_result_value:.1f}%" if fia_result_value is not None else "N/A"
+
+        pointer_svg = ""
+        if pointer_x is not None:
+            pointer_svg = f"""
+                <line x1='{pointer_x:.1f}' y1='26' x2='{pointer_x:.1f}' y2='52' stroke='#111' stroke-width='2'/>
+                <polygon points='{pointer_x-7:.1f},52 {pointer_x+7:.1f},52 {pointer_x:.1f},{BAR_Y}' fill='#111'/>
+            """
+
         fia_graph_only_html = f"""
         <div class='fia-graph-wrap'>
-            <div class='fia-graph-title'>FLUORESCENCE IMMUNOASSAY (FIA) GRAPH</div>
-            <svg viewBox='0 0 420 180' class='fia-graph' role='img' aria-label='Fluorescence Immunoassay graph'>
-                <line x1='35' y1='150' x2='400' y2='150' stroke='#111' stroke-width='1.5'/>
-                <line x1='35' y1='15' x2='35' y2='150' stroke='#111' stroke-width='1.5'/>
-                <path d='M45 142 C95 140, 115 130, 150 95 S215 25, 265 42 S325 120, 390 138' fill='none' stroke='#111' stroke-width='2.2'/>
-                <line x1='210' y1='20' x2='210' y2='150' stroke='#555' stroke-dasharray='4 4'/>
-                <text x='215' y='32' font-size='11'>Result marker</text>
-                <text x='175' y='172' font-size='11'>Reaction / Time</text>
-                <text x='10' y='18' font-size='11'>Signal</text>
+            <div class='fia-graph-title'>FLUORESCENCE IMMUNOASSAY (FIA) - HbA1c GAUGE</div>
+            <svg viewBox='0 0 420 180' class='fia-graph' role='img' aria-label='HbA1c color-banded reference range gauge'>
+                <text x='210' y='16' font-size='15' font-weight='700' text-anchor='middle'>Result: {result_label}</text>
+                {pointer_svg}
+                <rect x='{GAUGE_X0}' y='{BAR_Y}' width='{green_end_x - GAUGE_X0:.1f}' height='{BAR_H}' fill='#4caf50'/>
+                <rect x='{green_end_x:.1f}' y='{BAR_Y}' width='{yellow_end_x - green_end_x:.1f}' height='{BAR_H}' fill='#ffc107'/>
+                <rect x='{yellow_end_x:.1f}' y='{BAR_Y}' width='{GAUGE_X1 - yellow_end_x:.1f}' height='{BAR_H}' fill='#f44336'/>
+                <rect x='{GAUGE_X0}' y='{BAR_Y}' width='{GAUGE_X1 - GAUGE_X0}' height='{BAR_H}' fill='none' stroke='#111' stroke-width='1.5'/>
+                <line x1='{green_end_x:.1f}' y1='{BAR_Y}' x2='{green_end_x:.1f}' y2='{BAR_Y + BAR_H}' stroke='#111' stroke-width='1'/>
+                <line x1='{yellow_end_x:.1f}' y1='{BAR_Y}' x2='{yellow_end_x:.1f}' y2='{BAR_Y + BAR_H}' stroke='#111' stroke-width='1'/>
+                <text x='{GAUGE_X0}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='start'>&lt;{GREEN_YELLOW_CUT:.1f}</text>
+                <text x='{green_end_x:.1f}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='middle'>{GREEN_YELLOW_CUT:.1f}</text>
+                <text x='{yellow_end_x:.1f}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='middle'>{YELLOW_RED_CUT:.1f}</text>
+                <text x='{GAUGE_X1}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='end'>&gt;{YELLOW_RED_CUT:.1f}</text>
+                <text x='210' y='170' font-size='9.5' text-anchor='middle'>Green: Normal &#160;&#160; Yellow: Pre-diabetes &#160;&#160; Red: Diabetes range</text>
             </svg>
         </div>
         """
@@ -7139,7 +7186,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                graph box sit cleanly side by side without colliding. */
             .fia-inline-row {{ 
                 display: flex; 
-                flex-wrap: wrap; 
+                flex-wrap: nowrap; 
+                justify-content: flex-end;
                 gap: 15px; 
                 align-items: flex-start; 
                 box-sizing: border-box; 
@@ -7157,10 +7205,15 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                long block of text. align-items:flex-start on
                .fia-inline-row (above) stops it from being stretched to
                match the table's full height, so there's no leftover
-               empty white space inside the box. */
+               empty white space inside the box. margin-left:auto plus
+               flex-wrap:nowrap/justify-content:flex-end on the row above
+               are three independent guarantees that this box always sits
+               flush against the far-right edge of the row, never
+               wrapping under the table or drifting left. */
             .fia-graph-wrap {{ 
                 flex: 0 0 230px; 
                 max-width: 230px; 
+                margin-left: auto;
                 box-sizing: border-box; 
                 padding: 6px 8px; 
                 border: 1px solid #222; 
