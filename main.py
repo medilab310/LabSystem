@@ -7131,10 +7131,73 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                page, exactly where the content naturally ends. This is
                what keeps long reports from overflowing or triggering
                awkward forced page breaks. */
-            .fia-layout {{ display:flex; gap:12px; margin-top:10px; align-items:stretch; }}
-            .fia-description {{ flex:1 1 52%; min-width:0; padding:8px 10px; border:1px solid #222; }}
-            .fia-graph-wrap {{ flex:1 1 48%; min-width:0; padding:8px; border:1px solid #222; }}
+            /* FIA layout fix: the root cause of the border-overlap/text-
+               overflow bug was that .fia-description and .fia-graph-wrap
+               never set box-sizing:border-box. Under the default
+               content-box model, each box's PADDING and BORDER get added
+               ON TOP OF its flex-basis percentage - so 52% + 48% of
+               padding/border-inflated boxes actually exceeded 100% of
+               the container's width combined, forcing the two boxes to
+               collide/overlap. box-sizing:border-box makes the declared
+               percentage the box's TRUE outer width (padding and border
+               included), which is what guarantees they sit cleanly
+               side-by-side with a real gap between them. */
+            .fia-layout {{ 
+                display: flex; 
+                flex-wrap: wrap; 
+                gap: 15px; 
+                margin-top: 10px; 
+                align-items: stretch; 
+                box-sizing: border-box; 
+                width: 100%; 
+            }}
+            .fia-description {{ 
+                flex: 0 1 52%; 
+                max-width: 52%; 
+                box-sizing: border-box; 
+                min-width: 0; 
+                padding: 6px 8px; 
+                border: 1px solid #222; 
+                overflow: hidden; 
+                font-size: 9px !important; 
+            }}
+            /* Any table rendered inside the guidelines block (e.g. the
+               "HbA1c Interpretation Guidelines" table configured in the
+               test's Notes) gets forced to a safe, self-contained layout:
+               table-layout:fixed locks it to the container's own width
+               instead of growing to fit its content, and word-wrap on
+               every cell guarantees long interpretation text wraps
+               inside its own cell rather than bleeding past the box's
+               right border. Explicit column widths (30% / 70%) match the
+               "Range" vs "Interpretation & Description" column pattern. */
+            .fia-description table {{ 
+                width: 100% !important; 
+                table-layout: fixed; 
+                border-collapse: collapse; 
+                font-size: 9px !important; 
+            }}
+            .fia-description table td, .fia-description table th {{ 
+                word-wrap: break-word; 
+                overflow-wrap: break-word; 
+                padding: 2px 4px; 
+                box-sizing: border-box; 
+                vertical-align: top; 
+                font-size: 9px !important; 
+            }}
+            .fia-description table td:first-child, .fia-description table th:first-child {{ width: 30%; }}
+            .fia-description table td:last-child, .fia-description table th:last-child {{ width: 70%; }}
+            .fia-graph-wrap {{ 
+                flex: 0 1 45%; 
+                max-width: 45%; 
+                box-sizing: border-box; 
+                min-width: 0; 
+                padding: 6px 8px; 
+                border: 1px solid #222; 
+            }}
             .fia-graph-title {{ text-align:center; font-size:9px !important; font-weight:700; margin-bottom:4px; }}
+            /* SVG itself is untouched (viewBox + width:100% already make
+               it scale cleanly and responsively) - only its wrapper's
+               box model was ever the problem. */
             .fia-graph {{ width:100%; height:auto; display:block; }}
             @media print {{ .fia-layout {{ break-inside: avoid; page-break-inside: avoid; }} }}
 
