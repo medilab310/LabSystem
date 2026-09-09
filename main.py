@@ -7121,7 +7121,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 <rect x='{GAUGE_X0}' y='{BAR_Y}' width='{GAUGE_X1 - GAUGE_X0}' height='{BAR_H}' fill='none' stroke='#111' stroke-width='1.5'/>
                 <line x1='{green_end_x:.1f}' y1='{BAR_Y}' x2='{green_end_x:.1f}' y2='{BAR_Y + BAR_H}' stroke='#111' stroke-width='1'/>
                 <line x1='{yellow_end_x:.1f}' y1='{BAR_Y}' x2='{yellow_end_x:.1f}' y2='{BAR_Y + BAR_H}' stroke='#111' stroke-width='1'/>
-                <text x='{GAUGE_X0}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='start'>&lt;{GREEN_YELLOW_CUT:.1f}</text>
+                <text x='{GAUGE_X0}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='start'>&lt;{GAUGE_MIN:.1f}</text>
                 <text x='{green_end_x:.1f}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='middle'>{GREEN_YELLOW_CUT:.1f}</text>
                 <text x='{yellow_end_x:.1f}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='middle'>{YELLOW_RED_CUT:.1f}</text>
                 <text x='{GAUGE_X1}' y='{BAR_Y + BAR_H + 14}' font-size='10' text-anchor='end'>&gt;{GAUGE_MAX:.1f}</text>
