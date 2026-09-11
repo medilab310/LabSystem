@@ -1339,6 +1339,16 @@ def init_db():
     if "saved_at" not in assigned_columns:
         cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN saved_at TEXT")
 
+    # Additive-only migration for the Sales & Financial Analytics module's
+    # doctor commission breakdown. Existing doctors get a 0% rate (i.e.
+    # no behavior change to any existing report) until someone sets a
+    # real rate; nothing about the doctors table's existing columns or
+    # rows is touched.
+    cursor.execute("PRAGMA table_info(doctors)")
+    doctor_columns = {row[1] for row in cursor.fetchall()}
+    if "commission_rate" not in doctor_columns:
+        cursor.execute("ALTER TABLE doctors ADD COLUMN commission_rate REAL DEFAULT 0")
+
     # Default admin user (username: admin, password: 1234)
     cursor.execute("INSERT OR IGNORE INTO users (username, password) VALUES ('admin', '1234')")
 
@@ -2254,6 +2264,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
                 <h2>MEDISTAR MEDICAL LABORATORY - REPORTS</h2>
             </div>
             <div>
+                <a href="/reports/sales-analytics" class="btn-secondary" style="padding: 6px 14px; font-size: 13px; background:#27ae60; margin-right:8px;">💰 Sales & Financial Analytics</a>
                 <a href="/dashboard" class="btn-secondary" style="padding: 6px 14px; font-size: 13px;">← Back to Dashboard</a>
             </div>
         </div>
@@ -2996,6 +3007,13 @@ def manage_doctors(request: Request):
             <td>{d['name']}</td>
             <td>{d['specialization'] or '-'}</td>
             <td>{d['phone'] or '-'}</td>
+            <td>
+                <form action="/update-doctor-commission/{d['id']}" method="post" style="display:flex; gap:4px; align-items:center;">
+                    <input type="number" name="commission_rate" step="0.1" min="0" max="100" value="{d['commission_rate'] if 'commission_rate' in d.keys() and d['commission_rate'] is not None else 0}" style="width:60px; padding:4px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;">
+                    <span style="font-size:12px;">%</span>
+                    <button type="submit" style="background:#0f4c81; color:white; border:none; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;">Save</button>
+                </form>
+            </td>
             <td style="text-align:center;">
                 <a href="/delete-doctor/{d['id']}" onclick="return confirm('Delete this doctor? Existing patient records/reports that already reference this doctor by name are not affected.');"
                    style="color:#e53e3e; text-decoration:none; font-weight:700; font-size:12px; background:rgba(229,62,62,0.1); padding:5px 10px; border-radius:5px;">
@@ -3046,6 +3064,10 @@ def manage_doctors(request: Request):
                     <label>Phone Number:</label>
                     <input type="text" name="phone" placeholder="0771234567">
                 </div>
+                <div class="form-group">
+                    <label>Commission Rate (%):</label>
+                    <input type="number" name="commission_rate" step="0.1" min="0" max="100" value="0" placeholder="e.g. 10">
+                </div>
                 <button type="submit" class="btn">Add Doctor</button>
             </form>
 
@@ -3056,9 +3078,10 @@ def manage_doctors(request: Request):
                     <th>Name</th>
                     <th>Specialization</th>
                     <th>Phone</th>
+                    <th>Commission %</th>
                     <th style="text-align:center;">Action</th>
                 </tr>
-                {rows if rows else '<tr><td colspan="5" style="text-align:center;">No doctors added yet.</td></tr>'}
+                {rows if rows else '<tr><td colspan="6" style="text-align:center;">No doctors added yet.</td></tr>'}
             </table>
         </div>
     </body>
@@ -3066,15 +3089,30 @@ def manage_doctors(request: Request):
     """
 
 @app.post("/add-doctor")
-def add_doctor(code: str = Form(...), name: str = Form(...), specialization: str = Form(None), phone: str = Form(None)):
+def add_doctor(code: str = Form(...), name: str = Form(...), specialization: str = Form(None), phone: str = Form(None), commission_rate: float = Form(0.0)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO doctors (code, name, specialization, phone) VALUES (?, ?, ?, ?)", 
-                       (code, name, specialization, phone))
+        cursor.execute("INSERT INTO doctors (code, name, specialization, phone, commission_rate) VALUES (?, ?, ?, ?, ?)", 
+                       (code, name, specialization, phone, commission_rate))
         conn.commit()
     except sqlite3.IntegrityError:
         pass # Code එක කලින් තිබුණොත් ignore කරයි
+    conn.close()
+    return RedirectResponse(url="/manage-doctors", status_code=303)
+
+
+@app.post("/update-doctor-commission/{doctor_id}")
+def update_doctor_commission(doctor_id: int, request: Request, commission_rate: float = Form(0.0)):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_doctors"):
+        return render_locked_page("Manage Doctors")
+
+    commission_rate = max(0.0, min(100.0, commission_rate))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE doctors SET commission_rate = ? WHERE id = ?", (commission_rate, doctor_id))
+    conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-doctors", status_code=303)
 
@@ -7546,6 +7584,368 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             </div>
         </div>
 
+    </body>
+    </html>
+    """
+
+# =================================================================
+# SALES & FINANCIAL ANALYTICS MODULE (new, additive-only feature)
+# =================================================================
+# Reads from the existing patients / patient_assigned_tests / tests /
+# doctors / collecting_centers tables exactly as they already are -
+# no existing table is altered except the new, additive
+# `doctors.commission_rate` column (see init_db() migration above,
+# default 0 so every existing doctor's behavior is unchanged until a
+# rate is actually set). No existing route's logic is touched; this is
+# a brand-new route reached via a new link on the /reports page.
+
+def _sales_analytics_date_range(preset: str, start_date: str, end_date: str):
+    """Resolves the (start_date, end_date) SQL-ready date strings for
+    the chosen preset. Returns (start_date, end_date, resolved_start,
+    resolved_end) where the last two are always concrete dates (used
+    for the on-screen "Date Range" label), while the first two mirror
+    exactly what should be echoed back into the date <input> fields."""
+    today = now_colombo().date()
+    if preset == "today":
+        d = today.isoformat()
+        return d, d, d, d
+    if preset == "this_month":
+        first_of_month = today.replace(day=1).isoformat()
+        d_end = today.isoformat()
+        return first_of_month, d_end, first_of_month, d_end
+    # "custom" (or anything else): use whatever was actually submitted.
+    return start_date, end_date, (start_date or "All Time"), (end_date or "Present")
+
+
+@app.get("/reports/sales-analytics", response_class=HTMLResponse)
+def sales_analytics_page(
+    request: Request,
+    preset: str = "this_month",
+    start_date: str = "",
+    end_date: str = "",
+    doctor: str = "all",
+    center: str = "all",
+    view: str = "table",
+):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "reports"):
+        return render_locked_page("Sales & Financial Analytics")
+
+    start_date, end_date, label_start, label_end = _sales_analytics_date_range(preset, start_date, end_date)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # ---- Shared WHERE clause, built safely with parameterized ? placeholders ----
+    where_sql = "WHERE 1=1"
+    where_params = []
+
+    if start_date and end_date:
+        where_sql += " AND date(p.created_at) BETWEEN ? AND ?"
+        where_params.extend([start_date, end_date])
+
+    if doctor and doctor != "all":
+        where_sql += " AND p.doctor = ?"
+        where_params.append(doctor)
+
+    if center and center != "all":
+        where_sql += " AND COALESCE(p.center, p.collecting_center) = ?"
+        where_params.append(center)
+
+    # ---- Dropdown option sources ----
+    cursor.execute("SELECT code, name FROM doctors ORDER BY name")
+    doctor_options_rows = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT DISTINCT COALESCE(p.center, p.collecting_center) as c
+        FROM patients p
+        WHERE COALESCE(p.center, p.collecting_center) IS NOT NULL
+        UNION
+        SELECT center_name FROM collecting_centers WHERE center_name IS NOT NULL
+        ORDER BY c
+    """)
+    center_options_rows = [r["c"] for r in cursor.fetchall() if r["c"]]
+
+    # ---- Detailed sales rows (one row per patient, tests combined) ----
+    sales_rows = []
+    grand_total = 0.0
+    try:
+        cursor.execute(f"""
+            SELECT p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
+                   p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
+                   COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
+                   GROUP_CONCAT(t.test_name, ', ') as tests_performed,
+                   SUM(COALESCE(t.price, 0)) as amount
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            LEFT JOIN doctors d ON d.code = p.doctor
+            {where_sql}
+            GROUP BY p.id
+            ORDER BY p.id DESC
+        """, where_params)
+        sales_rows = cursor.fetchall()
+        grand_total = sum((r["amount"] or 0) for r in sales_rows)
+    except Exception as e:
+        sales_rows = []
+        sales_error = str(e)
+    else:
+        sales_error = ""
+
+    # ---- Doctor-wise summary ----
+    doctor_summary_rows = []
+    try:
+        cursor.execute(f"""
+            SELECT p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
+                   COUNT(DISTINCT p.id) as patient_count,
+                   SUM(COALESCE(t.price, 0)) as revenue,
+                   COALESCE(d.commission_rate, 0) as commission_rate
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            LEFT JOIN doctors d ON d.code = p.doctor
+            {where_sql}
+            GROUP BY p.doctor
+            ORDER BY revenue DESC
+        """, where_params)
+        doctor_summary_rows = cursor.fetchall()
+    except Exception:
+        doctor_summary_rows = []
+
+    # ---- Center-wise summary ----
+    center_summary_rows = []
+    try:
+        cursor.execute(f"""
+            SELECT COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
+                   COUNT(DISTINCT p.id) as patient_count,
+                   COUNT(pat.id) as tests_dispatched,
+                   SUM(COALESCE(t.price, 0)) as billing
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            {where_sql}
+            GROUP BY center_name
+            ORDER BY billing DESC
+        """, where_params)
+        center_summary_rows = cursor.fetchall()
+    except Exception:
+        center_summary_rows = []
+
+    conn.close()
+
+    # ---- Build option HTML ----
+    doctor_opts_html = '<option value="all">All Doctors</option>' + "".join(
+        f'<option value="{d["code"]}" {"selected" if doctor == d["code"] else ""}>{d["name"]} ({d["code"]})</option>'
+        for d in doctor_options_rows
+    )
+    center_opts_html = '<option value="all">All Centers</option>' + "".join(
+        f'<option value="{html.escape(c)}" {"selected" if center == c else ""}>{html.escape(c)}</option>'
+        for c in center_options_rows
+    )
+
+    # ---- Build the active view's table ----
+    if view == "doctor":
+        table_title = "Doctor-wise Performance & Commission Summary"
+        table_header_html = "<th>Doctor</th><th>Code</th><th style='text-align:center;'>Patients</th><th style='text-align:right;'>Revenue (LKR)</th><th style='text-align:center;'>Commission %</th><th style='text-align:right;'>Commission (LKR)</th>"
+        body_rows = ""
+        total_revenue = 0.0
+        total_commission = 0.0
+        for r in doctor_summary_rows:
+            revenue = r["revenue"] or 0
+            rate = r["commission_rate"] or 0
+            commission = revenue * (rate / 100.0)
+            total_revenue += revenue
+            total_commission += commission
+            body_rows += f"""
+            <tr>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(r['doctor_name'] or 'Not Specified')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['doctor_code'] or '-')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{r['patient_count']}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{revenue:,.2f}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{rate:.1f}%</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{commission:,.2f}</td>
+            </tr>
+            """
+        if not body_rows:
+            body_rows = '<tr><td colspan="6" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
+        footer_html = f"""
+        <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
+            <td colspan="3" style="padding:10px; text-align:right;">TOTAL</td>
+            <td style="padding:10px; text-align:right;">{total_revenue:,.2f}</td>
+            <td></td>
+            <td style="padding:10px; text-align:right;">{total_commission:,.2f}</td>
+        </tr>
+        """
+
+    elif view == "center":
+        table_title = "Center-wise Dispatch & Billing Summary"
+        table_header_html = "<th>Center</th><th style='text-align:center;'>Patients</th><th style='text-align:center;'>Tests Dispatched</th><th style='text-align:right;'>Total Billing (LKR)</th>"
+        body_rows = ""
+        total_billing = 0.0
+        for r in center_summary_rows:
+            billing = r["billing"] or 0
+            total_billing += billing
+            body_rows += f"""
+            <tr>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(r['center_name'] or 'Main Branch')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{r['patient_count']}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{r['tests_dispatched']}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{billing:,.2f}</td>
+            </tr>
+            """
+        if not body_rows:
+            body_rows = '<tr><td colspan="4" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
+        footer_html = f"""
+        <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
+            <td colspan="3" style="padding:10px; text-align:right;">TOTAL BILLING (LKR)</td>
+            <td style="padding:10px; text-align:right;">{total_billing:,.2f}</td>
+        </tr>
+        """
+
+    else:
+        view = "table"
+        table_title = "Detailed Sales Data"
+        table_header_html = "<th>Date</th><th>Invoice/Lab No</th><th>Patient Name</th><th>Test(s) Performed</th><th>Doctor</th><th>Center</th><th style='text-align:right;'>Amount (LKR)</th>"
+        body_rows = ""
+        for r in sales_rows:
+            ref_no = f"Med-{r['patient_id']:04d}"
+            display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
+            date_str = str(r["created_at"] or "").split(" ")[0]
+            patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
+            body_rows += f"""
+            <tr>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{date_str}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{display_ref_no}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(patient_name)}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['tests_performed'] or '')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['doctor_name'] or 'Not Specified')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['center_name'] or 'Main Branch')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(r['amount'] or 0):,.2f}</td>
+            </tr>
+            """
+        if not body_rows:
+            body_rows = f'<tr><td colspan="7" style="padding:20px; text-align:center; color: var(--text-muted);">{"Error: " + html.escape(sales_error) if sales_error else "No matching sales records for the selected filters."}</td></tr>'
+        footer_html = f"""
+        <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
+            <td colspan="6" style="padding:10px; text-align:right;">TOTAL AMOUNT (LKR)</td>
+            <td style="padding:10px; text-align:right;">{grand_total:,.2f}</td>
+        </tr>
+        """
+
+    def _view_link(v):
+        return f"/reports/sales-analytics?preset={preset}&start_date={start_date}&end_date={end_date}&doctor={doctor}&center={center}&view={v}"
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <title>Sales & Financial Analytics - MEDISTAR MEDICAL LABORATORY</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+        <style>
+            :root {{
+                --bg-color: #f4f7fb; --header-bg: #0f4c81; --card-bg: #ffffff;
+                --text-main: #1e293b; --text-muted: #64748b; --border-color: #cbd5e1; --btn-color: #0f4c81;
+            }}
+            body {{ font-family: Arial, sans-serif; background: var(--bg-color); color: var(--text-main); margin: 0; padding: 0; }}
+            .header {{ background: var(--header-bg); color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+            .header h2 {{ margin: 0; font-size: 19px; }}
+            .container {{ padding: 30px; max-width: 1300px; margin: auto; }}
+            .btn-secondary {{ background: #64748b; color: white; border: none; padding: 9px 16px; border-radius: 5px; font-weight: bold; cursor: pointer; text-decoration: none; font-size: 13px; }}
+            .btn-primary {{ background: var(--btn-color); color: white; border: none; padding: 9px 20px; border-radius: 5px; font-weight: bold; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; }}
+            .filter-box {{ background: var(--card-bg); padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border: 1px solid var(--border-color); margin-bottom: 18px; display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }}
+            .filter-group {{ display: flex; flex-direction: column; gap: 5px; }}
+            .filter-group label {{ font-size: 12px; font-weight: bold; color: var(--text-muted); }}
+            .filter-group input, .filter-group select {{ padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 5px; background: var(--card-bg); color: var(--text-main); outline: none; }}
+            .tabs {{ display: flex; gap: 8px; margin-bottom: 18px; }}
+            .tab-link {{ padding: 9px 18px; border-radius: 20px; text-decoration: none; font-size: 13px; font-weight: bold; background: #e2e8f0; color: #334155; }}
+            .tab-link.active {{ background: var(--header-bg); color: white; }}
+            .report-card {{ background: var(--card-bg); padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border: 1px solid var(--border-color); }}
+            .report-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; border-bottom: 2px solid var(--border-color); padding-bottom: 12px; }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+            th {{ padding: 10px; font-size: 12.5px; color: white; background: var(--header-bg); text-align: left; }}
+            @media print {{
+                .no-print {{ display: none !important; }}
+                body {{ background: white; color: black; }}
+                .report-card {{ border: none; box-shadow: none; padding: 0; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header no-print">
+            <h2><i class="fa-solid fa-sack-dollar"></i> Sales & Financial Analytics</h2>
+            <a href="/reports" class="btn-secondary">&larr; Back to Reports</a>
+        </div>
+
+        <div class="container">
+            <form method="GET" action="/reports/sales-analytics" class="filter-box no-print">
+                <div class="filter-group">
+                    <label>Date Preset</label>
+                    <select name="preset" onchange="this.form.submit()">
+                        <option value="today" {"selected" if preset == "today" else ""}>Today</option>
+                        <option value="this_month" {"selected" if preset == "this_month" else ""}>This Month</option>
+                        <option value="custom" {"selected" if preset == "custom" else ""}>Custom Range</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Start Date</label>
+                    <input type="date" name="start_date" value="{start_date}">
+                </div>
+                <div class="filter-group">
+                    <label>End Date</label>
+                    <input type="date" name="end_date" value="{end_date}">
+                </div>
+                <div class="filter-group">
+                    <label>Doctor</label>
+                    <select name="doctor">{doctor_opts_html}</select>
+                </div>
+                <div class="filter-group">
+                    <label>Collecting Center</label>
+                    <select name="center">{center_opts_html}</select>
+                </div>
+                <input type="hidden" name="view" value="{view}">
+                <div class="filter-group">
+                    <button type="submit" class="btn-primary">Apply Filter</button>
+                </div>
+                <div class="filter-group" style="margin-left:auto; flex-direction:row; gap:8px;">
+                    <button type="button" onclick="window.print()" class="btn-primary" style="background:#27ae60;">🖨️ Print</button>
+                    <button type="button" onclick="exportSalesTableToExcel()" class="btn-primary" style="background:#1d7a46;">📊 Export to Excel</button>
+                </div>
+            </form>
+
+            <div class="tabs no-print">
+                <a href="{_view_link('table')}" class="tab-link {'active' if view == 'table' else ''}">📋 Sales Table</a>
+                <a href="{_view_link('doctor')}" class="tab-link {'active' if view == 'doctor' else ''}">👨‍⚕️ Doctor-wise Summary</a>
+                <a href="{_view_link('center')}" class="tab-link {'active' if view == 'center' else ''}">🏥 Center-wise Summary</a>
+            </div>
+
+            <div class="report-card">
+                <div class="report-header">
+                    <div>
+                        <h3 style="margin:0; font-size:17px;">{table_title}</h3>
+                        <p style="margin:4px 0 0 0; font-size:12px; color: var(--text-muted);">Date Range: {label_start} to {label_end}</p>
+                    </div>
+                    <span style="font-size:12px; font-weight:bold; color: var(--text-muted);">MEDISTAR MEDICAL LABORATORY</span>
+                </div>
+
+                <table id="exportTable">
+                    <thead><tr>{table_header_html}</tr></thead>
+                    <tbody>
+                        {body_rows}
+                        {footer_html}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <script>
+            function exportSalesTableToExcel() {{
+                const table = document.getElementById('exportTable');
+                const wb = XLSX.utils.table_to_book(table, {{ sheet: "Report" }});
+                const stamp = new Date().toISOString().slice(0, 10);
+                XLSX.writeFile(wb, "Sales_Report_" + stamp + ".xlsx");
+            }}
+        </script>
     </body>
     </html>
     """
