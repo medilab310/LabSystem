@@ -403,6 +403,7 @@ DEFAULT_PRINT_SETTINGS = {
     "fia_margin_bottom_px": 0,
     "fia_margin_left_px": 0,
     "fia_margin_right_px": 0,
+    "category_note_font_size": 10,
 }
 
 
@@ -423,7 +424,8 @@ def get_print_settings() -> dict:
                    patient_box_font_size_px, patient_box_padding_px,
                    mlt_signature_font_size_px, mlt_details_font_size_px,
                    show_printed_on,
-                   fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px
+                   fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px,
+                   category_note_font_size
             FROM system_print_settings WHERE id = 1
         """)
         row = cursor.fetchone()
@@ -1282,6 +1284,11 @@ def init_db():
         pass
     try:
         cursor.execute("ALTER TABLE system_print_settings ADD COLUMN fia_margin_right_px INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN category_note_font_size INTEGER DEFAULT 10")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -6618,6 +6625,14 @@ def print_settings_page(request: Request, saved: int = 0):
                             <span class="hint">Size of the designation and registration number lines below the name.</span>
                         </div>
                     </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Test Category Note / Interpretation Font Size (px)</label>
+                            <input type="number" name="category_note_font_size" min="6" max="20" step="1" value="{s['category_note_font_size']}">
+                            <span class="hint">Size of Test Category Notes and interpretation/guideline text on reports.</span>
+                        </div>
+                        <div class="field"></div>
+                    </div>
                     <div class="toggle-row">
                         <input type="checkbox" id="show_printed_on" name="show_printed_on" value="1" {"checked" if s.get('show_printed_on', 1) else ""} style="width:18px; height:18px;">
                         <label for="show_printed_on" style="margin:0; font-size:14px;">Show “Printed on” date/time on reports</label>
@@ -6695,6 +6710,7 @@ async def print_settings_save(request: Request):
     fia_margin_bottom_px = int(_clamp(form_data.get("fia_margin_bottom_px"), -50, 100, DEFAULT_PRINT_SETTINGS["fia_margin_bottom_px"]))
     fia_margin_left_px = int(_clamp(form_data.get("fia_margin_left_px"), -100, 100, DEFAULT_PRINT_SETTINGS["fia_margin_left_px"]))
     fia_margin_right_px = int(_clamp(form_data.get("fia_margin_right_px"), -50, 100, DEFAULT_PRINT_SETTINGS["fia_margin_right_px"]))
+    category_note_font_size = int(_clamp(form_data.get("category_note_font_size"), 6, 20, DEFAULT_PRINT_SETTINGS["category_note_font_size"]))
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -6705,6 +6721,7 @@ async def print_settings_save(request: Request):
             default_letterhead = ?, show_printed_on = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             fia_margin_top_px = ?, fia_margin_bottom_px = ?, fia_margin_left_px = ?, fia_margin_right_px = ?,
+            category_note_font_size = ?,
             updated_at = ?
         WHERE id = 1
     """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
@@ -6712,6 +6729,7 @@ async def print_settings_save(request: Request):
           patient_box_font_size_px, patient_box_padding_px,
           mlt_signature_font_size_px, mlt_details_font_size_px,
           fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px,
+          category_note_font_size,
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -6735,6 +6753,7 @@ def print_settings_reset(request: Request):
             default_letterhead = ?, show_printed_on = ?, patient_box_font_size_px = ?, patient_box_padding_px = ?,
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             fia_margin_top_px = ?, fia_margin_bottom_px = ?, fia_margin_left_px = ?, fia_margin_right_px = ?,
+            category_note_font_size = ?,
             updated_at = ?
         WHERE id = 1
     """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
@@ -6742,6 +6761,7 @@ def print_settings_reset(request: Request):
           d["default_letterhead"], d["show_printed_on"], d["patient_box_font_size_px"], d["patient_box_padding_px"],
           d["mlt_signature_font_size_px"], d["mlt_details_font_size_px"],
           d["fia_margin_top_px"], d["fia_margin_bottom_px"], d["fia_margin_left_px"], d["fia_margin_right_px"],
+          d["category_note_font_size"],
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -6889,7 +6909,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 if n_key in t_keys and test_row[n_key]:
                     raw_note = str(test_row[n_key])
                     clean_note = html.unescape(raw_note)
-                    test_notes_html = f"<div class='report-test-note'>{clean_note}</div>"
+                    test_notes_html = f"<div class='report-test-note test-category-note interpretation-note'>{clean_note}</div>"
                     break
     except Exception as e:
         pass
@@ -7205,6 +7225,24 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     # outer edge) rather than being drawn off the gauge.
     fia_graph_only_html = ""
     if show_fia_graph:
+        # Computed here in plain Python and written as literal inline
+        # pixel values (no calc(), no var(), no position:relative) - see
+        # the long comment on .fia-graph-wrap in the <style> block above
+        # for why the previous CSS-variable/calc() approach silently
+        # failed specifically in print/PDF output. !important on each
+        # guarantees these always win regardless of any other CSS rule.
+        fia_margin_top_final = 28 + print_settings["fia_margin_top_px"]
+        fia_margin_bottom_final = print_settings["fia_margin_bottom_px"]
+        fia_margin_left_final = print_settings["fia_margin_left_px"]
+        fia_margin_right_final = print_settings["fia_margin_right_px"]
+        fia_graph_wrap_style = (
+            f"margin-top: {fia_margin_top_final}px !important; "
+            f"margin-bottom: {fia_margin_bottom_final}px !important; "
+            f"margin-right: {fia_margin_right_final}px !important; "
+            f"position: relative !important; "
+            f"left: {fia_margin_left_final}px !important;"
+        )
+
         GAUGE_MIN, GAUGE_MAX = 4.0, 10.0
         GAUGE_X0, GAUGE_X1 = 40, 400
         GREEN_YELLOW_CUT, YELLOW_RED_CUT = 5.6, 7.0
@@ -7229,7 +7267,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             """
 
         fia_graph_only_html = f"""
-        <div class='fia-graph-wrap'>
+        <div class='fia-graph-wrap' style='{fia_graph_wrap_style}'>
             <div class='fia-graph-title'>FLUORESCENCE IMMUNOASSAY (FIA) - HbA1c GAUGE</div>
             <svg viewBox='0 0 420 180' class='fia-graph' role='img' aria-label='HbA1c color-banded reference range gauge'>
                 <text x='210' y='16' font-size='15' font-weight='700' text-anchor='middle'>Result: {result_label}</text>
@@ -7300,10 +7338,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 --dynamic-patient-padding: {print_settings['patient_box_padding_px']}px;
                 --dynamic-mlt-signature-font: {print_settings['mlt_signature_font_size_px']}px;
                 --dynamic-mlt-details-font: {print_settings['mlt_details_font_size_px']}px;
-                --dynamic-fia-margin-top: {print_settings['fia_margin_top_px']}px;
-                --dynamic-fia-margin-bottom: {print_settings['fia_margin_bottom_px']}px;
-                --dynamic-fia-margin-left: {print_settings['fia_margin_left_px']}px;
-                --dynamic-fia-margin-right: {print_settings['fia_margin_right_px']}px;
+                --dynamic-category-note-font: {print_settings['category_note_font_size']}px;
             }}
             body {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size); background: #f0f2f5; margin: 0; padding: 20px; color: #000; }}
             .report-page, .report-page * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-font-size) !important; }}
@@ -7386,14 +7421,14 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             .report-table th {{ background: none; color: #000; border-top: 1px solid #000; border-bottom: 1px solid #000; padding: var(--dynamic-row-padding) 7px; font-size: var(--dynamic-header-font-size) !important; font-weight: bold; box-sizing: border-box; line-height: var(--dynamic-line-height); }}
             .report-table td {{ box-sizing: border-box; overflow-wrap: anywhere; word-break: normal; line-height: var(--dynamic-line-height); }}
             
-            .report-note, .report-test-note {{ margin-top: 10px; padding: 0; font-size: var(--dynamic-font-size) !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
+            .report-note, .report-test-note, .test-category-note, .interpretation-note {{ margin-top: 10px; padding: 0; font-size: var(--dynamic-category-note-font) !important; color: #000; background: transparent; border: none; line-height: 1.4; }}
             /* When a FIA gauge is present, the row's height is driven by
                the (taller) gauge box rather than a typically much
                shorter single-parameter table, which otherwise leaves an
                awkward blank gap before the notes/guidelines text below.
                This tightens the gap specifically in that case only -
                every other test's note spacing above is untouched. */
-            .fia-inline-row + .report-note, .fia-inline-row + .report-test-note {{ margin-top: -5px; }}
+            .fia-inline-row + .report-note, .fia-inline-row + .report-test-note, .fia-inline-row + .test-category-note, .fia-inline-row + .interpretation-note {{ margin-top: -5px; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
             .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
@@ -7439,29 +7474,30 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                flex-wrap:nowrap/justify-content:flex-end on the row above
                are three independent guarantees that this box always sits
                flush against the far-right edge of the row, never
-               wrapping under the table or drifting left. */
+               wrapping under the table or drifting left.
+
+               NOTE: the admin-configurable top/bottom/left/right offsets
+               are intentionally NOT set here via CSS var()/calc(). That
+               was the actual bug: calc(28px + var(--x)) combined with
+               position:relative + a var()-driven `left` offset is not
+               reliably supported by WeasyPrint (the PDF/print rendering
+               engine used for /report-download and this page's browser
+               print output) - it would resolve fine on-screen in a
+               regular browser tab, but silently fail to apply in the
+               actual printed/PDF output, which is exactly the reported
+               symptom ("not moving the graph box in print mode"). The
+               fix is to compute the final pixel values in Python (see
+               fia_graph_only_html below) and write them as plain,
+               literal inline styles - no calc(), no var(), no
+               position:relative - which every rendering engine
+               (browser screen, browser print, and WeasyPrint) handles
+               identically and reliably. margin-left:auto (for the
+               right-anchor) is the one exception kept here, since it's
+               fixed layout behavior, not an admin-adjustable value. */
             .fia-graph-wrap {{ 
                 flex: 0 0 230px; 
                 max-width: 230px; 
                 margin-left: auto;
-                /* Downward nudge so the gauge's top/vertical center
-                   lines up naturally with the middle/lower portion of
-                   the results table's actual data row, rather than
-                   sitting flush with the very top of the flex row
-                   (above the table's own header-row padding/border).
-                   The base 28px is fixed layout; the admin-configurable
-                   --dynamic-fia-margin-* variables (set at /print-settings)
-                   layer additional fine-tuning on top without needing any
-                   CSS edits. margin-right eats into the space that
-                   margin-left:auto would otherwise claim, nudging the box
-                   left from the page edge; the "left" nudge uses relative
-                   positioning instead, since margin-left itself is
-                   reserved for the auto right-alignment above. */
-                margin-top: calc(28px + var(--dynamic-fia-margin-top));
-                margin-bottom: var(--dynamic-fia-margin-bottom);
-                margin-right: var(--dynamic-fia-margin-right);
-                position: relative;
-                left: var(--dynamic-fia-margin-left);
                 box-sizing: border-box; 
                 padding: 6px 8px; 
                 border: 1px solid #222; 
