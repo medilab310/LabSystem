@@ -518,6 +518,43 @@ def render_locked_page(feature_label: str) -> HTMLResponse:
     """, status_code=403)
 
 
+def render_cancelled_bill_page(ref_display: str = "") -> HTMLResponse:
+    """Shown IN PLACE OF the page content whenever a cancelled bill's
+    result-entry/report/print URL is opened directly. Cancelled bills
+    must never be usable for entering results or generating a report,
+    even if someone still has the old link/URL."""
+    ref_html = f"<p style='color:#94a3b8; font-size:13px; margin-top:-8px; margin-bottom:22px;'>{html.escape(ref_display)}</p>" if ref_display else ""
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Bill Cancelled</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+            body {{ background: #f4f7fe; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #1b2559; }}
+            .locked-card {{ background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; box-shadow: 0px 8px 24px rgba(0,0,0,0.06); padding: 48px 40px; text-align: center; max-width: 440px; }}
+            .locked-card i {{ font-size: 42px; color: #b91c1c; margin-bottom: 18px; }}
+            .locked-card h2 {{ font-size: 20px; margin-bottom: 10px; }}
+            .locked-card p.msg {{ color: #707eae; font-size: 14px; margin-bottom: 22px; }}
+            .back-btn {{ display: inline-block; background: #0d47a1; color: #fff; text-decoration: none; padding: 10px 22px; border-radius: 8px; font-weight: 700; font-size: 14px; }}
+        </style>
+    </head>
+    <body>
+        <div class="locked-card">
+            <i class="fa-solid fa-ban"></i>
+            <h2>This Bill Has Been Cancelled</h2>
+            {ref_html}
+            <p class="msg">This bill was cancelled and is excluded from active reports. It can't be used to enter results or generate a report. It's still viewable under Sales Analytics &rarr; Cancelled Invoices for audit purposes.</p>
+            <a href="/patients-dashboard" class="back-btn"><i class="fa-solid fa-arrow-left"></i> Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """, status_code=403)
+
+
 # -------------------------------------------------------------
 # GLOBAL SESSION / CROSS-TAB LOGOUT SYNCHRONIZATION
 # -------------------------------------------------------------
@@ -2389,6 +2426,135 @@ def _ensure_patients_dashboard_schema(conn, cursor):
         return test_code_col
 
 
+def _render_cancel_bills_tab(conn, cursor, search, msg):
+    """Renders the dedicated 'Cancel Bills' tab: a list of ACTIVE
+    (not yet cancelled) bills with a Cancel Bill action per row, plus a
+    search filter by Lab/Invoice No or Patient Name. Cancelled bills are
+    excluded here too - once cancelled they only appear under Sales
+    Analytics -> Cancelled Invoices for audit purposes."""
+    where_sql = "WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)"
+    where_params = []
+
+    if search and search.strip():
+        search_term = f"%{search.strip()}%"
+        where_sql += " AND (p.name LIKE ? OR p.manual_bill_no LIKE ? OR CAST(p.id AS TEXT) LIKE ?)"
+        where_params.extend([search_term, search_term, search_term])
+
+    try:
+        cursor.execute(f"""
+            SELECT p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
+                   COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
+                   COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
+                   SUM(COALESCE(t.price, 0)) as amount
+            FROM patients p
+            LEFT JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            LEFT JOIN tests t ON t.id = pat.test_id
+            LEFT JOIN doctors d ON d.code = p.doctor
+            {where_sql}
+            GROUP BY p.id
+            ORDER BY p.id DESC
+            LIMIT 300
+        """, where_params)
+        rows = cursor.fetchall()
+    except Exception:
+        rows = []
+    conn.close()
+
+    rows_html = ""
+    for r in rows:
+        p_id = r["patient_id"]
+        p_name = f"{(r['title'] or '').strip()} {(r['name'] or '').strip()}".strip()
+        ref_no = f"Med-{p_id:04d}"
+        manual_bill_no = str(r["manual_bill_no"] or "").strip()
+        display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
+        date_str = str(r["created_at"] or "N/A")
+        amount = r["amount"] or 0
+        rows_html += f"""
+        <tr style="border-bottom: 1px solid #eee; background: #fff;" onmouseover="this.style.background='#f9f9f9'" onmouseout="this.style.background='#fff'">
+            <td style="padding: 12px 15px; color: #64748b; font-size: 13px;">{date_str}</td>
+            <td style="padding: 12px 15px; font-weight: bold; color: #0f4c81;">{display_ref_no}</td>
+            <td style="padding: 12px 15px; color: #333; font-weight: 500;">{p_name}</td>
+            <td style="padding: 12px 15px; color: #475569;">{r['doctor_name']}</td>
+            <td style="padding: 12px 15px; color: #475569;">{r['center_name']}</td>
+            <td style="padding: 12px 15px; color: #475569; text-align:right;">{amount:,.2f}</td>
+            <td style="padding: 12px 15px;">
+                <form method="post" action="/invoices/{p_id}/cancel" style="margin:0;"
+                      onsubmit="return confirm('Are you sure you want to cancel Bill {display_ref_no}? This will permanently remove it from active reports.');">
+                    <button type="submit" style="background:#b91c1c; color:#fff; border:none; padding:7px 14px; border-radius:6px; font-size:12.5px; font-weight:700; cursor:pointer;">🚫 Cancel Bill</button>
+                </form>
+            </td>
+        </tr>"""
+
+    if not rows_html:
+        rows_html = """<tr><td colspan="7" style="text-align:center; padding:30px; color:#666; font-size:14px;">No active bills found.</td></tr>"""
+
+    msg_html = ""
+    if msg:
+        msg_html = f"""
+        <div style="background:#dcfce7; border:1px solid #86efac; color:#15803d; padding:12px 18px; border-radius:8px; margin-bottom:16px; font-weight:bold; display:flex; align-items:center; gap:10px;">
+            <i class="fa-solid fa-circle-check"></i> {html.escape(msg)}
+        </div>
+        """
+
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Cancel Bills - Patients Dashboard</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 30px; margin: 0; }}
+            .container {{ max-width: 1250px; margin: auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
+            h2 {{ color: #0f4c81; margin-top: 0; font-size: 22px; margin-bottom: 20px; }}
+            .filter-card {{ background: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid #e2e8f0; margin-bottom: 20px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }}
+            .filter-card input {{ padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; min-width: 280px; }}
+            .btn-search {{ background: #0f4c81; color: white; border: none; padding: 10px 22px; font-size: 14px; border-radius: 6px; cursor: pointer; font-weight: bold; }}
+            .btn-reset {{ background: #e2e8f0; color: #334155; border: none; padding: 10px 15px; font-size: 14px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-flex; align-items: center; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; text-align: left; }}
+            th {{ background: #0f4c81; color: white; padding: 12px 15px; font-size: 13px; font-weight: bold; text-transform: uppercase; }}
+            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0f4c81; text-decoration: none; font-weight: bold; font-size: 13px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
+            <h2>🚫 Cancel Bills</h2>
+
+            <div style="display:flex; gap:8px; margin-bottom:18px;">
+                <a href="/patients-dashboard" style="background:#fff; color:#0f4c81; border:1px solid #0f4c81; padding:8px 16px; border-radius:6px; text-decoration:none; font-weight:bold; font-size:13px;">📋 Active Patients</a>
+                <a href="/patients-dashboard?tab=cancel_bills" style="background:#b91c1c; color:white; padding:8px 16px; border-radius:6px; text-decoration:none; font-weight:bold; font-size:13px;">🚫 Cancel Bills</a>
+            </div>
+
+            {msg_html}
+
+            <form method="get" action="/patients-dashboard" class="filter-card">
+                <input type="hidden" name="tab" value="cancel_bills">
+                <input type="text" name="search" value="{search if search else ''}" placeholder="Search by Lab/Invoice No or Patient Name...">
+                <button type="submit" class="btn-search">🔍 Search</button>
+                <a href="/patients-dashboard?tab=cancel_bills" class="btn-reset">Reset</a>
+            </form>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Date / Time</th>
+                        <th>Lab / Invoice No</th>
+                        <th>Patient Name</th>
+                        <th>Doctor</th>
+                        <th>Collecting Center</th>
+                        <th style="text-align:right;">Total Amount (LKR)</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>""")
+
+
 @app.get("/patients-dashboard", response_class=HTMLResponse)
 def patients_dashboard(
     request: Request,
@@ -2397,11 +2563,16 @@ def patients_dashboard(
     end_date: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
     cancelled_bill: Optional[str] = Query(None),
+    tab: str = Query("active"),
+    msg: Optional[str] = Query(None),
 ):
     conn = get_db_connection()
     cursor = conn.cursor()
 
     test_code_col = _ensure_patients_dashboard_schema(conn, cursor)
+
+    if tab == "cancel_bills":
+        return _render_cancel_bills_tab(conn, cursor, search, msg)
 
     # Shared WHERE clause, built once and reused for both the COUNT
     # query (for pagination) and the actual page fetch, so the two
@@ -2591,6 +2762,12 @@ def patients_dashboard(
         <div class="container">
             <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
             <h2>Patients Result Management Dashboard</h2>
+
+            <div style="display:flex; gap:8px; margin-bottom:18px;">
+                <a href="/patients-dashboard" style="background:#0f4c81; color:white; padding:8px 16px; border-radius:6px; text-decoration:none; font-weight:bold; font-size:13px;">📋 Active Patients</a>
+                <a href="/patients-dashboard?tab=cancel_bills" style="background:#fff; color:#b91c1c; border:1px solid #b91c1c; padding:8px 16px; border-radius:6px; text-decoration:none; font-weight:bold; font-size:13px;">🚫 Cancel Bills</a>
+            </div>
+
             {f'''
             <div style="background:#fdecea; border:1px solid #f5c6cb; color:#c0392b; padding:12px 18px; border-radius:8px; margin-bottom:16px; font-weight:bold; display:flex; align-items:center; gap:10px;">
                 <i class="fa-solid fa-circle-check"></i> Bill {html.escape(cancelled_bill)} has been cancelled and moved to Cancelled Records.
@@ -5151,6 +5328,14 @@ def test_entry_page(patient_id: int, test_id: int):
         
     p_cols = [desc[0] for desc in cursor.description]
     p_dict = dict(zip(p_cols, p_row))
+
+    if bool(p_dict.get("is_cancelled")):
+        conn.close()
+        manual_bill_no = str(p_dict.get("manual_bill_no") or "").strip()
+        ref_no = f"Med-{patient_id:04d}"
+        display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
+        return render_cancelled_bill_page(display_ref_no)
+
     p_title = p_dict.get("title", "")
     p_name = p_dict.get("name", "")
     p_gender = p_dict.get("gender") or "Male"
@@ -5585,6 +5770,14 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         return HTMLResponse(content="<h3>Patient Not Found!</h3><a href='/patients-dashboard'>Back</a>", status_code=404)
 
     p = dict(patient)
+
+    if bool(p.get("is_cancelled")):
+        conn.close()
+        manual_bill_no = str(p.get("manual_bill_no") or "").strip()
+        ref_no = f"Med-{patient_id:04d}"
+        display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
+        return render_cancelled_bill_page(display_ref_no)
+
     p_id = p.get("id")
     p_title = p.get("title") or p.get("salutation") or ""
     p_name = p.get("name") or p.get("patient_name") or p.get("full_name") or ""
@@ -5593,7 +5786,6 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
     p_doctor = p.get("doctor") or p.get("doctor_name") or p.get("ref_doctor") or ""
     p_center = p.get("center") or p.get("branch") or ""
-    p_is_cancelled = bool(p.get("is_cancelled"))
 
     # 2. Fetch Assigned Tests with Categories safely
     try:
@@ -5804,21 +5996,6 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     </span>
     """
 
-    cancelled_badge_html = """
-    <span style="background: #b91c1c; color: white; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; margin-left: 8px;">
-        <i class="fa-solid fa-ban"></i> CANCELLED
-    </span>
-    """ if p_is_cancelled else ""
-
-    cancel_bill_button_html = "" if p_is_cancelled else f"""
-    <form method="post" action="/invoices/{p_id}/cancel" style="display:inline;"
-          onsubmit="return confirm('Are you sure you want to CANCEL this bill?\\n\\nThis will exclude it from all sales/revenue reports and mark the report as CANCELLED. This cannot be easily undone.');">
-        <button type="submit" style="background:#b91c1c; color:#fff; border:none; padding:6px 14px; border-radius:20px; font-size:12px; font-weight:700; cursor:pointer; margin-left:8px;">
-            🚫 Cancel Bill
-        </button>
-    </form>
-    """
-
     alert_banner = ""
     if updated == "1":
         alert_banner = """
@@ -5899,7 +6076,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         <div class="container">
             <div class="top-bar">
                 <a href="/patients-dashboard" class="back-link"><i class="fa-solid fa-arrow-left"></i> Back to Result Dashboard</a>
-                <div>{status_badge}{cancelled_badge_html}{cancel_bill_button_html}</div>
+                <div>{status_badge}</div>
             </div>
 
             {alert_banner}
@@ -6101,8 +6278,9 @@ def cancel_invoice(invoice_id: int, request: Request):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM patients WHERE id = ?", (invoice_id,))
-    if not cursor.fetchone():
+    cursor.execute("SELECT id, manual_bill_no FROM patients WHERE id = ?", (invoice_id,))
+    row = cursor.fetchone()
+    if not row:
         conn.close()
         return HTMLResponse("<h3>Patient/Bill not found!</h3>", status_code=404)
 
@@ -6111,7 +6289,13 @@ def cancel_invoice(invoice_id: int, request: Request):
     conn.close()
 
     ref_no = f"Med-{invoice_id:04d}"
-    return RedirectResponse(url=f"/patients-dashboard?cancelled_bill={quote(ref_no, safe='')}", status_code=303)
+    manual_bill_no = str(row["manual_bill_no"] or "").strip()
+    display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
+    success_msg = f"Bill {display_ref_no} cancelled successfully."
+    return RedirectResponse(
+        url=f"/patients-dashboard?tab=cancel_bills&msg={quote(success_msg, safe='')}",
+        status_code=303
+    )
 
 # =============================================================
 # 2. SAVE TEST RESULTS ROUTE (Fixed with Comment Support)
@@ -6127,7 +6311,14 @@ async def save_test_results(request: Request):
         
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
+        # Cancelled bills must never accept new/edited results.
+        cursor.execute("SELECT is_cancelled FROM patients WHERE id = ?", (patient_id,))
+        p_row = cursor.fetchone()
+        if p_row and bool(p_row["is_cancelled"]):
+            conn.close()
+            return render_cancelled_bill_page(f"Med-{patient_id:04d}")
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS patient_parameter_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
