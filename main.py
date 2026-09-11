@@ -1453,7 +1453,7 @@ def dashboard():
     cursor.execute("SELECT COUNT(*) FROM tests")
     total_tests = cursor.fetchone()[0]
     
-    cursor.execute("SELECT id, title, name, phone, doctor FROM patients ORDER BY id DESC LIMIT 5")
+    cursor.execute("SELECT id, title, name, phone, doctor FROM patients WHERE (is_cancelled IS NULL OR is_cancelled = 0) ORDER BY id DESC LIMIT 5")
     recent_patients = cursor.fetchall()
     
     conn.close()
@@ -2156,7 +2156,10 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
     params = []
     
     if start_date and end_date:
-        date_filter_sql = "date(created_at) BETWEEN ? AND ?"
+        # Keep the cancellation exclusion even when a date range is applied -
+        # previously this replaced the filter entirely, letting cancelled
+        # bills leak back into date-filtered revenue/patient counts.
+        date_filter_sql = "date(created_at) BETWEEN ? AND ? AND (is_cancelled IS NULL OR is_cancelled = 0)"
         params = [start_date, end_date]
 
     try:
@@ -2392,7 +2395,8 @@ def patients_dashboard(
     search: Optional[str] = Query(None),
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
-    page: int = Query(1, ge=1)
+    page: int = Query(1, ge=1),
+    cancelled_bill: Optional[str] = Query(None),
 ):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -2402,7 +2406,8 @@ def patients_dashboard(
     # Shared WHERE clause, built once and reused for both the COUNT
     # query (for pagination) and the actual page fetch, so the two
     # never drift out of sync with each other.
-    where_sql = "WHERE 1=1"
+    # Cancelled bills must never appear in the active patient list.
+    where_sql = "WHERE (is_cancelled IS NULL OR is_cancelled = 0)"
     where_params = []
 
     if search and search.strip():
@@ -2586,6 +2591,11 @@ def patients_dashboard(
         <div class="container">
             <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
             <h2>Patients Result Management Dashboard</h2>
+            {f'''
+            <div style="background:#fdecea; border:1px solid #f5c6cb; color:#c0392b; padding:12px 18px; border-radius:8px; margin-bottom:16px; font-weight:bold; display:flex; align-items:center; gap:10px;">
+                <i class="fa-solid fa-circle-check"></i> Bill {html.escape(cancelled_bill)} has been cancelled and moved to Cancelled Records.
+            </div>
+            ''' if cancelled_bill else ''}
             
             <form method="get" action="/patients-dashboard" class="filter-card">
                 <div class="filter-group" style="flex: 2;">
@@ -3277,13 +3287,14 @@ def add_test_entry(request: Request, search: str = "", selected_patient_id: int 
         cursor.execute("""
             SELECT p.id, p.title, p.name, p.age_years, p.age_months, p.age_days, p.gender, p.phone
             FROM patients p
-            WHERE p.name LIKE ? OR p.phone LIKE ?
+            WHERE (p.name LIKE ? OR p.phone LIKE ?) AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)
             ORDER BY p.id DESC
         """, (search_term, search_term))
     else:
         cursor.execute("""
             SELECT p.id, p.title, p.name, p.age_years, p.age_months, p.age_days, p.gender, p.phone
             FROM patients p
+            WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)
             ORDER BY p.id DESC
             LIMIT 20
         """)
@@ -5015,7 +5026,7 @@ def select_patient(search: str = "", selected_patient_id: int = None):
                    r.id as report_id
             FROM patients p
             LEFT JOIN reports r ON p.id = r.patient_id
-            WHERE p.name LIKE ? OR p.phone LIKE ?
+            WHERE (p.name LIKE ? OR p.phone LIKE ?) AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)
             ORDER BY p.id DESC
         """, (search_term, search_term))
     else:
@@ -5025,6 +5036,7 @@ def select_patient(search: str = "", selected_patient_id: int = None):
                    r.id as report_id
             FROM patients p
             LEFT JOIN reports r ON p.id = r.patient_id
+            WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)
             ORDER BY p.id DESC
             LIMIT 20
         """)
@@ -6097,7 +6109,9 @@ def cancel_invoice(invoice_id: int, request: Request):
     cursor.execute("UPDATE patients SET is_cancelled = 1 WHERE id = ?", (invoice_id,))
     conn.commit()
     conn.close()
-    return RedirectResponse(url=f"/patient-results/{invoice_id}?updated=cancelled", status_code=303)
+
+    ref_no = f"Med-{invoice_id:04d}"
+    return RedirectResponse(url=f"/patients-dashboard?cancelled_bill={quote(ref_no, safe='')}", status_code=303)
 
 # =============================================================
 # 2. SAVE TEST RESULTS ROUTE (Fixed with Comment Support)
@@ -6290,7 +6304,7 @@ def share_reports_page(request: Request, q: str = ""):
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             JOIN tests t ON t.id = pat.test_id
-            WHERE p.name LIKE ? OR p.phone LIKE ? OR CAST(p.id AS TEXT) = ?
+            WHERE (p.name LIKE ? OR p.phone LIKE ? OR CAST(p.id AS TEXT) = ?) AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)
             ORDER BY p.id DESC, t.test_name ASC
             LIMIT 50
         """, (like, like, q.strip()))
@@ -7817,26 +7831,38 @@ def sales_analytics_page(
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # ---- Shared WHERE clause, built safely with parameterized ? placeholders ----
-    # CRITICAL: this one clause feeds all three queries below (detailed
-    # sales rows, doctor-wise summary, center-wise summary), so excluding
-    # cancelled bills here automatically keeps every revenue total across
-    # this whole page accurate - a cancelled bill is never double-excluded
-    # or missed in one view but not another.
-    where_sql = "WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)"
-    where_params = []
+    # ---- Shared date/doctor/center filters, built safely with
+    # parameterized ? placeholders. The cancellation condition is kept
+    # separate (see where_sql / cancelled_where_sql below) so the exact
+    # same date/doctor/center filters apply consistently whether looking
+    # at active sales or the Cancelled Invoices tab.
+    common_where_sql = ""
+    common_where_params = []
 
     if start_date and end_date:
-        where_sql += " AND date(p.created_at) BETWEEN ? AND ?"
-        where_params.extend([start_date, end_date])
+        common_where_sql += " AND date(p.created_at) BETWEEN ? AND ?"
+        common_where_params.extend([start_date, end_date])
 
     if doctor and doctor != "all":
-        where_sql += " AND p.doctor = ?"
-        where_params.append(doctor)
+        common_where_sql += " AND p.doctor = ?"
+        common_where_params.append(doctor)
 
     if center and center != "all":
-        where_sql += " AND COALESCE(p.center, p.collecting_center) = ?"
-        where_params.append(center)
+        common_where_sql += " AND COALESCE(p.center, p.collecting_center) = ?"
+        common_where_params.append(center)
+
+    # CRITICAL: this one clause feeds all three "active" queries below
+    # (detailed sales rows, doctor-wise summary, center-wise summary), so
+    # excluding cancelled bills here automatically keeps every revenue
+    # total across this whole page accurate - a cancelled bill is never
+    # double-excluded or missed in one view but not another.
+    where_sql = "WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)" + common_where_sql
+    where_params = list(common_where_params)
+
+    # Mirror image of where_sql: same date/doctor/center filters, but only
+    # the cancelled bills - powers the dedicated Cancelled Invoices tab.
+    cancelled_where_sql = "WHERE p.is_cancelled = 1" + common_where_sql
+    cancelled_where_params = list(common_where_params)
 
     # ---- Dropdown option sources ----
     cursor.execute("SELECT code, name FROM doctors ORDER BY name")
@@ -7917,6 +7943,28 @@ def sales_analytics_page(
     except Exception:
         center_summary_rows = []
 
+    # ---- Cancelled bills (dedicated audit tab) ----
+    cancelled_rows = []
+    try:
+        cursor.execute(f"""
+            SELECT p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
+                   p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
+                   COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
+                   SUM(COALESCE(t.price, 0)) as amount
+            FROM patients p
+            LEFT JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            LEFT JOIN tests t ON t.id = pat.test_id
+            LEFT JOIN doctors d ON d.code = p.doctor
+            {cancelled_where_sql}
+            GROUP BY p.id
+            ORDER BY p.id DESC
+        """, cancelled_where_params)
+        cancelled_rows = cursor.fetchall()
+    except Exception:
+        cancelled_rows = []
+    cancelled_count = len(cancelled_rows)
+    cancelled_total = sum((r["amount"] or 0) for r in cancelled_rows)
+
     conn.close()
 
     # ---- Build option HTML ----
@@ -7988,6 +8036,34 @@ def sales_analytics_page(
         </tr>
         """
 
+    elif view == "cancelled":
+        table_title = "Cancelled Invoices (Audit)"
+        table_header_html = "<th>Date / Time</th><th>Invoice / Lab No</th><th>Patient Name</th><th>Doctor Name</th><th>Collecting Center</th><th style='text-align:right;'>Cancelled Bill Amount (LKR)</th>"
+        body_rows = ""
+        for r in cancelled_rows:
+            ref_no = f"Med-{r['patient_id']:04d}"
+            display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
+            date_str = str(r["created_at"] or "")
+            patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
+            body_rows += f"""
+            <tr>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(date_str)}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{display_ref_no}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(patient_name)}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['doctor_name'] or 'Not Specified')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['center_name'] or 'Main Branch')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right; color:#c0392b; font-weight:bold;">{(r['amount'] or 0):,.2f}</td>
+            </tr>
+            """
+        if not body_rows:
+            body_rows = '<tr><td colspan="6" style="padding:20px; text-align:center; color: var(--text-muted);">No cancelled bills for the selected filters.</td></tr>'
+        footer_html = f"""
+        <tr style="font-weight:bold; background: rgba(192,57,43,0.06);">
+            <td colspan="5" style="padding:10px; text-align:right;">TOTAL CANCELLED (LKR)</td>
+            <td style="padding:10px; text-align:right; color:#c0392b;">{cancelled_total:,.2f}</td>
+        </tr>
+        """
+
     else:
         view = "table"
         table_title = "Detailed Sales Data"
@@ -8046,6 +8122,11 @@ def sales_analytics_page(
             .tabs {{ display: flex; gap: 8px; margin-bottom: 18px; }}
             .tab-link {{ padding: 9px 18px; border-radius: 20px; text-decoration: none; font-size: 13px; font-weight: bold; background: #e2e8f0; color: #334155; }}
             .tab-link.active {{ background: var(--header-bg); color: white; }}
+            .tab-link.cancelled-tab.active {{ background: #c0392b; }}
+            .summary-cards {{ display: flex; gap: 16px; margin-bottom: 18px; }}
+            .summary-card {{ background: var(--card-bg); border: 1px solid var(--border-color); border-left: 4px solid #c0392b; border-radius: 10px; padding: 16px 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); min-width: 220px; }}
+            .summary-card-label {{ font-size: 12px; font-weight: bold; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }}
+            .summary-card-value {{ font-size: 24px; font-weight: bold; color: var(--text-main); }}
             .report-card {{ background: var(--card-bg); padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border: 1px solid var(--border-color); }}
             .report-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; border-bottom: 2px solid var(--border-color); padding-bottom: 12px; }}
             table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
@@ -8103,7 +8184,21 @@ def sales_analytics_page(
                 <a href="{_view_link('table')}" class="tab-link {'active' if view == 'table' else ''}">📋 Sales Table</a>
                 <a href="{_view_link('doctor')}" class="tab-link {'active' if view == 'doctor' else ''}">👨‍⚕️ Doctor-wise Summary</a>
                 <a href="{_view_link('center')}" class="tab-link {'active' if view == 'center' else ''}">🏥 Center-wise Summary</a>
+                <a href="{_view_link('cancelled')}" class="tab-link cancelled-tab {'active' if view == 'cancelled' else ''}">🚫 Cancelled Invoices</a>
             </div>
+
+            {f'''
+            <div class="summary-cards no-print">
+                <div class="summary-card">
+                    <div class="summary-card-label">Total Cancelled Bills</div>
+                    <div class="summary-card-value">{cancelled_count}</div>
+                </div>
+                <div class="summary-card">
+                    <div class="summary-card-label">Total Cancelled Revenue Value</div>
+                    <div class="summary-card-value" style="color:#c0392b;">LKR {cancelled_total:,.2f}</div>
+                </div>
+            </div>
+            ''' if view == 'cancelled' else ''}
 
             <div class="report-card">
                 <div class="report-header">
