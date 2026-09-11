@@ -1336,6 +1336,12 @@ def init_db():
     # a manual bill number is entered for a new or edited record.
     if "manual_bill_no" not in patient_columns:
         cursor.execute("ALTER TABLE patients ADD COLUMN manual_bill_no TEXT")
+    # Additive-only migration for bill/invoice cancellation. Existing rows
+    # are untouched and default to 0 (not cancelled) - a patient's whole
+    # visit/bill is the natural "invoice" granularity in this system (one
+    # registration covers all of that patient's assigned tests).
+    if "is_cancelled" not in patient_columns:
+        cursor.execute("ALTER TABLE patients ADD COLUMN is_cancelled INTEGER DEFAULT 0")
 
     cursor.execute("PRAGMA table_info(patient_assigned_tests)")
     assigned_columns = {row[1] for row in cursor.fetchall()}
@@ -2146,7 +2152,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
     table_rows = ""
     report_title = ""
 
-    date_filter_sql = "1=1"
+    date_filter_sql = "(is_cancelled IS NULL OR is_cancelled = 0)"
     params = []
     
     if start_date and end_date:
@@ -5575,6 +5581,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
     p_doctor = p.get("doctor") or p.get("doctor_name") or p.get("ref_doctor") or ""
     p_center = p.get("center") or p.get("branch") or ""
+    p_is_cancelled = bool(p.get("is_cancelled"))
 
     # 2. Fetch Assigned Tests with Categories safely
     try:
@@ -5785,6 +5792,21 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     </span>
     """
 
+    cancelled_badge_html = """
+    <span style="background: #b91c1c; color: white; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; margin-left: 8px;">
+        <i class="fa-solid fa-ban"></i> CANCELLED
+    </span>
+    """ if p_is_cancelled else ""
+
+    cancel_bill_button_html = "" if p_is_cancelled else f"""
+    <form method="post" action="/invoices/{p_id}/cancel" style="display:inline;"
+          onsubmit="return confirm('Are you sure you want to CANCEL this bill?\\n\\nThis will exclude it from all sales/revenue reports and mark the report as CANCELLED. This cannot be easily undone.');">
+        <button type="submit" style="background:#b91c1c; color:#fff; border:none; padding:6px 14px; border-radius:20px; font-size:12px; font-weight:700; cursor:pointer; margin-left:8px;">
+            🚫 Cancel Bill
+        </button>
+    </form>
+    """
+
     alert_banner = ""
     if updated == "1":
         alert_banner = """
@@ -5796,6 +5818,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         alert_banner = """
         <div style="background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">
             <i class="fa-solid fa-check-circle"></i> Test results & comments saved successfully!
+        </div>
+        """
+    elif updated == "cancelled":
+        alert_banner = """
+        <div style="background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; font-size: 13px;">
+            <i class="fa-solid fa-ban"></i> This bill has been cancelled and is now excluded from all sales/revenue reports.
         </div>
         """
 
@@ -5859,7 +5887,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         <div class="container">
             <div class="top-bar">
                 <a href="/patients-dashboard" class="back-link"><i class="fa-solid fa-arrow-left"></i> Back to Result Dashboard</a>
-                <div>{status_badge}</div>
+                <div>{status_badge}{cancelled_badge_html}{cancel_bill_button_html}</div>
             </div>
 
             {alert_banner}
@@ -6045,6 +6073,31 @@ async def update_patient_details(request: Request):
             except Exception:
                 pass
         return HTMLResponse(content=f"<h3>Error updating patient details: {html.escape(str(e))}</h3>", status_code=500)
+
+# =============================================================
+# BILL / INVOICE CANCELLATION
+# =============================================================
+# A patient's registration/visit is this system's natural "invoice" -
+# it covers all tests assigned to that one visit. Cancelling it excludes
+# the whole bill from every sales/revenue report, and marks the printed
+# report so it can never be mistaken for a valid test bill.
+@app.post("/invoices/{invoice_id}/cancel")
+def cancel_invoice(invoice_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "reports"):
+        return render_locked_page("Cancel Bill")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM patients WHERE id = ?", (invoice_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return HTMLResponse("<h3>Patient/Bill not found!</h3>", status_code=404)
+
+    cursor.execute("UPDATE patients SET is_cancelled = 1 WHERE id = ?", (invoice_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url=f"/patient-results/{invoice_id}?updated=cancelled", status_code=303)
 
 # =============================================================
 # 2. SAVE TEST RESULTS ROUTE (Fixed with Comment Support)
@@ -6850,6 +6903,15 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     # entered; otherwise append it exactly once using the requested slash.
     display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
 
+    is_cancelled_bill = bool(patient.get("is_cancelled"))
+    cancelled_report_banner_html = """
+    <div style="text-align:center; margin: 4px 0 10px 0;">
+        <span style="display:inline-block; color:#b91c1c; border:2px solid #b91c1c; padding:4px 22px; font-size:16px; font-weight:900; letter-spacing:2px; transform: rotate(-3deg); border-radius:4px;">
+            CANCELLED
+        </span>
+    </div>
+    """ if is_cancelled_bill else ""
+
     def format_report_datetime(value):
         if not value or str(value).strip().lower() == "none":
             return None
@@ -7602,6 +7664,8 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                 <img src="{barcode_url}" alt="Barcode">
             </div>
 
+            {cancelled_report_banner_html}
+
             <div class="patient-box">
                 <table class="header-table">
                     <colgroup>
@@ -7754,7 +7818,12 @@ def sales_analytics_page(
     cursor = conn.cursor()
 
     # ---- Shared WHERE clause, built safely with parameterized ? placeholders ----
-    where_sql = "WHERE 1=1"
+    # CRITICAL: this one clause feeds all three queries below (detailed
+    # sales rows, doctor-wise summary, center-wise summary), so excluding
+    # cancelled bills here automatically keeps every revenue total across
+    # this whole page accurate - a cancelled bill is never double-excluded
+    # or missed in one view but not another.
+    where_sql = "WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)"
     where_params = []
 
     if start_date and end_date:
