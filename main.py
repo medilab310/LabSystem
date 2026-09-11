@@ -6273,7 +6273,17 @@ def share_reports_page(request: Request, q: str = ""):
     recent_rows_html = ""
     for token, p_id, t_id, created_at, p_name, t_name in recent:
         share_url = f"{base_url}/shared-report/{token}"
-        wa_text = quote(f"Hello, here is your lab report for {t_name}: {share_url}")
+        wa_message = (
+            f"Hello {p_name},\n"
+            f"Your test report from Medistar Medical Laboratory is now ready.\n"
+            f"You can view and download your report in PDF or Image format using this secure link:\n"
+            f"🔗 {share_url}\n\n"
+            f"Thank you!"
+        )
+        wa_text = quote(wa_message)
+        # data-message carries the raw (unescaped-for-URL) template for the
+        # "Copy Message & Link" button's clipboard action.
+        copy_payload = html.escape(wa_message, quote=True)
         recent_rows_html += f"""
         <tr>
             <td style="padding:10px; border-bottom:1px solid #eee; font-weight:600;">{html.escape(p_name or "")}</td>
@@ -6283,10 +6293,14 @@ def share_reports_page(request: Request, q: str = ""):
                        style="width:100%; padding:6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;">
             </td>
             <td style="padding:10px; border-bottom:1px solid #eee; text-align:right; white-space:nowrap;">
-                <a href="https://wa.me/?text={wa_text}" target="_blank"
+                <a href="https://api.whatsapp.com/send?text={wa_text}" target="_blank"
                    style="background:#25D366; color:white; padding:6px 10px; text-decoration:none; border-radius:4px; font-size:12px; font-weight:bold; margin-right:5px;">
-                    <i class="fa-brands fa-whatsapp"></i> WhatsApp
+                    📲 Share via WhatsApp
                 </a>
+                <button type="button" onclick="copyShareMessage(this)" data-message="{copy_payload}"
+                   style="background:#64748b; color:white; padding:6px 10px; border:none; border-radius:4px; font-size:12px; font-weight:bold; cursor:pointer; margin-right:5px;">
+                    📋 Copy Message &amp; Link
+                </button>
                 <a href="{share_url}" target="_blank"
                    style="background:#0f4c81; color:white; padding:6px 10px; text-decoration:none; border-radius:4px; font-size:12px; font-weight:bold;">
                     Open
@@ -6336,6 +6350,18 @@ def share_reports_page(request: Request, q: str = ""):
                 </table>
             </div>
         </div>
+        <script>
+            function copyShareMessage(btn) {{
+                const msg = btn.getAttribute("data-message");
+                navigator.clipboard.writeText(msg).then(function() {{
+                    const original = btn.textContent;
+                    btn.textContent = "✅ Copied!";
+                    setTimeout(function() {{ btn.textContent = original; }}, 1800);
+                }}).catch(function() {{
+                    alert("Could not copy automatically. Message:\\n\\n" + msg);
+                }});
+            }}
+        </script>
     </body>
     </html>
     """
@@ -6386,6 +6412,7 @@ def shared_report_view(token: str, request: Request):
         return HTMLResponse("<h2 style='font-family:Arial; text-align:center; margin-top:80px; color:#e74c3c;'>This report link is invalid or has expired.</h2>", status_code=404)
 
     patient_id, test_id = row[0], row[1]
+    lab_no = f"Med-{patient_id:04d}"
     inner_report = report_view(patient_id, test_id, request)
     if isinstance(inner_report, HTMLResponse):
         inner_html = inner_report.body.decode("utf-8")
@@ -6394,21 +6421,75 @@ def shared_report_view(token: str, request: Request):
     else:
         return inner_report
 
-    # Add a simple "Download PDF" bar above the existing report content,
-    # using the token so the patient never sees/needs the real patient_id
-    # or test_id in their URL bar.
-    download_bar = f"""
-    <div style="max-width:900px; margin:16px auto 0 auto; text-align:center;">
-        <a href="/shared-report/{token}/download"
-           style="display:inline-block; background:#0f4c81; color:white; padding:12px 26px; border-radius:8px; text-decoration:none; font-weight:bold; font-family:Arial, sans-serif;">
-            <i class="fa-solid fa-download"></i> Download Report (PDF)
-        </a>
+    # Hide every internal/admin control on this public page (the "Back to
+    # Edit" link and the internal print toggle in .action-bar) without
+    # needing to string-surgically remove exact HTML - a CSS override is
+    # robust regardless of how that markup changes in the future.
+    hide_admin_css = "<style>.action-bar { display: none !important; }</style>"
+
+    patient_banner = """
+    <div style="max-width:900px; margin:16px auto 0 auto; background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; padding:16px 20px; text-align:center; font-family:Arial, sans-serif; color:#1e3a5f;">
+        <strong>Your laboratory test report is ready.</strong><br>
+        You can view it online or download it directly to your device.
     </div>
     """
+
+    download_bar = f"""
+    <div style="max-width:900px; margin:14px auto 0 auto; text-align:center; font-family:Arial, sans-serif;">
+        <button onclick="downloadReportAsPdf()"
+           style="display:inline-block; background:#0f4c81; color:white; padding:12px 26px; border-radius:8px; text-decoration:none; font-weight:bold; border:none; font-size:14px; cursor:pointer; margin:4px;">
+            📄 Download PDF
+        </button>
+        <button onclick="downloadReportAsJpg()"
+           style="display:inline-block; background:#0f172a; color:white; padding:12px 26px; border-radius:8px; text-decoration:none; font-weight:bold; border:none; font-size:14px; cursor:pointer; margin:4px;">
+            🖼️ Download as JPG
+        </button>
+    </div>
+    <div id="shared-report-status" style="text-align:center; font-family:Arial, sans-serif; font-size:12px; color:#64748b; margin-top:6px;"></div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <script>
+        function _setSharedStatus(msg) {{
+            const el = document.getElementById("shared-report-status");
+            if (el) el.textContent = msg;
+        }}
+        function downloadReportAsPdf() {{
+            const el = document.querySelector(".report-page");
+            if (!el) return;
+            _setSharedStatus("Preparing PDF...");
+            html2pdf().set({{
+                margin: 0,
+                filename: "Report_{lab_no}.pdf",
+                image: {{ type: "jpeg", quality: 0.98 }},
+                html2canvas: {{ scale: 2, useCORS: true }},
+                jsPDF: {{ unit: "mm", format: "a4", orientation: "portrait" }}
+            }}).from(el).save().then(() => _setSharedStatus("")).catch(() => _setSharedStatus("Could not generate PDF - please try again."));
+        }}
+        function downloadReportAsJpg() {{
+            const el = document.querySelector(".report-page");
+            if (!el) return;
+            _setSharedStatus("Preparing image...");
+            html2canvas(el, {{ scale: 2, useCORS: true }}).then(function(canvas) {{
+                const link = document.createElement("a");
+                link.download = "Report_{lab_no}.jpg";
+                link.href = canvas.toDataURL("image/jpeg", 0.95);
+                link.click();
+                _setSharedStatus("");
+            }}).catch(() => _setSharedStatus("Could not generate image - please try again."));
+        }}
+    </script>
+    """
+
+    if "</head>" in inner_html:
+        inner_html = inner_html.replace("</head>", hide_admin_css + "</head>")
+    else:
+        inner_html = hide_admin_css + inner_html
+
     if "</body>" in inner_html:
+        inner_html = inner_html.replace("<body>", "<body>" + patient_banner)
         inner_html = inner_html.replace("</body>", download_bar + "</body>")
     else:
-        inner_html = inner_html + download_bar
+        inner_html = patient_banner + inner_html + download_bar
 
     return HTMLResponse(inner_html)
 
@@ -7674,7 +7755,7 @@ def sales_analytics_page(
             SELECT p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
                    p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
                    COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
-                   GROUP_CONCAT(t.test_name, ', ') as tests_performed,
+                   GROUP_CONCAT(COALESCE(NULLIF(t.test_code, ''), t.test_name), ', ') as tests_performed,
                    SUM(COALESCE(t.price, 0)) as amount
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
