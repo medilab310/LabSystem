@@ -3894,6 +3894,16 @@ def seed_standard_tests_and_parameters():
         _ensure_column(cursor, "test_parameters", "is_calculated", "is_calculated INTEGER DEFAULT 0")
         _ensure_column(cursor, "test_parameters", "calculation_key", "calculation_key TEXT")
         _ensure_column(cursor, "test_parameters", "is_bold", "is_bold INTEGER DEFAULT 0")
+        # Per-RESULT bold flag, set by the operator on the Result Entry
+        # screen. Distinct from test_parameters.is_bold above, which is a
+        # per-parameter *config* flag that bolds the parameter NAME for
+        # every patient. This one bolds one specific patient's result
+        # VALUE for one specific test.
+        _ensure_column(cursor, "patient_parameter_results", "is_bold", "is_bold INTEGER DEFAULT 0")
+        # Per-assigned-test flag: when set, the ABST / antibiotic
+        # susceptibility section is omitted from the printed report
+        # (used for "No Growth" culture reports).
+        _ensure_column(cursor, "patient_assigned_tests", "hide_abst", "hide_abst INTEGER DEFAULT 0")
 
         standards = [
             {
@@ -5339,7 +5349,22 @@ def test_entry_page(patient_id: int, test_id: int):
     p_title = p_dict.get("title", "")
     p_name = p_dict.get("name", "")
     p_gender = p_dict.get("gender") or "Male"
-    p_age_display = p_dict.get("age_years") or p_dict.get("age") or ""
+    # Age is stored as three separate numeric columns. Surface all three so
+    # infant/child ages entered as months or days round-trip correctly
+    # through the edit form instead of collapsing to a single "years" box.
+    def _age_part(key):
+        try:
+            value = p_dict.get(key)
+            return max(0, int(float(value))) if value not in (None, "") else 0
+        except (TypeError, ValueError):
+            return 0
+
+    p_age_years = _age_part("age_years")
+    p_age_months = _age_part("age_months")
+    p_age_days = _age_part("age_days")
+    if p_age_years == 0 and p_age_months == 0 and p_age_days == 0:
+        p_age_years = _age_part("age")
+    p_age_display = format_age(p_age_years, p_age_months, p_age_days)
     p_doctor = p_dict.get("doctor") or ""
     p_center_display = p_dict.get("center") or p_dict.get("collecting_center") or ""
     
@@ -5416,6 +5441,15 @@ def test_entry_page(patient_id: int, test_id: int):
         input_attr = 'style="flex: 3; padding: 3px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; transition: border-color 0.2s;"'
 
     if params:
+        param_form_html += """
+        <div style="display:grid; grid-template-columns: minmax(170px,2fr) minmax(110px,2.4fr) 58px 80px minmax(110px,1.6fr); gap:6px; padding-bottom:5px; margin-bottom:6px; border-bottom:2px solid #e2e8f0; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.3px;">
+            <span>Parameter</span>
+            <span>Result</span>
+            <span style="text-align:center;">Bold</span>
+            <span>Unit</span>
+            <span>Reference Range</span>
+        </div>
+        """
         for p in params:
             p_id_param = p["id"]
             p_name_val = p["p_name"]
@@ -5436,13 +5470,28 @@ def test_entry_page(patient_id: int, test_id: int):
                 selected_ref = p["ref_range"] or ""
 
             p_val = ""
+            p_is_bold = 0
             try:
-                cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id = ? AND test_id = ? AND parameter_id = ?", (patient_id, test_id, p_id_param))
+                cursor.execute(
+                    "SELECT result_value, COALESCE(is_bold, 0) AS is_bold FROM patient_parameter_results "
+                    "WHERE patient_id = ? AND test_id = ? AND parameter_id = ?",
+                    (patient_id, test_id, p_id_param)
+                )
                 exist_res = cursor.fetchone()
                 if exist_res and exist_res["result_value"] is not None:
                     p_val = str(exist_res["result_value"])
+                if exist_res:
+                    p_is_bold = int(exist_res["is_bold"] or 0)
             except Exception:
-                pass
+                # Older database without the is_bold column - fall back to the
+                # value-only query so Result Entry still works.
+                try:
+                    cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id = ? AND test_id = ? AND parameter_id = ?", (patient_id, test_id, p_id_param))
+                    exist_res = cursor.fetchone()
+                    if exist_res and exist_res["result_value"] is not None:
+                        p_val = str(exist_res["result_value"])
+                except Exception:
+                    pass
 
             default_val = str(p["default_result"] or "").strip()
             # Existing entered value always wins. If no value exists, show the
@@ -5456,14 +5505,34 @@ def test_entry_page(patient_id: int, test_id: int):
                 calc_attr = input_attr
                 badge = ''
 
-            ref_html = f'<div style="font-size:11px;color:#64748b;margin-top:3px;">Ref: {html.escape(str(selected_ref))}</div>' if selected_ref else ''
-            unit_html = f'<span style="min-width:90px;font-size:12px;color:#64748b;">{html.escape(str(unit_val))}</span>' if unit_val else '<span style="min-width:90px;"></span>'
+            # Reference range now gets its own right-hand helper column so the
+            # operator can verify limits while typing, instead of being tucked
+            # under the parameter name on the left.
+            ref_html = (
+                f'<span style="font-size:11.5px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="{html.escape(str(selected_ref))}">{html.escape(str(selected_ref))}</span>'
+                if selected_ref else '<span></span>'
+            )
+            unit_html = f'<span style="font-size:12px;color:#64748b;">{html.escape(str(unit_val))}</span>' if unit_val else '<span></span>'
+
+            # Per-result Bold toggle. Calculated parameters are excluded -
+            # their value is derived, and the entry input is already readonly.
+            if is_calculated:
+                bold_html = '<span></span>'
+            else:
+                bold_disabled = ' disabled' if has_results else ''
+                bold_checked = ' checked' if p_is_bold else ''
+                bold_html = (
+                    f'<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#64748b;cursor:{"not-allowed" if has_results else "pointer"};white-space:nowrap;" title="Print this result in bold on the report">'
+                    f'<input type="checkbox" name="bold_{test_id}_{p_id_param}" value="1"{bold_checked}{bold_disabled} style="width:13px;height:13px;margin:0;">Bold</label>'
+                )
 
             param_form_html += f"""
-            <div style="display:grid; grid-template-columns: minmax(180px,2fr) minmax(120px,3fr) 100px; margin-bottom: 2px; align-items:center; gap:6px;">
-                <label style="font-weight:600;color:#334155;font-size:14px;">{html.escape(str(p_name_val))}{badge}{ref_html}</label>
+            <div style="display:grid; grid-template-columns: minmax(170px,2fr) minmax(110px,2.4fr) 58px 80px minmax(110px,1.6fr); margin-bottom: 2px; align-items:center; gap:6px;">
+                <label style="font-weight:600;color:#334155;font-size:14px;">{html.escape(str(p_name_val))}{badge}</label>
                 <input type="text" name="param_{test_id}_{p_id_param}" value="{html.escape(final_val)}" placeholder="{'Auto calculated' if is_calculated else 'Enter result...'}" class="param-input" onkeydown="handleParamKeyNav(event, this)" {calc_attr}>
+                {bold_html}
                 {unit_html}
+                {ref_html}
             </div>
             """
     else:
@@ -5474,6 +5543,37 @@ def test_entry_page(patient_id: int, test_id: int):
         </div>
         """
         
+    # ---- Culture & Sensitivity: "Hide ABST" toggle ----
+    # Only surfaced for culture/sensitivity tests, identified by test name
+    # (this database has no separate test-type flag to key off).
+    _t_name_lower = str(t_name or "").lower()
+    is_culture_test = any(k in _t_name_lower for k in ("culture", "sensitivity", "abst", "c/s", "c & s"))
+    abst_toggle_html = ""
+    if is_culture_test:
+        current_hide_abst = 0
+        try:
+            cursor.execute(
+                "SELECT COALESCE(hide_abst, 0) AS hide_abst FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?",
+                (patient_id, test_id)
+            )
+            _abst_row = cursor.fetchone()
+            if _abst_row:
+                current_hide_abst = int(_abst_row["hide_abst"] or 0)
+        except Exception:
+            current_hide_abst = 0
+
+        abst_toggle_html = f"""
+        <div style="background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; padding:12px 16px; margin-bottom:16px;">
+            <label style="display:flex; align-items:center; gap:10px; cursor:{"not-allowed" if has_results else "pointer"}; font-size:13.5px; font-weight:600; color:#9a3412;">
+                <input type="checkbox" name="hide_abst" value="1"{" checked" if current_hide_abst else ""}{" disabled" if has_results else ""} style="width:17px; height:17px; margin:0;">
+                <span><i class="fa-solid fa-flask-vial"></i> Hide ABST Section (No Growth / Not Applicable)</span>
+            </label>
+            <div style="font-size:11.5px; color:#b45309; margin-top:6px; padding-left:27px;">
+                When ticked, the antibiotic susceptibility grid is omitted from the printed report, keeping &ldquo;No Growth&rdquo; reports clean.
+            </div>
+        </div>
+        """
+
     # Save button OR Locked Warning Message
     if has_results:
         save_action_html = """
@@ -5530,9 +5630,13 @@ def test_entry_page(patient_id: int, test_id: int):
                         <option value="Female" {"selected" if p_gender == "Female" else ""}>Female</option>
                     </select>
                 </div>
-                <div style="flex:1; min-width:90px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Age</label>
-                    <input type="text" name="patient_age" value="{p_age_display}" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box;">
+                <div style="flex:1.4; min-width:210px;">
+                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Age (Years / Months / Days) &mdash; currently: <b>{html.escape(p_age_display)}</b></label>
+                    <div style="display:flex; gap:6px;">
+                        <input type="number" name="patient_age_years" min="0" value="{p_age_years}" title="Years" placeholder="Y" style="width:100%; padding:8px 6px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box; text-align:center;">
+                        <input type="number" name="patient_age_months" min="0" max="11" value="{p_age_months}" title="Months" placeholder="M" style="width:100%; padding:8px 6px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box; text-align:center;">
+                        <input type="number" name="patient_age_days" min="0" max="30" value="{p_age_days}" title="Days" placeholder="D" style="width:100%; padding:8px 6px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box; text-align:center;">
+                    </div>
                 </div>
                 <div style="flex:1; min-width:150px;">
                     <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Doctor</label>
@@ -5631,6 +5735,7 @@ def test_entry_page(patient_id: int, test_id: int):
                 <h2>{t_name} - Report</h2>
                 
                 <form action="/save-specific-test/{patient_id}/{test_id}" method="post">
+                    {abst_toggle_html}
                     {param_form_html}
                     {save_action_html}
                 </form>
@@ -5652,21 +5757,65 @@ def test_entry_page(patient_id: int, test_id: int):
 # 3. BACKEND ACTION ENDPOINTS (Saving & Updates)
 # -------------------------------------------------------------
 @app.post("/update-patient-info/{patient_id}")
-def update_patient_info(patient_id: int, patient_title: str = Form(...), patient_name: str = Form(...), patient_phone: str = Form(None), patient_doctor: str = Form(None), patient_age: str = Form(None), patient_center: str = Form(None), patient_gender: str = Form(None), test_id: int = Form(None)):
+def update_patient_info(
+    patient_id: int,
+    patient_title: str = Form(...),
+    patient_name: str = Form(...),
+    patient_phone: str = Form(None),
+    patient_doctor: str = Form(None),
+    patient_age: str = Form(None),
+    patient_age_years: str = Form(None),
+    patient_age_months: str = Form(None),
+    patient_age_days: str = Form(None),
+    patient_center: str = Form(None),
+    patient_gender: str = Form(None),
+    test_id: int = Form(None),
+):
+    """
+    FIX: this handler previously accepted a single `patient_age` string and
+    wrote it into age_years (and the legacy `age` column) only - age_months
+    and age_days were never touched. Editing an infant's age as months/days
+    on the Result Entry screen therefore appeared to save but silently
+    discarded the months/days, and the report kept showing the old age.
+
+    The form now submits three separate numeric fields; all three are
+    persisted. `patient_age` is still accepted so any older/cached form
+    that posts a single value keeps working (treated as years).
+    """
+    def _as_int(value, fallback=0):
+        try:
+            return max(0, int(float(str(value).strip())))
+        except (TypeError, ValueError, AttributeError):
+            return fallback
+
+    # Prefer the explicit 3-field form; fall back to the legacy single field.
+    if patient_age_years is None and patient_age_months is None and patient_age_days is None:
+        years = _as_int(patient_age)
+        months = 0
+        days = 0
+    else:
+        years = _as_int(patient_age_years)
+        months = _as_int(patient_age_months)
+        days = _as_int(patient_age_days)
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
             UPDATE patients 
-            SET title = ?, name = ?, phone = ?, doctor = ?, age_years = ?, age = ?, center = ?, gender = ?
+            SET title = ?, name = ?, phone = ?, doctor = ?,
+                age_years = ?, age_months = ?, age_days = ?, age = ?,
+                center = ?, gender = ?
             WHERE id = ?
-        """, (patient_title, patient_name, patient_phone, patient_doctor, patient_age, patient_age, patient_center, patient_gender, patient_id))
+        """, (patient_title, patient_name, patient_phone, patient_doctor,
+              years, months, days, years,
+              patient_center, patient_gender, patient_id))
         conn.commit()
-    except Exception as e:
+    except Exception:
         try:
             cursor.execute("UPDATE patients SET name = ? WHERE id = ?", (patient_name, patient_id))
             conn.commit()
-        except:
+        except Exception:
             pass
     conn.close()
     if test_id:
@@ -5692,6 +5841,10 @@ async def save_specific_test(patient_id: int, test_id: int, request: Request):
             if len(parts) >= 3:
                 p_id_param = parts[2]
 
+                # An unchecked checkbox is simply absent from the POST body,
+                # so the flag is derived from presence of bold_<test>_<param>.
+                is_bold_flag = 1 if form_data.get(f"bold_{test_id}_{p_id_param}") else 0
+
                 # Locking: only allow setting the parameter result if it isn't already saved.
                 cursor.execute("""
                     SELECT result_value FROM patient_parameter_results 
@@ -5701,11 +5854,11 @@ async def save_specific_test(patient_id: int, test_id: int, request: Request):
                 existing_param_value = existing_param["result_value"] if existing_param else None
                 if not (existing_param_value and str(existing_param_value).strip()):
                     cursor.execute("""
-                        INSERT INTO patient_parameter_results (patient_id, test_id, parameter_id, result_value)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO patient_parameter_results (patient_id, test_id, parameter_id, result_value, is_bold)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT(patient_id, test_id, parameter_id) 
-                        DO UPDATE SET result_value = ?
-                    """, (patient_id, test_id, p_id_param, value, value))
+                        DO UPDATE SET result_value = ?, is_bold = ?
+                    """, (patient_id, test_id, p_id_param, value, is_bold_flag, value, is_bold_flag))
         elif key.startswith("result_"):
             # Locking: only allow setting the result if it isn't already saved.
             cursor.execute("SELECT result FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?", (patient_id, test_id))
@@ -5720,6 +5873,16 @@ async def save_specific_test(patient_id: int, test_id: int, request: Request):
 
     # Automatically calculate derived parameters (LDL/VLDL/ratio/eGFR).
     calculate_and_save_derived_results(cursor, patient_id, test_id)
+
+    # Persist the "Hide ABST" preference for culture tests. The checkbox is
+    # only rendered for culture/sensitivity tests, so for every other test
+    # this simply writes 0 and changes nothing observable.
+    hide_abst_flag = 1 if form_data.get("hide_abst") else 0
+    try:
+        cursor.execute("UPDATE patient_assigned_tests SET hide_abst = ? WHERE patient_id = ? AND test_id = ?",
+                       (hide_abst_flag, patient_id, test_id))
+    except Exception:
+        pass
 
     # Persist the exact time this test's results were saved.
     cursor.execute("UPDATE patient_assigned_tests SET saved_at = ? WHERE patient_id = ? AND test_id = ?",
@@ -7231,9 +7394,15 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     main_result_val = ""
     comment_text = ""
     saved_at_value = None
+    # Set from the "Hide ABST Section (No Growth / Not Applicable)" toggle on
+    # the Result Entry screen. Use this to gate any antibiotic-susceptibility
+    # block: `if not hide_abst: ...render ABST table...`
+    hide_abst = False
     
     if assigned_res:
         assigned_keys = assigned_res.keys()
+        if "hide_abst" in assigned_keys:
+            hide_abst = bool(int(assigned_res["hide_abst"] or 0))
         if "result" in assigned_keys and assigned_res["result"]:
             main_result_val = str(assigned_res["result"])
             
@@ -7339,10 +7508,13 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             matched=select_best_ref_range(cursor,int(p_id),patient_gender,patient_age_days) if p_id is not None else None
             ref_range=matched or default_ref
             res="-"
+            result_marked_bold = False
             try:
-                cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",(patient_id,test_id,p_id))
+                cursor.execute("SELECT result_value, COALESCE(is_bold, 0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",(patient_id,test_id,p_id))
                 rr=cursor.fetchone()
                 if rr and rr["result_value"] is not None and str(rr["result_value"]).strip(): res=str(rr["result_value"]).strip()
+                if rr:
+                    result_marked_bold = bool(int(rr["is_bold"] or 0))
             except sqlite3.Error:
                 try:
                     cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id=? AND parameter_id=? LIMIT 1",(patient_id,p_id))
@@ -7369,7 +7541,10 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
             flag,is_abnormal=evaluate_result_flag(res,ref_range)
             if fia_result_value is None:
                 fia_result_value = _try_float(res)
-            result_weight="bold" if is_abnormal else "normal"
+            # Bold the result value when it is out of range (existing
+            # behaviour) OR when the operator explicitly ticked "Bold" for
+            # this specific result on the Result Entry screen.
+            result_weight="bold" if (is_abnormal or result_marked_bold) else "normal"
             investigation_weight="bold" if int(d.get("is_bold", 0) or 0) else "normal"
             cells = [
                 (html.escape(p_name), align_inv, investigation_weight, "#000"),
