@@ -474,6 +474,14 @@ DEFAULT_PRINT_SETTINGS = {
     "fia_margin_left_px": 0,
     "fia_margin_right_px": 0,
     "category_note_font_size": 10,
+    # Signature image fine-tuning (admin-adjustable from Print Settings).
+    # Negative margins are intentionally allowed so the gap between the
+    # signature image and the name/details below it can be tightened.
+    "sig_margin_top_px": -45,
+    "sig_margin_bottom_px": -32,
+    "sig_margin_left_px": 10,
+    "sig_margin_right_px": 0,
+    "sig_img_height_px": 135,
 }
 
 
@@ -495,7 +503,8 @@ def get_print_settings() -> dict:
                    mlt_signature_font_size_px, mlt_details_font_size_px,
                    show_printed_on,
                    fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px,
-                   category_note_font_size
+                   category_note_font_size,
+                   sig_margin_top_px, sig_margin_bottom_px, sig_margin_left_px, sig_margin_right_px, sig_img_height_px
             FROM system_print_settings WHERE id = 1
         """)
         row = cursor.fetchone()
@@ -1142,6 +1151,60 @@ def delete_user(user_id: int, request: Request):
 
 # -----------------------------
 # HELPER FUNCTIONS
+def parse_age_components(age_raw: str):
+    """Parse a free-text age string into (years, months, days, ok).
+
+    Infant/child safe. The previous inline parser used an *optional* year
+    suffix, so a bare number followed by a month/day unit was also swallowed
+    by the year pattern - "5 D" parsed as 5 YEARS and 5 days, "8 months" as
+    8 years and 8 months, "15 days" as 15 years. That silently corrupted
+    infant records and broke every age-aware reference range for paediatric
+    patients using the legacy free-text age path.
+
+    The fix: each unit is matched with an explicit, mandatory suffix, and a
+    bare number (no unit at all) is the ONLY case treated as years.
+
+    Accepts: "25", "25 Y", "25Y 3M", "0Y 3M 5D", "3M", "5 D", "8 months",
+             "15 days", "1Y 6M 20D".
+    Returns ok=False only when the string is non-empty and unparseable.
+    """
+    text = str(age_raw or "").strip()
+    if not text:
+        return 0, 0, 0, True
+
+    # Explicit, mandatory unit suffixes. Order matters inside each
+    # alternation: longest spelling first so "months" isn't cut to "m".
+    y_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:years|year|yrs|yr|y)\b", text, re.I)
+    m_match = re.search(r"(\d+)\s*(?:months|month|mos|mo|m)\b", text, re.I)
+    d_match = re.search(r"(\d+)\s*(?:days|day|d)\b", text, re.I)
+
+    age_years = age_months = age_days = 0
+    matched_any = False
+
+    if y_match:
+        matched_any = True
+        try:
+            age_years = max(0, int(float(y_match.group(1))))
+        except (TypeError, ValueError):
+            age_years = 0
+    if m_match:
+        matched_any = True
+        age_months = max(0, min(11, int(m_match.group(1))))
+    if d_match:
+        matched_any = True
+        age_days = max(0, min(30, int(d_match.group(1))))
+
+    if not matched_any:
+        # No unit anywhere - a bare number means years.
+        plain = re.fullmatch(r"\d+(?:\.\d+)?", text)
+        if not plain:
+            return 0, 0, 0, False
+        age_years = max(0, int(float(text)))
+
+    return age_years, age_months, age_days, True
+
+
+
 # -----------------------------
 def clean_display_range(ref_range, unit):
     if not ref_range:
@@ -1577,6 +1640,35 @@ def init_db():
         pass
     try:
         cursor.execute("ALTER TABLE system_print_settings ADD COLUMN category_note_font_size INTEGER DEFAULT 10")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    # Signature image fine-tuning columns. Additive only - existing rows
+    # take the DEFAULT, so current reports render exactly as before until
+    # an admin changes a value.
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_top_px INTEGER DEFAULT -45")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_bottom_px INTEGER DEFAULT -32")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_left_px INTEGER DEFAULT 10")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_right_px INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_img_height_px INTEGER DEFAULT 135")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -6718,27 +6810,17 @@ async def update_patient_details(request: Request):
         elif age_raw:
             # Legacy free-text fallback. Normalize into the columns used by
             # the dynamic reference-range and eGFR logic. Supports: `25`,
-            # `25 Y`, `25Y 3M`, and `25Y 3M 5D`.
-            y_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:y|yr|yrs|year|years)?\b", age_raw, re.I)
-            m_match = re.search(r"(\d+)\s*(?:m|mo|mos|month|months)\b", age_raw, re.I)
-            d_match = re.search(r"(\d+)\s*(?:d|day|days)\b", age_raw, re.I)
-
-            # A plain numeric value means years.
-            if y_match:
-                try:
-                    age_years = int(float(y_match.group(1)))
-                except (TypeError, ValueError):
-                    age_years = 0
-            if m_match:
-                age_months = max(0, min(11, int(m_match.group(1))))
-            if d_match:
-                age_days = max(0, min(30, int(d_match.group(1))))
-
-            if not (y_match or m_match or d_match):
-                plain = re.fullmatch(r"\d+(?:\.\d+)?", age_raw)
-                if not plain:
-                    return HTMLResponse("<h3>Invalid age format!</h3><p>Use e.g. 25 Y or 25Y 3M.</p><a href='/patient-results/%s'>Go Back</a>" % patient_id, status_code=400)
-                age_years = int(float(age_raw))
+            # `25 Y`, `25Y 3M`, `25Y 3M 5D`, and infant forms like `3M`,
+            # `5 D`, `8 months`, `15 days`.
+            #
+            # Parsing is delegated to parse_age_components(), which requires
+            # an explicit unit suffix. The previous inline regex treated the
+            # year suffix as optional, so "5 D" became 5 YEARS 5 days and
+            # "8 months" became 8 years 8 months - silently corrupting every
+            # infant record that came through this path.
+            age_years, age_months, age_days, age_ok = parse_age_components(age_raw)
+            if not age_ok:
+                return HTMLResponse("<h3>Invalid age format!</h3><p>Use e.g. 25 Y, 25Y 3M, or 0Y 3M 5D.</p><a href='/patient-results/%s'>Go Back</a>" % patient_id, status_code=400)
 
             # Keep the legacy `age` field numeric for compatibility with the
             # existing schema and older code paths.
@@ -7439,6 +7521,45 @@ def print_settings_page(request: Request, saved: int = 0):
                     </div>
 
                     <h3 style="color:#0f4c81; font-size:15px; margin:26px 0 4px 0; border-top:1px solid #e2e8f0; padding-top:18px;">
+                        ✍️ MLT Signature Fine-Tuning
+                    </h3>
+                    <p style="color:#64748b; font-size:12px; margin-top:-2px;">
+                        Fine-tune the signature image's position and size on the report - no CSS editing needed. Negative values are allowed (e.g. -50 to +50).
+                    </p>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Signature Margin Top (px)</label>
+                            <input type="number" name="sig_margin_top_px" min="-50" max="50" step="1" value="{s['sig_margin_top_px']}">
+                            <span class="hint">Positive = nudge down, negative = nudge up.</span>
+                        </div>
+                        <div class="field">
+                            <label>Signature Margin Bottom (px)</label>
+                            <input type="number" name="sig_margin_bottom_px" min="-50" max="50" step="1" value="{s['sig_margin_bottom_px']}">
+                            <span class="hint">Use negative values like -30px to reduce the gap between the signature image and the name/details text below it.</span>
+                        </div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Signature Margin Left (px)</label>
+                            <input type="number" name="sig_margin_left_px" min="-50" max="50" step="1" value="{s['sig_margin_left_px']}">
+                            <span class="hint">Positive = nudge right, negative = nudge left.</span>
+                        </div>
+                        <div class="field">
+                            <label>Signature Margin Right (px)</label>
+                            <input type="number" name="sig_margin_right_px" min="-50" max="50" step="1" value="{s['sig_margin_right_px']}">
+                            <span class="hint">Extra space reserved to the right of the signature image.</span>
+                        </div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field">
+                            <label>Signature Height (px)</label>
+                            <input type="number" name="sig_img_height_px" min="20" max="200" step="1" value="{s['sig_img_height_px']}">
+                            <span class="hint">Scales the signature image's rendered height (width adjusts proportionally via object-fit: contain).</span>
+                        </div>
+                        <div class="field"></div>
+                    </div>
+
+                    <h3 style="color:#0f4c81; font-size:15px; margin:26px 0 4px 0; border-top:1px solid #e2e8f0; padding-top:18px;">
                         <i class="fa-solid fa-arrows-up-down-left-right"></i> FIA Graph Box Position
                     </h3>
                     <p style="color:#64748b; font-size:12px; margin-top:-2px;">
@@ -7507,6 +7628,11 @@ async def print_settings_save(request: Request):
     fia_margin_left_px = int(_clamp(form_data.get("fia_margin_left_px"), -100, 100, DEFAULT_PRINT_SETTINGS["fia_margin_left_px"]))
     fia_margin_right_px = int(_clamp(form_data.get("fia_margin_right_px"), -50, 100, DEFAULT_PRINT_SETTINGS["fia_margin_right_px"]))
     category_note_font_size = int(_clamp(form_data.get("category_note_font_size"), 6, 20, DEFAULT_PRINT_SETTINGS["category_note_font_size"]))
+    sig_margin_top_px = int(_clamp(form_data.get("sig_margin_top_px"), -50, 50, DEFAULT_PRINT_SETTINGS["sig_margin_top_px"]))
+    sig_margin_bottom_px = int(_clamp(form_data.get("sig_margin_bottom_px"), -50, 50, DEFAULT_PRINT_SETTINGS["sig_margin_bottom_px"]))
+    sig_margin_left_px = int(_clamp(form_data.get("sig_margin_left_px"), -50, 50, DEFAULT_PRINT_SETTINGS["sig_margin_left_px"]))
+    sig_margin_right_px = int(_clamp(form_data.get("sig_margin_right_px"), -50, 50, DEFAULT_PRINT_SETTINGS["sig_margin_right_px"]))
+    sig_img_height_px = int(_clamp(form_data.get("sig_img_height_px"), 20, 200, DEFAULT_PRINT_SETTINGS["sig_img_height_px"]))
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -7518,6 +7644,7 @@ async def print_settings_save(request: Request):
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             fia_margin_top_px = ?, fia_margin_bottom_px = ?, fia_margin_left_px = ?, fia_margin_right_px = ?,
             category_note_font_size = ?,
+            sig_margin_top_px = ?, sig_margin_bottom_px = ?, sig_margin_left_px = ?, sig_margin_right_px = ?, sig_img_height_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (row_padding_px, base_font_size_px, header_font_size_px, line_height,
@@ -7526,6 +7653,7 @@ async def print_settings_save(request: Request):
           mlt_signature_font_size_px, mlt_details_font_size_px,
           fia_margin_top_px, fia_margin_bottom_px, fia_margin_left_px, fia_margin_right_px,
           category_note_font_size,
+          sig_margin_top_px, sig_margin_bottom_px, sig_margin_left_px, sig_margin_right_px, sig_img_height_px,
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -7550,6 +7678,7 @@ def print_settings_reset(request: Request):
             mlt_signature_font_size_px = ?, mlt_details_font_size_px = ?,
             fia_margin_top_px = ?, fia_margin_bottom_px = ?, fia_margin_left_px = ?, fia_margin_right_px = ?,
             category_note_font_size = ?,
+            sig_margin_top_px = ?, sig_margin_bottom_px = ?, sig_margin_left_px = ?, sig_margin_right_px = ?, sig_img_height_px = ?,
             updated_at = ?
         WHERE id = 1
     """, (d["row_padding_px"], d["base_font_size_px"], d["header_font_size_px"],
@@ -7558,6 +7687,7 @@ def print_settings_reset(request: Request):
           d["mlt_signature_font_size_px"], d["mlt_details_font_size_px"],
           d["fia_margin_top_px"], d["fia_margin_bottom_px"], d["fia_margin_left_px"], d["fia_margin_right_px"],
           d["category_note_font_size"],
+          d["sig_margin_top_px"], d["sig_margin_bottom_px"], d["sig_margin_left_px"], d["sig_margin_right_px"], d["sig_img_height_px"],
           now_colombo().isoformat(timespec="seconds")))
     conn.commit()
     conn.close()
@@ -7581,6 +7711,21 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
     print_settings = get_print_settings()
     if letterhead is None:
         letterhead = print_settings["default_letterhead"]
+
+    # Computed once here as plain, literal inline pixel values (no calc(),
+    # no CSS var()) and written directly onto the signature <img> tag. An
+    # inline style is required rather than a class/variable because print
+    # and PDF rendering does not reliably resolve CSS custom properties.
+    # Defaults mirror the original hardcoded .sig-img-new rule, so output
+    # is unchanged until an admin edits these in Print Settings.
+    sig_img_inline_style = (
+        f"margin-top: {print_settings['sig_margin_top_px']}px !important; "
+        f"margin-bottom: {print_settings['sig_margin_bottom_px']}px !important; "
+        f"margin-left: {print_settings['sig_margin_left_px']}px !important; "
+        f"margin-right: {print_settings['sig_margin_right_px']}px !important; "
+        f"height: {print_settings['sig_img_height_px']}px !important; "
+        f"position: relative;"
+    )
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -8510,7 +8655,7 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
                         <img src="{qr_url}" alt="QR Code">
                     </div>
                     <div class="sig-wrapper-new">
-                        <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" onerror="this.style.display='none';">
+                        <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" style="{sig_img_inline_style}" onerror="this.style.display='none';">
                         <b class="mlt-name">S.P.Jananga</b>
                         <span class="mlt-details" style="color: #222;">Medical Laboratory Technologist (MLT)</span>
                         <span class="mlt-details" style="color: #444;">SLMC No 2867</span>
