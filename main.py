@@ -5,6 +5,7 @@ import re
 import html
 import threading
 import secrets
+import hashlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -409,6 +410,48 @@ SUPER_ADMIN_USERNAME = "admin"
 def is_super_admin(user: dict) -> bool:
     """True for the built-in primary admin account only."""
     return (user or {}).get("username", "").strip().lower() == SUPER_ADMIN_USERNAME
+
+
+# -------------------------------------------------------------
+# PASSWORD HASHING (stdlib-only PBKDF2-HMAC-SHA256, no passlib/bcrypt
+# dependency required) + legacy-plaintext auto-migration on login.
+# -------------------------------------------------------------
+_PBKDF2_ITERATIONS = 260000
+
+
+def hash_password(password: str) -> str:
+    """Self-describing hash string so a future algorithm change stays
+    backward compatible: 'pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>'."""
+    salt = secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${_PBKDF2_ITERATIONS}${salt.hex()}${derived.hex()}"
+
+
+def is_hashed_password(stored: str) -> bool:
+    return isinstance(stored, str) and stored.startswith("pbkdf2_sha256$")
+
+
+def verify_password(stored: str, provided: str) -> bool:
+    """Verifies `provided` against `stored`, whether `stored` is already
+    one of our pbkdf2_sha256$... hashes or (for not-yet-migrated legacy
+    rows) a plain-text password. Never raises on malformed stored values -
+    just fails closed. Uses a constant-time comparison for the actual
+    hash/plaintext check to avoid timing side channels."""
+    if not stored or provided is None:
+        return False
+    if is_hashed_password(stored):
+        try:
+            _, iterations_str, salt_hex, hash_hex = stored.split("$", 3)
+            iterations = int(iterations_str)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+        except (ValueError, TypeError):
+            return False
+        derived = hashlib.pbkdf2_hmac("sha256", provided.encode("utf-8"), salt, iterations)
+        return secrets.compare_digest(derived, expected)
+    # Legacy plaintext row - direct comparison. The caller (login_post)
+    # re-hashes and saves the upgraded value on a successful match.
+    return secrets.compare_digest(stored, provided)
 
 # -------------------------------------------------------------
 # PRINT LAYOUT SETTINGS (dashboard-configurable report styling)
@@ -847,21 +890,33 @@ async def login_post(request: Request):
             )
         """)
         
-        cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
         user = cursor.fetchone()
-        conn.close()
-        
-        if user:
+
+        if user and verify_password(user["password"], password):
+            # Legacy-plaintext auto-migration: if the stored value wasn't
+            # already one of our pbkdf2_sha256$... hashes, upgrade it now
+            # that we've just verified the plaintext password was correct.
+            # One-time, silent, on the very next successful login for that
+            # account - nothing else about the row changes.
+            if not is_hashed_password(user["password"]):
+                cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), user["id"]))
+                conn.commit()
+
             # Role එකක් නැත්නම් default 'MLT' විදිහට ගන්නවා
             user_role = user["role"] if "role" in user.keys() and user["role"] else "MLT"
             user_permissions = user["permissions"] if "permissions" in user.keys() and user["permissions"] else ""
             
+            conn.close()
+
             # හැමෝම Dashboard එකට යවනවා සහ Cookies සෙට් කරනවා
             resp = RedirectResponse(url="/dashboard", status_code=303)
             resp.set_cookie(key="username", value=username)
             resp.set_cookie(key="role", value=user_role)
             resp.set_cookie(key="permissions", value=user_permissions)
             return resp
+
+        conn.close()
             
     except Exception as e:
         pass
@@ -901,7 +956,7 @@ async def add_user(request: Request):
         cursor.execute(
             f"INSERT INTO users (username, password, role, permissions, {col_sql}) "
             f"VALUES (?, ?, ?, ?, {placeholders})",
-            tuple([username, password, role, permissions_str] + flag_values)
+            tuple([username, hash_password(password), role, permissions_str] + flag_values)
         )
         conn.commit()
         conn.close()
@@ -988,6 +1043,10 @@ def edit_user_page(user_id: int, request: Request):
                         </select>
                     </div>
                     <div class="form-group">
+                        <label>Reset Password (leave blank to keep current password)</label>
+                        <input type="password" name="new_password" class="form-control" placeholder="New password" autocomplete="new-password">
+                    </div>
+                    <div class="form-group">
                         <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
                         {checkboxes_html}
                     </div>
@@ -1013,6 +1072,7 @@ async def edit_user_post(user_id: int, request: Request):
 
     form_data = await request.form()
     role = form_data.get("role", "").strip()
+    new_password = (form_data.get("new_password", "") or "").strip()
     selected_permissions = form_data.getlist("permissions")
     permissions_str = ",".join(p for p in selected_permissions if p in PERMISSIONS)
 
@@ -1032,19 +1092,49 @@ async def edit_user_post(user_id: int, request: Request):
     flag_values = [1 if form_data.get(col) else 0 for col in flag_cols]
     flag_set_sql = ", ".join(f"{col} = ?" for col in flag_cols)
 
-    cursor.execute(
-        f"UPDATE users SET role = ?, permissions = ?, {flag_set_sql} WHERE id = ?",
-        tuple([role, permissions_str] + flag_values + [user_id])
-    )
+    if new_password:
+        cursor.execute(
+            f"UPDATE users SET role = ?, permissions = ?, password = ?, {flag_set_sql} WHERE id = ?",
+            tuple([role, permissions_str, hash_password(new_password)] + flag_values + [user_id])
+        )
+    else:
+        cursor.execute(
+            f"UPDATE users SET role = ?, permissions = ?, {flag_set_sql} WHERE id = ?",
+            tuple([role, permissions_str] + flag_values + [user_id])
+        )
     conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-users", status_code=303)
 
 @app.get("/delete-user/{user_id}")
-def delete_user(user_id: int):
+def delete_user(user_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
+        return render_locked_page("Manage Users")
+
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+    target = cursor.fetchone()
+    if not target:
+        conn.close()
+        return RedirectResponse(url="/manage-users", status_code=303)
+
+    target_username = str(target["username"] or "").strip()
+
     # The primary super admin can never be deleted through the UI.
+    if target_username.lower() == SUPER_ADMIN_USERNAME:
+        conn.close()
+        return RedirectResponse(url="/manage-users", status_code=303)
+
+    # Self-deletion guard: a logged-in user can't delete their own active
+    # account (which would otherwise leave their session pointing at a
+    # user row that no longer exists).
+    if target_username.lower() == (current_user.get("username") or "").strip().lower():
+        conn.close()
+        return RedirectResponse(url="/manage-users?error=self_delete", status_code=303)
+
     cursor.execute("DELETE FROM users WHERE id = ? AND username != ?", (user_id, SUPER_ADMIN_USERNAME))
     conn.commit()
     conn.close()
@@ -6141,10 +6231,30 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     p_title = p.get("title") or p.get("salutation") or ""
     p_name = p.get("name") or p.get("patient_name") or p.get("full_name") or ""
     p_age = p.get("age") or p.get("age_years") or p.get("patient_age") or ""
+    # Separate Years/Months/Days, mirroring test_entry_page()'s _age_part()
+    # helper, so infant/child ages entered in months or days round-trip
+    # correctly here too instead of collapsing into one "years" box.
+    def _age_part(key):
+        try:
+            value = p.get(key)
+            return max(0, int(float(value))) if value not in (None, "") else 0
+        except (TypeError, ValueError):
+            return 0
+    p_age_years = _age_part("age_years")
+    p_age_months = _age_part("age_months")
+    p_age_days = _age_part("age_days")
+    if p_age_years == 0 and p_age_months == 0 and p_age_days == 0:
+        p_age_years = _age_part("age")
     p_gender = p.get("gender") or p.get("sex") or "Male"
     p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
     p_doctor = p.get("doctor") or p.get("doctor_name") or p.get("ref_doctor") or ""
     p_center = p.get("center") or p.get("branch") or ""
+
+    # Needed for the same gender/age-aware reference-range lookup that
+    # test_entry_page() already uses, so a parameter's correct range shows
+    # up immediately here too instead of only after visiting report_view.
+    patient_age_days = patient_age_to_days(p)
+    patient_gender_val = p.get("gender") or ""
 
     # 2. Fetch Assigned Tests with Categories safely
     try:
@@ -6201,40 +6311,27 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 main_result = t["result"] if t["result"] else ""
                 test_comment = t["comment"] if "comment" in t.keys() and t["comment"] else ""
                 
-                # Fetch parameters dynamically, respecting the saved custom
-                # display order. Tries "display_order ASC, id ASC" first;
-                # only falls back to the old "id ASC" ordering if the
-                # candidate table/column combination doesn't have a
-                # display_order column (legacy schema compatibility - same
-                # defensive try/except pattern already used for
-                # default_result below).
+                # Fetch parameters straight from test_parameters, respecting
+                # the saved custom display order and pulling unit/ref_range
+                # too - same query test_entry_page() uses, so both Result
+                # Entry screens show identical reference ranges immediately
+                # on load instead of one of them needing a report_view visit
+                # or a Reset first to "discover" this data.
                 params = []
-                for tbl in ["test_parameters", "parameters", "sub_tests", "test_fields"]:
-                    for col in ["parameter_name", "name", "param_name"]:
-                        try:
-                            cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY display_order ASC, id ASC", (t_id,))
-                            params = cursor.fetchall()
-                            if params: break
-                        except:
-                            try:
-                                cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
-                                params = cursor.fetchall()
-                                if params: break
-                            except:
-                                try:
-                                    cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY display_order ASC, id ASC", (t_id,))
-                                    params = cursor.fetchall()
-                                    if params: break
-                                except:
-                                    try:
-                                        cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
-                                        params = cursor.fetchall()
-                                        if params: break
-                                    except:
-                                        continue
-                    if params: break
+                try:
+                    cursor.execute("""
+                        SELECT id, param_name AS p_name, unit, ref_range,
+                               COALESCE(display_order, 0) AS display_order,
+                               COALESCE(default_result, '') AS default_ref_range
+                        FROM test_parameters
+                        WHERE test_id = ?
+                        ORDER BY display_order ASC, id ASC
+                    """, (t_id,))
+                    params = cursor.fetchall()
+                except sqlite3.Error:
+                    params = []
                 
-                # Pre-fetch existing parameter values & determine lock status
+                # Pre-fetch existing parameter values, bold flag & lock status
                 param_values = []
                 has_saved_param_value = False
                 for p_item in params:
@@ -6246,16 +6343,43 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                     # there's nothing meaningful to type into a separator.
                     if str(p_name_val or "").strip() in {"", ".", "-", "_"}:
                         continue
+                    unit_val = p_item["unit"] or ""
                     default_val = p_item["default_ref_range"] if "default_ref_range" in p_item.keys() and p_item["default_ref_range"] else ""
-                    p_val = ""
+
+                    # Patient-specific reference range wins over the
+                    # parameter's own default, exactly like test_entry_page.
+                    selected_ref = None
                     try:
-                        cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id = ? AND test_id = ? AND parameter_id = ?", (patient_id, t_id, p_id_param))
+                        selected_ref = select_best_ref_range(cursor, p_id_param, patient_gender_val, patient_age_days)
+                    except Exception:
+                        selected_ref = None
+                    if not selected_ref:
+                        selected_ref = p_item["ref_range"] or ""
+
+                    p_val = ""
+                    p_is_bold = 0
+                    try:
+                        cursor.execute(
+                            "SELECT result_value, COALESCE(is_bold, 0) AS is_bold FROM patient_parameter_results "
+                            "WHERE patient_id = ? AND test_id = ? AND parameter_id = ?",
+                            (patient_id, t_id, p_id_param)
+                        )
                         exist_res = cursor.fetchone()
-                        if exist_res: p_val = exist_res["result_value"]
-                    except: pass
+                        if exist_res:
+                            if exist_res["result_value"] is not None:
+                                p_val = exist_res["result_value"]
+                            p_is_bold = int(exist_res["is_bold"] or 0)
+                    except Exception:
+                        # Older database without the is_bold column - fall
+                        # back to the value-only query.
+                        try:
+                            cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id = ? AND test_id = ? AND parameter_id = ?", (patient_id, t_id, p_id_param))
+                            exist_res = cursor.fetchone()
+                            if exist_res: p_val = exist_res["result_value"]
+                        except: pass
                     if p_val and str(p_val).strip():
                         has_saved_param_value = True
-                    param_values.append((p_id_param, p_name_val, default_val, p_val))
+                    param_values.append((p_id_param, p_name_val, default_val, p_val, unit_val, selected_ref, p_is_bold))
 
                 has_results = bool(main_result and str(main_result).strip()) or has_saved_param_value
 
@@ -6300,14 +6424,31 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 """
                 
                 if params:
-                    categories_html += f"""<div style="display: grid; gap: 4px; margin-bottom: 8px;">"""
-                    for p_id_param, p_name_val, default_val, p_val in param_values:
+                    categories_html += f"""
+                    <div style="display: grid; grid-template-columns: minmax(140px,1.6fr) minmax(90px,1.8fr) 50px 60px minmax(90px,1.3fr); gap:8px; padding-bottom:4px; margin-bottom:4px; border-bottom:1px solid #e2e8f0; font-size:10px; font-weight:700; color:#94a3b8; text-transform:uppercase; letter-spacing:0.3px;">
+                        <span>Parameter</span><span>Result</span><span style="text-align:center;">Bold</span><span>Unit</span><span>Ref. Range</span>
+                    </div>
+                    <div style="display: grid; gap: 4px; margin-bottom: 8px;">"""
+                    for p_id_param, p_name_val, default_val, p_val, unit_val, selected_ref, p_is_bold in param_values:
                         final_val = p_val if p_val != "" else default_val
-                        
+
+                        bold_disabled = ' disabled' if has_results else ''
+                        bold_checked = ' checked' if p_is_bold else ''
+                        ref_html = (
+                            f'<span style="font-size:11px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="{html.escape(str(selected_ref))}">{html.escape(str(selected_ref))}</span>'
+                            if selected_ref else '<span></span>'
+                        )
+                        unit_html = f'<span style="font-size:11.5px;color:#64748b;">{html.escape(str(unit_val))}</span>' if unit_val else '<span></span>'
+
                         categories_html += f"""
-                        <div style="display: flex; align-items: center; gap: 12px; padding: 2px 0;">
-                            <label style="flex: 1; font-size: 13px; font-weight: 600; color: #475569;">{p_name_val}</label>
-                            <input type="text" name="param_{t_id}_{p_id_param}" value="{final_val}" placeholder="Result..." class="param-input" onkeydown="handleParamKeyNav(event, this)" {value_input_attr}>
+                        <div style="display: grid; grid-template-columns: minmax(140px,1.6fr) minmax(90px,1.8fr) 50px 60px minmax(90px,1.3fr); align-items: center; gap: 8px; padding: 2px 0;">
+                            <label style="font-size: 13px; font-weight: 600; color: #475569;">{html.escape(str(p_name_val))}</label>
+                            <input type="text" name="param_{t_id}_{p_id_param}" value="{html.escape(str(final_val))}" placeholder="Result..." class="param-input" onkeydown="handleParamKeyNav(event, this)" {value_input_attr}>
+                            <label style="display:flex;align-items:center;gap:3px;font-size:10.5px;color:#64748b;cursor:{'not-allowed' if has_results else 'pointer'};white-space:nowrap;" title="Print this result in bold on the report">
+                                <input type="checkbox" name="bold_{t_id}_{p_id_param}" value="1"{bold_checked}{bold_disabled} style="width:12px;height:12px;margin:0;">Bold
+                            </label>
+                            {unit_html}
+                            {ref_html}
                         </div>
                         """
                     categories_html += "</div>"
@@ -6461,8 +6602,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                                 </select>
                             </div>
                             <div class="form-group">
-                                <label>Age</label>
-                                <input type="text" name="age" value="{p_age}" placeholder="e.g. 25 Y">
+                                <label>Age (Years / Months / Days)</label>
+                                <div style="display:flex; gap:6px;">
+                                    <input type="number" name="age_years" min="0" value="{p_age_years}" title="Years" placeholder="Y" style="width:100%; padding:9px 6px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; box-sizing:border-box; text-align:center; background:#f8fafc;">
+                                    <input type="number" name="age_months" min="0" max="11" value="{p_age_months}" title="Months" placeholder="M" style="width:100%; padding:9px 6px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; box-sizing:border-box; text-align:center; background:#f8fafc;">
+                                    <input type="number" name="age_days" min="0" max="30" value="{p_age_days}" title="Days" placeholder="D" style="width:100%; padding:9px 6px; border:1px solid #cbd5e1; border-radius:8px; font-size:13px; box-sizing:border-box; text-align:center; background:#f8fafc;">
+                                </div>
                             </div>
                         </div>
                         <div class="form-group">
@@ -6514,12 +6659,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
 async def update_patient_details(request: Request):
     """Persist demographic edits made from Result Entry / Patient Results.
 
-    The Result Entry form submits one human-readable `age` field (for example
-    `25 Y`), while the report/reference-range logic uses the normalized
-    age_years/age_months/age_days columns. The previous handler only updated
-    `age`, leaving `age_years` unchanged, so the screen could appear to save
-    while reports continued using the old age. This handler updates both the
-    legacy/display age and the normalized age columns in one transaction.
+    The form now submits direct age_years/age_months/age_days number
+    fields (matching test_entry_page()'s "Patient Details" form), which
+    map straight onto the normalized columns the report/reference-range
+    logic uses. The legacy single free-text `age` field (e.g. "25 Y") is
+    still accepted and parsed the same way as before, purely so any other
+    caller still posting the old format keeps working.
     """
     if not user_can(get_current_user(request), "can_edit_patients"):
         return render_locked_page("Update Patient Details")
@@ -6538,6 +6683,9 @@ async def update_patient_details(request: Request):
         title = (form_data.get("title") or "").strip()
         name = (form_data.get("name") or "").strip()
         age_raw = (form_data.get("age") or "").strip()
+        age_years_raw = (form_data.get("age_years") or "").strip()
+        age_months_raw = (form_data.get("age_months") or "").strip()
+        age_days_raw = (form_data.get("age_days") or "").strip()
         gender = (form_data.get("gender") or "").strip()
         phone = (form_data.get("phone") or "").strip()
         doctor = (form_data.get("doctor") or "").strip()
@@ -6546,14 +6694,31 @@ async def update_patient_details(request: Request):
         if not name:
             return HTMLResponse("<h3>Patient name is required!</h3>", status_code=400)
 
-        # Normalize the editable age field into the columns used by the
-        # dynamic reference-range and eGFR logic. Supports: `25`, `25 Y`,
-        # `25Y 3M`, and `25Y 3M 5D`. Empty age is allowed.
         age_years = 0
         age_months = 0
         age_days = 0
         age_db_value = None
-        if age_raw:
+
+        if age_years_raw != "" or age_months_raw != "" or age_days_raw != "":
+            # Direct Years/Months/Days fields were submitted - use them
+            # straight, clamped to sane ranges.
+            try:
+                age_years = max(0, int(float(age_years_raw))) if age_years_raw else 0
+            except (TypeError, ValueError):
+                age_years = 0
+            try:
+                age_months = max(0, min(11, int(float(age_months_raw)))) if age_months_raw else 0
+            except (TypeError, ValueError):
+                age_months = 0
+            try:
+                age_days = max(0, min(30, int(float(age_days_raw)))) if age_days_raw else 0
+            except (TypeError, ValueError):
+                age_days = 0
+            age_db_value = age_years
+        elif age_raw:
+            # Legacy free-text fallback. Normalize into the columns used by
+            # the dynamic reference-range and eGFR logic. Supports: `25`,
+            # `25 Y`, `25Y 3M`, and `25Y 3M 5D`.
             y_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:y|yr|yrs|year|years)?\b", age_raw, re.I)
             m_match = re.search(r"(\d+)\s*(?:m|mo|mos|month|months)\b", age_raw, re.I)
             d_match = re.search(r"(\d+)\s*(?:d|day|days)\b", age_raw, re.I)
@@ -6736,6 +6901,12 @@ async def save_test_results(request: Request):
                 test_id = parts[1]
                 param_id = parts[2]
 
+                # An unchecked checkbox is simply absent from the POST
+                # body, so the bold flag is derived from presence of
+                # bold_<test>_<param> - same convention save_specific_test()
+                # (test_entry_page's save handler) already uses.
+                is_bold_flag = 1 if form_data.get(f"bold_{test_id}_{param_id}") else 0
+
                 # Locking: only allow setting the parameter result if it isn't already saved.
                 cursor.execute("""
                     SELECT result_value FROM patient_parameter_results 
@@ -6745,10 +6916,10 @@ async def save_test_results(request: Request):
                 existing_param_value = existing_param["result_value"] if existing_param else None
                 if not (existing_param_value and str(existing_param_value).strip()):
                     cursor.execute("""
-                        INSERT INTO patient_parameter_results (patient_id, test_id, parameter_id, result_value)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT(patient_id, test_id, parameter_id) DO UPDATE SET result_value = excluded.result_value
-                    """, (patient_id, test_id, param_id, value))
+                        INSERT INTO patient_parameter_results (patient_id, test_id, parameter_id, result_value, is_bold)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(patient_id, test_id, parameter_id) DO UPDATE SET result_value = excluded.result_value, is_bold = excluded.is_bold
+                    """, (patient_id, test_id, param_id, value, is_bold_flag))
 
         # Calculate all derived parameters after the manual inputs are saved.
         # If this request contains several tests, calculate each affected test.
