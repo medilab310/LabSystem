@@ -384,6 +384,33 @@ PERMISSIONS = {
 }
 
 # -------------------------------------------------------------
+# GRANULAR PERMISSION FLAGS (dedicated integer columns on `users`)
+# -------------------------------------------------------------
+# These are stored as real INTEGER columns rather than inside the
+# comma-separated `permissions` text column above, and - critically -
+# they are always read back FROM THE DATABASE at check time, never from
+# a cookie. See the note on get_user_flags() below for why that matters.
+#
+# Shape: column_name -> (checkbox label, default value for new users)
+GRANULAR_PERMISSIONS = {
+    "can_cancel_bills":  ("🚫 Special Permission: Allow Bill Cancellation", 0),
+    "can_view_reports":  ("📊 View Sales Analytics & Financial Summaries", 0),
+    "can_edit_results":  ("🧪 Enter / Modify Test Results", 1),
+    "can_edit_patients": ("👤 Update Patient Profile Details", 1),
+    "can_manage_users":  ("👥 Access User Management", 0),
+}
+
+# The primary super-admin account. This username is hidden from every
+# user-management listing and can never be edited or deleted through the
+# UI, but always retains unrestricted access when logged in.
+SUPER_ADMIN_USERNAME = "admin"
+
+
+def is_super_admin(user: dict) -> bool:
+    """True for the built-in primary admin account only."""
+    return (user or {}).get("username", "").strip().lower() == SUPER_ADMIN_USERNAME
+
+# -------------------------------------------------------------
 # PRINT LAYOUT SETTINGS (dashboard-configurable report styling)
 # -------------------------------------------------------------
 DEFAULT_PRINT_SETTINGS = {
@@ -470,6 +497,78 @@ def user_has_access(user: dict, permission_key: str) -> bool:
     if role_lower in FULL_ACCESS_ROLES:
         return True
     return permission_key in user.get("permissions", set())
+
+
+def get_user_flags(username: str) -> dict:
+    """
+    Reads the granular permission columns for `username` straight from the
+    database.
+
+    Deliberately NOT cookie-based. get_current_user() above reads role and
+    permissions from cookies, which the browser owns and a user can edit
+    freely - anyone could set role=owner and bypass every check. For a
+    high-consequence permission like bill cancellation that is not good
+    enough, so these flags are always re-read from the users table at the
+    moment of the check. The cookie is only used to say *which* user to
+    look up, never what they are allowed to do.
+
+    Returns the defaults from GRANULAR_PERMISSIONS if the user row or
+    column is missing, so an older database degrades safely instead of
+    raising.
+    """
+    flags = {col: default for col, (_label, default) in GRANULAR_PERMISSIONS.items()}
+    username = (username or "").strip()
+    if not username:
+        return {col: 0 for col in GRANULAR_PERMISSIONS}
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ? LIMIT 1", (username,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            row_keys = row.keys()
+            for col in GRANULAR_PERMISSIONS:
+                if col in row_keys and row[col] is not None:
+                    flags[col] = int(row[col] or 0)
+    except Exception:
+        pass
+    return flags
+
+
+def user_can(user: dict, flag_column: str) -> bool:
+    """
+    Granular permission check for a single `users.<flag_column>` column.
+
+    Order of precedence:
+      1. The primary super admin always passes.
+      2. Owner/Admin roles always pass (consistent with user_has_access).
+      3. Otherwise the flag must be 1 in the database.
+    """
+    if is_super_admin(user):
+        return True
+    if (user.get("role") or "").strip().lower() in FULL_ACCESS_ROLES:
+        return True
+    return bool(get_user_flags(user.get("username", "")).get(flag_column, 0))
+
+
+def user_can_or_legacy(user: dict, flag_column: str, permission_key: str) -> bool:
+    """
+    Passes if EITHER the new granular flag is set OR the user already holds
+    the equivalent legacy permission key.
+
+    This matters on deploy: the new columns are added with DEFAULT 0, so
+    every pre-existing user starts with can_view_reports = 0 and
+    can_manage_users = 0. Gating those screens on the flag alone would
+    instantly lock out staff who legitimately have access today. The OR
+    keeps them working until an admin ticks the new boxes, while still
+    letting the flag grant access on its own.
+
+    Bill cancellation deliberately does NOT use this - it is checked with
+    user_can() alone, because tightening that specific action is the point
+    of the feature.
+    """
+    return user_can(user, flag_column) or user_has_access(user, permission_key)
 
 
 def render_locked_page(feature_label: str) -> HTMLResponse:
@@ -783,12 +882,26 @@ async def add_user(request: Request):
     selected_permissions = form_data.getlist("permissions")
     permissions_str = ",".join(p for p in selected_permissions if p in PERMISSIONS)
 
+    # Never allow a second account to be created under the reserved
+    # super-admin username - that row is hidden from this UI and must stay
+    # the single built-in account.
+    if username.strip().lower() == SUPER_ADMIN_USERNAME:
+        return RedirectResponse(url="/manage-users", status_code=303)
+
     if username and password and role:
+        # Column names come from the GRANULAR_PERMISSIONS constant (never
+        # from the request), and every value is bound as a ? parameter.
+        flag_cols = list(GRANULAR_PERMISSIONS.keys())
+        flag_values = [1 if form_data.get(col) else 0 for col in flag_cols]
+        col_sql = ", ".join(flag_cols)
+        placeholders = ", ".join("?" for _ in flag_cols)
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO users (username, password, role, permissions) VALUES (?, ?, ?, ?)",
-            (username, password, role, permissions_str)
+            f"INSERT INTO users (username, password, role, permissions, {col_sql}) "
+            f"VALUES (?, ?, ?, ?, {placeholders})",
+            tuple([username, password, role, permissions_str] + flag_values)
         )
         conn.commit()
         conn.close()
@@ -799,7 +912,7 @@ async def add_user(request: Request):
 @app.get("/edit-user/{user_id}", response_class=HTMLResponse)
 def edit_user_page(user_id: int, request: Request):
     current_user = get_current_user(request)
-    if not user_has_access(current_user, "manage_users"):
+    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
         return render_locked_page("Manage Users")
 
     conn = get_db_connection()
@@ -808,6 +921,12 @@ def edit_user_page(user_id: int, request: Request):
     u = cursor.fetchone()
     conn.close()
     if not u:
+        return HTMLResponse("<h3>User not found.</h3><a href='/manage-users'>Back</a>", status_code=404)
+
+    # The primary super admin is hidden from User Management, so its edit
+    # page is closed too - otherwise the account would still be reachable
+    # by guessing its row id in the URL.
+    if str(u["username"]).strip().lower() == SUPER_ADMIN_USERNAME:
         return HTMLResponse("<h3>User not found.</h3><a href='/manage-users'>Back</a>", status_code=404)
 
     u_role = (u["role"] if "role" in u.keys() and u["role"] else "MLT")
@@ -819,6 +938,17 @@ def edit_user_page(user_id: int, request: Request):
         checkboxes_html += f"""
         <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600;">
             <input type="checkbox" name="permissions" value="{perm_key}" {checked}> {html.escape(perm_label)}
+        </label>
+        """
+
+    u_keys = u.keys()
+    granular_checkboxes = ""
+    for _col, (_label, _default) in GRANULAR_PERMISSIONS.items():
+        _current = int(u[_col] or 0) if _col in u_keys and u[_col] is not None else _default
+        _highlight = "background:#fff5f5; border:1px solid #fed7d7; padding:8px 10px; border-radius:8px;" if _col == "can_cancel_bills" else ""
+        granular_checkboxes += f"""
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600; {_highlight}">
+            <input type="checkbox" name="{_col}" value="1" {"checked" if _current else ""}> {html.escape(_label)}
         </label>
         """
 
@@ -861,6 +991,10 @@ def edit_user_page(user_id: int, request: Request):
                         <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
                         {checkboxes_html}
                     </div>
+                    <div class="form-group">
+                        <label>Granular Access Controls</label>
+                        {granular_checkboxes}
+                    </div>
                     <button type="submit" class="submit-btn"><i class="fa-solid fa-check"></i> Save Changes</button>
                     <a href="/manage-users" style="margin-left:12px;">Cancel</a>
                 </form>
@@ -874,7 +1008,7 @@ def edit_user_page(user_id: int, request: Request):
 @app.post("/edit-user/{user_id}")
 async def edit_user_post(user_id: int, request: Request):
     current_user = get_current_user(request)
-    if not user_has_access(current_user, "manage_users"):
+    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
         return render_locked_page("Manage Users")
 
     form_data = await request.form()
@@ -884,7 +1018,24 @@ async def edit_user_post(user_id: int, request: Request):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET role = ?, permissions = ? WHERE id = ?", (role, permissions_str, user_id))
+
+    # Refuse to modify the hidden super-admin row even if its id is posted
+    # directly - the UI never exposes it, so any such request is forged.
+    cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+    target = cursor.fetchone()
+    if not target or str(target["username"]).strip().lower() == SUPER_ADMIN_USERNAME:
+        conn.close()
+        return RedirectResponse(url="/manage-users", status_code=303)
+
+    # Column names are constants from GRANULAR_PERMISSIONS; all values bound as ?.
+    flag_cols = list(GRANULAR_PERMISSIONS.keys())
+    flag_values = [1 if form_data.get(col) else 0 for col in flag_cols]
+    flag_set_sql = ", ".join(f"{col} = ?" for col in flag_cols)
+
+    cursor.execute(
+        f"UPDATE users SET role = ?, permissions = ?, {flag_set_sql} WHERE id = ?",
+        tuple([role, permissions_str] + flag_values + [user_id])
+    )
     conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-users", status_code=303)
@@ -893,7 +1044,8 @@ async def edit_user_post(user_id: int, request: Request):
 def delete_user(user_id: int):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    # The primary super admin can never be deleted through the UI.
+    cursor.execute("DELETE FROM users WHERE id = ? AND username != ?", (user_id, SUPER_ADMIN_USERNAME))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-users", status_code=303)
@@ -1108,6 +1260,15 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN permissions TEXT DEFAULT ''")
     except Exception:
         pass
+
+    # Granular permission flags. Each column is added independently so one
+    # already-existing column can never abort the others (libsql raises on
+    # a duplicate column, which would short-circuit a shared try block).
+    for _col, (_label, _default) in GRANULAR_PERMISSIONS.items():
+        try:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN {_col} INTEGER DEFAULT {int(_default)}")
+        except Exception:
+            pass
     conn.commit()
 
     # 3. Patients Table
@@ -1401,6 +1562,19 @@ def init_db():
 
     # Default admin user (username: admin, password: 1234)
     cursor.execute("INSERT OR IGNORE INTO users (username, password) VALUES ('admin', '1234')")
+
+    # The primary super admin always carries owner role + every granular
+    # flag, so it keeps unrestricted access no matter what an operator
+    # toggles elsewhere. It is hidden from the User Management UI, so this
+    # row can never be edited or downgraded through the app.
+    try:
+        _flag_set_sql = ", ".join(f"{col} = 1" for col in GRANULAR_PERMISSIONS)
+        cursor.execute(
+            f"UPDATE users SET role = 'owner', {_flag_set_sql} WHERE username = ?",
+            (SUPER_ADMIN_USERNAME,)
+        )
+    except Exception:
+        pass
 
     # ---------------------------------------------------------
     # Calculation metadata / result storage migrations
@@ -1941,7 +2115,7 @@ def dashboard():
 @app.get("/manage-users", response_class=HTMLResponse)
 def manage_users(request: Request):
     current_user = get_current_user(request)
-    if not user_has_access(current_user, "manage_users"):
+    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
         return render_locked_page("Manage Users")
 
     conn = get_db_connection()
@@ -1967,7 +2141,10 @@ def manage_users(request: Request):
     except Exception:
         pass
         
-    cursor.execute("SELECT * FROM users")
+    # Hide the primary super-admin account from the User Management table.
+    # It keeps full access when logged in, but is invisible to (and so
+    # cannot be edited or deleted by) anyone managing users here.
+    cursor.execute("SELECT * FROM users WHERE username != ?", (SUPER_ADMIN_USERNAME,))
     users = cursor.fetchall()
     conn.close()
 
@@ -2030,6 +2207,15 @@ def manage_users(request: Request):
         permission_checkboxes += f"""
         <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600;">
             <input type="checkbox" name="permissions" value="{perm_key}"> {html.escape(perm_label)}
+        </label>
+        """
+
+    granular_checkboxes = ""
+    for _col, (_label, _default) in GRANULAR_PERMISSIONS.items():
+        _highlight = "background:#fff5f5; border:1px solid #fed7d7; padding:8px 10px; border-radius:8px;" if _col == "can_cancel_bills" else ""
+        granular_checkboxes += f"""
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600; {_highlight}">
+            <input type="checkbox" name="{_col}" value="1" {"checked" if _default else ""}> {html.escape(_label)}
         </label>
         """
 
@@ -2146,6 +2332,10 @@ def manage_users(request: Request):
                         <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
                         {permission_checkboxes}
                     </div>
+                    <div class="form-group">
+                        <label>Granular Access Controls</label>
+                        {granular_checkboxes}
+                    </div>
                     <button type="submit" class="submit-btn"><i class="fa-solid fa-check"></i> Create User</button>
                 </form>
             </div>
@@ -2179,7 +2369,7 @@ def manage_users(request: Request):
 @app.get("/reports", response_class=HTMLResponse)
 def reports_page(request: Request, start_date: str = "", end_date: str = "", report_type: str = "sales"):
     current_user = get_current_user(request)
-    if not user_has_access(current_user, "reports"):
+    if not user_can_or_legacy(current_user, "can_view_reports", "reports"):
         return render_locked_page("Reports & Analytics")
 
     conn = get_db_connection()
@@ -5759,6 +5949,7 @@ def test_entry_page(patient_id: int, test_id: int):
 @app.post("/update-patient-info/{patient_id}")
 def update_patient_info(
     patient_id: int,
+    request: Request,
     patient_title: str = Form(...),
     patient_name: str = Form(...),
     patient_phone: str = Form(None),
@@ -5782,6 +5973,9 @@ def update_patient_info(
     persisted. `patient_age` is still accepted so any older/cached form
     that posts a single value keeps working (treated as years).
     """
+    if not user_can(get_current_user(request), "can_edit_patients"):
+        return render_locked_page("Update Patient Details")
+
     def _as_int(value, fallback=0):
         try:
             return max(0, int(float(str(value).strip())))
@@ -5825,6 +6019,8 @@ def update_patient_info(
 
 @app.post("/save-specific-test/{patient_id}/{test_id}")
 async def save_specific_test(patient_id: int, test_id: int, request: Request):
+    if not user_can(get_current_user(request), "can_edit_results"):
+        return render_locked_page("Enter / Modify Test Results")
     form_data = await request.form()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -6325,6 +6521,8 @@ async def update_patient_details(request: Request):
     while reports continued using the old age. This handler updates both the
     legacy/display age and the normalized age columns in one transaction.
     """
+    if not user_can(get_current_user(request), "can_edit_patients"):
+        return render_locked_page("Update Patient Details")
     conn = None
     try:
         form_data = await request.form()
@@ -6436,7 +6634,11 @@ async def update_patient_details(request: Request):
 @app.post("/invoices/{invoice_id}/cancel")
 def cancel_invoice(invoice_id: int, request: Request):
     current_user = get_current_user(request)
-    if not user_has_access(current_user, "reports"):
+    # Bill cancellation is destructive and financially significant, so it
+    # needs its own explicit grant - having general "reports" access is no
+    # longer sufficient. user_can() re-reads the flag from the database
+    # rather than trusting the (client-editable) permissions cookie.
+    if not user_can(current_user, "can_cancel_bills"):
         return render_locked_page("Cancel Bill")
 
     conn = get_db_connection()
@@ -6465,6 +6667,8 @@ def cancel_invoice(invoice_id: int, request: Request):
 # =============================================================
 @app.post("/save-test-results")
 async def save_test_results(request: Request):
+    if not user_can(get_current_user(request), "can_edit_results"):
+        return render_locked_page("Enter / Modify Test Results")
     try:
         form_data = await request.form()
         patient_id = form_data.get("patient_id")
@@ -8189,7 +8393,7 @@ def sales_analytics_page(
     view: str = "table",
 ):
     current_user = get_current_user(request)
-    if not user_has_access(current_user, "reports"):
+    if not user_can_or_legacy(current_user, "can_view_reports", "reports"):
         return render_locked_page("Sales & Financial Analytics")
 
     start_date, end_date, label_start, label_end = _sales_analytics_date_range(preset, start_date, end_date)
