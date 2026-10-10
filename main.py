@@ -6,6 +6,7 @@ import html
 import threading
 import secrets
 import hashlib
+import base64
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -741,9 +742,32 @@ LOGOUT_SYNC_SCRIPT = """
 </script>
 """
 
+# Public (no-login) QR report pages. They must never run the staff
+# logout-sync script and must never emit a Set-Cookie header.
+PUBLIC_REPORT_PATH_PREFIXES = ("/public-report/",)
+
+PUBLIC_REPORT_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+    "X-Robots-Tag": "noindex, nofollow, noarchive",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
 @app.middleware("http")
 async def inject_logout_sync(request: Request, call_next):
     response = await call_next(request)
+
+    if request.url.path.startswith(PUBLIC_REPORT_PATH_PREFIXES):
+        # A public report response can NEVER create a session.
+        response.raw_headers[:] = [
+            (k, v) for (k, v) in response.raw_headers if k.lower() != b"set-cookie"
+        ]
+        for _hk, _hv in PUBLIC_REPORT_HEADERS.items():
+            response.headers[_hk] = _hv
+        return response
+
     content_type = response.headers.get("content-type", "")
     body = getattr(response, "body", None)
 
@@ -7092,6 +7116,278 @@ def report_download(patient_id: int, test_id: int, request: Request):
     )
 
 # -------------------------------------------------------------
+# PUBLIC (QR) REPORT ROUTES - token-gated, read-only, no login, no cookies
+# -------------------------------------------------------------
+_REPORT_QR_TABLE_READY = False
+_QR_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+# Widths per symbol value (0..105 data/start, 106 = stop), in modules,
+# alternating bar/space starting with a bar.
+_CODE128_WIDTHS = [
+    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
+    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
+    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
+    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
+    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
+    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
+    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
+    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
+    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
+    "211214", "211232", "2331112",
+]
+
+
+def _code128b_data_uri(text: str):
+    """SVG data: URI of a Code 128-B barcode for `text` (generated locally, no
+    external service), or None if it cannot be encoded."""
+    try:
+        if not text or any(not (32 <= ord(ch) <= 126) for ch in text):
+            return None
+        values = [104] + [ord(ch) - 32 for ch in text]
+        checksum = (104 + sum(i * v for i, v in enumerate(values[1:], start=1))) % 103
+        values += [checksum, 106]
+        quiet = 10
+        x = quiet
+        rects = []
+        for val in values:
+            is_bar = True
+            for w in _CODE128_WIDTHS[val]:
+                width = int(w)
+                if is_bar:
+                    rects.append(f'<rect x="{x}" y="0" width="{width}" height="30"/>')
+                x += width
+                is_bar = not is_bar
+        total = x + quiet
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total} 30" '
+            f'preserveAspectRatio="none" shape-rendering="crispEdges">'
+            f'<rect width="{total}" height="30" fill="#fff"/><g fill="#000">{"".join(rects)}</g></svg>'
+        )
+        return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("ascii")).decode("ascii")
+    except Exception:
+        return None
+
+
+def _ensure_report_qr_table(cursor) -> None:
+    """Additive-only table: maps an unguessable token to ONE (patient, test)."""
+    global _REPORT_QR_TABLE_READY
+    if _REPORT_QR_TABLE_READY:
+        return
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS report_qr_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            patient_id INTEGER NOT NULL,
+            test_id INTEGER NOT NULL,
+            created_at TEXT,
+            UNIQUE(patient_id, test_id)
+        )
+    """)
+    _REPORT_QR_TABLE_READY = True
+
+
+def _get_or_create_report_qr_token(patient_id: int, test_id: int):
+    """Stable QR token for a report (created on first use), or None on any
+    problem (callers then keep the previous QR target)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        _ensure_report_qr_table(cursor)
+        cursor.execute(
+            "SELECT token FROM report_qr_tokens WHERE patient_id = ? AND test_id = ? LIMIT 1",
+            (patient_id, test_id),
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+
+        # Only mint tokens for tests that really belong to this patient.
+        cursor.execute(
+            "SELECT 1 FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ? LIMIT 1",
+            (patient_id, test_id),
+        )
+        if not cursor.fetchone():
+            return None
+
+        cursor.execute(
+            "INSERT OR IGNORE INTO report_qr_tokens (token, patient_id, test_id, created_at) VALUES (?, ?, ?, ?)",
+            (secrets.token_urlsafe(24), patient_id, test_id, now_colombo().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        cursor.execute(
+            "SELECT token FROM report_qr_tokens WHERE patient_id = ? AND test_id = ? LIMIT 1",
+            (patient_id, test_id),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _resolve_report_qr_token(token: str):
+    """token -> (patient_id, test_id) or None. Never raises."""
+    if not token or not _QR_TOKEN_RE.match(token):
+        return None
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        _ensure_report_qr_table(cursor)
+        cursor.execute(
+            "SELECT patient_id, test_id FROM report_qr_tokens WHERE token = ? LIMIT 1",
+            (token,),
+        )
+        row = cursor.fetchone()
+        return (row[0], row[1]) if row else None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _public_message_page(title: str, message: str, status_code: int) -> HTMLResponse:
+    """Neutral standalone page for public visitors: no staff UI, no login or
+    dashboard links, no cookies."""
+    return HTMLResponse(
+        f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(title)}</title></head>
+<body style="font-family:Arial,sans-serif;background:#f4f7fe;color:#1b2559;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;">
+<div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:40px 32px;max-width:440px;text-align:center;">
+<h2 style="margin:0 0 12px 0;font-size:20px;">{html.escape(title)}</h2>
+<p style="margin:0;color:#707eae;font-size:14px;line-height:1.6;">{html.escape(message)}</p>
+</div></body></html>""",
+        status_code=status_code,
+        headers=dict(PUBLIC_REPORT_HEADERS),
+    )
+
+
+def _build_public_report_html(patient_id: int, test_id: int, request: Request):
+    """Public report HTML = the official staff report layout (always with the
+    lab letterhead, barcode and patient registration box), minus staff
+    controls, with the barcode generated locally."""
+    built = _build_report_html(patient_id, test_id, request, letterhead=1, public=True)
+    if isinstance(built, str):
+        ref_no = f"Med-{patient_id:04d}"
+        remote = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
+        local = _code128b_data_uri(ref_no)
+        if local and remote in built:
+            built = built.replace(remote, local, 1)
+    return built
+
+
+@app.get("/public-report/{token}", response_class=HTMLResponse)
+def public_report_view(token: str, request: Request):
+    """Public, unauthenticated, READ-ONLY view of exactly one report, reached
+    from the QR code. Access = possession of the random token. It reads no
+    cookies, sets none, and exposes no staff controls or other patient data."""
+    target = _resolve_report_qr_token(token)
+    if not target:
+        return _public_message_page(
+            "Report link invalid",
+            "This report link is invalid or no longer available. Please contact the laboratory.",
+            404,
+        )
+    patient_id, test_id = target
+
+    built = _build_public_report_html(patient_id, test_id, request)
+    if isinstance(built, HTMLResponse):
+        built = built.body.decode("utf-8")
+    if not isinstance(built, str) or "Patient not found" in built[:200]:
+        return _public_message_page("Report unavailable", "This report is no longer available.", 404)
+
+    # Fail closed: the official letterhead, barcode and patient registration box
+    # must all be present before anything is served.
+    if ("url('" not in built or 'class="top-barcode-container"' not in built
+            or 'class="patient-box"' not in built or "/static/letterhead.png" not in built):
+        return _public_message_page("Report unavailable", "This report cannot be displayed right now.", 500)
+
+    # Fail closed: refuse to serve if any staff control survived.
+    if 'class="action-bar"' in built or "/test-entry/" in built:
+        return _public_message_page("Report unavailable", "This report cannot be displayed right now.", 500)
+
+    safe_token = html.escape(token, quote=True)
+    head_css = (
+        "<style>.action-bar{display:none !important;}"
+        "body{padding-bottom:76px !important;}"
+        ".public-bar{position:fixed;left:0;right:0;bottom:0;z-index:50;background:#ffffff;"
+        "border-top:1px solid #e2e8f0;box-shadow:0 -2px 8px rgba(0,0,0,0.08);padding:10px;"
+        "text-align:center;font-family:Arial,sans-serif;}"
+        "@media print{.public-bar{display:none !important;}body{padding-bottom:0 !important;}}</style>"
+    )
+    public_bar = f"""
+    <div class="public-bar">
+        <a href="/public-report/{safe_token}/download" style="display:inline-block;background:#0f4c81;color:#fff;padding:11px 24px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:14px;margin:2px 4px;">&#128196; Download PDF</a>
+        <button type="button" onclick="window.print()" style="display:inline-block;background:#0f172a;color:#fff;padding:11px 24px;border-radius:8px;border:none;font-weight:bold;font-size:14px;cursor:pointer;margin:2px 4px;">&#128424; Print</button>
+    </div>
+    """
+
+    if "</head>" in built:
+        built = built.replace("</head>", head_css + "</head>", 1)
+    else:
+        built = head_css + built
+    if "</body>" in built:
+        built = built.replace("</body>", public_bar + "</body>", 1)
+    else:
+        built = built + public_bar
+
+    return HTMLResponse(built, headers=dict(PUBLIC_REPORT_HEADERS))
+
+
+@app.get("/public-report/{token}/download")
+def public_report_download(token: str, request: Request):
+    """Public PDF download for the single report behind a QR token."""
+    target = _resolve_report_qr_token(token)
+    if not target:
+        return _public_message_page(
+            "Report link invalid",
+            "This report link is invalid or no longer available. Please contact the laboratory.",
+            404,
+        )
+    patient_id, test_id = target
+
+    try:
+        from weasyprint import HTML
+    except Exception:
+        # Keep the system usable on installations without WeasyPrint.
+        return RedirectResponse(url=f"/public-report/{token}", status_code=303)
+
+    report_html = _build_public_report_html(patient_id, test_id, request)
+    if isinstance(report_html, HTMLResponse):
+        if report_html.status_code != 200:
+            return report_html
+        html_text = report_html.body.decode("utf-8")
+    elif isinstance(report_html, str):
+        html_text = report_html
+    else:
+        return report_html
+    try:
+        pdf_bytes = HTML(string=html_text, base_url=str(request.base_url)).write_pdf()
+    except Exception as exc:
+        return _public_message_page("Unable to generate PDF", "The PDF could not be generated right now. Please try again.", 500)
+
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"MEDISTAR_{patient_id}_{test_id}").strip("_") or "MEDISTAR_REPORT"
+    headers = {"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
+    headers.update(PUBLIC_REPORT_HEADERS)
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+# -------------------------------------------------------------
 # SHAREABLE REPORT LINKS (for WhatsApp / public sharing)
 # -------------------------------------------------------------
 # Uses the new, additive-only `share_links` table (see init_db). Does not
@@ -7704,6 +8000,109 @@ def report_letterhead_preview(patient_id: int, test_id: int, request: Request):
 
 @app.get("/report-view/{patient_id}/{test_id}", response_class=HTMLResponse)
 def report_view(patient_id: int, test_id: int, request: Request, letterhead: Optional[int] = None):
+    # Staff route: behaviour unchanged.
+    return _build_report_html(patient_id, test_id, request, letterhead=letterhead, public=False)
+
+
+# ---- ABST (antibiotic sensitivity) section detection for culture reports ----
+_ABST_MARKER_RE = re.compile(r"\b(abst|antibiotic|antibiotics|antibiogram|sensitivity|susceptibility)\b", re.I)
+_ABST_DRUG_RE = re.compile(
+    r"\b(amoxicillin|amoxycillin|ampicillin|augmentin|amoxiclav|co-?amoxiclav|cefalexin|cephalexin|cefuroxime|"
+    r"cefixime|ceftriaxone|ceftazidime|cefotaxime|cefepime|cefazolin|cefoxitin|ciprofloxacin|levofloxacin|"
+    r"norfloxacin|ofloxacin|gentamicin|gentamycin|amikacin|tobramycin|nitrofurantoin|cotrimoxazole|"
+    r"co-trimoxazole|trimethoprim|sulfamethoxazole|meropenem|imipenem|ertapenem|piperacillin|tazobactam|"
+    r"azithromycin|erythromycin|clarithromycin|clindamycin|doxycycline|tetracycline|vancomycin|linezolid|"
+    r"teicoplanin|colistin|polymyxin|fosfomycin|chloramphenicol|cloxacillin|flucloxacillin|penicillin|"
+    r"oxacillin|aztreonam)\b",
+    re.I,
+)
+
+
+def _abst_param_ids_to_skip(cursor, params, name_col, patient_id, test_id, hide_abst, test_name):
+    """Ids of the parameter rows that make up the ABST section of a culture
+    report and must be left out of the printed table. Returns an empty set
+    (nothing hidden) whenever in doubt, so a report is never emptied.
+
+    The ABST section is: every row from the first row whose name looks like an
+    ABST heading (ABST / Antibiotic / Sensitivity / Susceptibility) to the end;
+    or, when there is no such heading row, the rows named after common
+    antibiotics. It is hidden when the "Hide ABST" toggle is ticked, and also
+    automatically when no ABST result has been entered at all.
+    """
+    try:
+        if not params:
+            return set()
+        tn = str(test_name or "").lower()
+        if not any(k in tn for k in ("culture", "sensitivity", "abst", "c/s", "c & s")):
+            return set()
+
+        rows = []  # (id, name, is_spacer)
+        for p in params:
+            d = dict(p)
+            nm = str(d.get(name_col) or "").strip()
+            rows.append((d.get("id"), nm, nm in ("", ".", "-", "_")))
+
+        marker_idx = next((i for i, r in enumerate(rows) if not r[2] and _ABST_MARKER_RE.search(r[1])), None)
+        if marker_idx is not None:
+            abst_rows = rows[marker_idx:]
+        else:
+            first_drug = next((i for i, r in enumerate(rows) if not r[2] and _ABST_DRUG_RE.search(r[1])), None)
+            if first_drug is None:
+                return set()
+            abst_rows = [r for i, r in enumerate(rows)
+                         if i >= first_drug and (r[2] or _ABST_DRUG_RE.search(r[1]))]
+
+        abst_ids = {r[0] for r in abst_rows if r[0] is not None}
+        real_ids = [r[0] for r in abst_rows if not r[2] and r[0] is not None]
+        if not real_ids:
+            return set()
+
+        if not hide_abst:
+            # Toggle left on "show": still omit the section when it is entirely empty.
+            for pid in real_ids:
+                cursor.execute(
+                    "SELECT result_value FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",
+                    (patient_id, test_id, pid),
+                )
+                rr = cursor.fetchone()
+                if rr and rr[0] is not None and str(rr[0]).strip():
+                    return set()
+
+        # Never hide every visible row.
+        if not [r for r in rows if r[0] not in abst_ids and not r[2]]:
+            return set()
+        return abst_ids
+    except Exception:
+        return set()
+
+
+def _strip_staff_controls(report_html: str) -> str:
+    """Removes the staff action bar ("Back to Edit", print-mode links) so it
+    can never be shown on a public page."""
+    return re.sub(
+        r'<div class="action-bar">.*?</div>\s*</div>',
+        "",
+        report_html,
+        count=1,
+        flags=re.S,
+    )
+
+
+def _build_report_html(patient_id: int, test_id: int, request: Request,
+                       letterhead: Optional[int] = None, public: bool = False):
+    """public=True is only ever passed by the token-validated /public-report
+    routes (it is a function argument, never a request parameter)."""
+    result = _report_html_impl(patient_id, test_id, request, letterhead, public)
+    if public and isinstance(result, str):
+        result = _strip_staff_controls(result)
+    return result
+
+
+def _report_html_impl(patient_id: int, test_id: int, request: Request,
+                      letterhead: Optional[int] = None, public: bool = False):
+    # Opaque, unguessable token that the printed QR code points to.
+    qr_token = _get_or_create_report_qr_token(patient_id, test_id)
+
     # Resolve letterhead state: an explicit query param (?letterhead=0/1)
     # always wins (preserves the existing toggle/link behavior exactly);
     # only when no explicit value is given do we fall back to the
@@ -8002,9 +8401,15 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
 
     visible_col_count = sum(col_visible) or 1
 
+    # ABST (antibiotic sensitivity) rows left out of the printed table when the
+    # "Hide ABST" toggle is ticked, or when no ABST result was entered.
+    abst_skip_ids = _abst_param_ids_to_skip(cursor, params, name_col, patient_id, test_id, hide_abst, test_name)
+
     if params:
         for p in params:
             d=dict(p); p_id=d.get("id")
+            if p_id in abst_skip_ids:
+                continue
 
             # FIX #1: Some parameter rows are deliberately named "." (or
             # left blank) purely to create a visual gap between groups of
@@ -8250,7 +8655,12 @@ def report_view(patient_id: int, test_id: int, request: Request, letterhead: Opt
         """
 
     barcode_url = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
-    download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
+    if qr_token:
+        # Dedicated, unauthenticated, read-only public page for this ONE report.
+        download_url = str(request.base_url).rstrip("/") + f"/public-report/{qr_token}"
+    else:
+        # Token could not be created: keep the previous QR target (unchanged behaviour).
+        download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
     qr_data = quote(download_url, safe="")
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=120x120&data={qr_data}"
 
