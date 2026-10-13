@@ -3438,7 +3438,7 @@ def add_patient_page(request: Request, saved_id: int = None):
                 const gender = document.getElementById("genderSelect");
                 if (title === "Mr." || title === "Master") {{
                     gender.value = "Male";
-                }} else if (title === "Mrs." || title === "Miss") {{
+                }} else if (title === "Mrs." || title === "Miss") || title === "Ms."){{
                     gender.value = "Female";
                 }}
             }}
