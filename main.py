@@ -3367,8 +3367,8 @@ def add_patient_page(request: Request, saved_id: int = None):
                         <select name="title" id="titleSelect" onchange="autoSelectGender()">
                             <option value="Mr.">Mr.</option>
                             <option value="Mrs.">Mrs.</option>
-                            <option value="Miss">Miss</option>
                             <option value="Ms.">Ms.</option>
+                            <option value="Miss">Miss</option>
                             <option value="Rev.">Rev.</option>
                             <option value="Dr.">Dr.</option>
                             <option value="Master">Master</option>
@@ -3438,7 +3438,7 @@ def add_patient_page(request: Request, saved_id: int = None):
                 const gender = document.getElementById("genderSelect");
                 if (title === "Mr." || title === "Master") {{
                     gender.value = "Male";
-                }} else if (title === "Mrs." || title === "Miss") || title === "Ms."){{
+                }} else if (title === "Mrs." || title === "Ms." || title === "Miss") {{
                     gender.value = "Female";
                 }}
             }}
@@ -6013,6 +6013,7 @@ def test_entry_page(patient_id: int, test_id: int):
                     <select name="patient_title" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
                         <option value="Mr." {"selected" if p_title == "Mr." else ""}>Mr.</option>
                         <option value="Mrs." {"selected" if p_title == "Mrs." else ""}>Mrs.</option>
+                        <option value="Ms." {"selected" if p_title == "Ms." else ""}>Ms.</option>
                         <option value="Miss" {"selected" if p_title == "Miss" else ""}>Miss</option>
                         <option value="Rev." {"selected" if p_title == "Rev." else ""}>Rev.</option>
                         <option value="Dr." {"selected" if p_title == "Dr." else ""}>Dr.</option>
@@ -6711,6 +6712,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                                 <select name="title">
                                     <option value="Mr." {"selected" if p_title == "Mr." else ""}>Mr.</option>
                                     <option value="Mrs." {"selected" if p_title == "Mrs." else ""}>Mrs.</option>
+                                    <option value="Ms." {"selected" if p_title == "Ms." else ""}>Ms.</option>
                                     <option value="Miss" {"selected" if p_title == "Miss" else ""}>Miss</option>
                                     <option value="Rev." {"selected" if p_title == "Rev." else ""}>Rev.</option>
                                     <option value="Dr." {"selected" if p_title == "Dr." else ""}>Dr.</option>
@@ -9275,9 +9277,36 @@ def sales_analytics_page(
     )
 
     # ---- Build the active view's table ----
+    # Shared helper for the detailed doctor-wise / center-wise views: renders one
+    # bill row using the exact same 7-column structure as the main sales table.
+    def _detail_bill_row_html(r):
+        ref_no = f"PRI-{r['patient_id']:04d}"
+        display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
+        date_str = str(r["created_at"] or "").split(" ")[0]
+        patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
+        return f"""
+        <tr>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{date_str}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{display_ref_no}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(patient_name)}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['tests_performed'] or '')}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['doctor_name'] or 'Not Specified')}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['center_name'] or 'Main Branch')}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(r['amount'] or 0):,.2f}</td>
+        </tr>
+        """
+
+    # Group the already-fetched (cancelled-excluded, filtered) bill rows so each
+    # doctor / center section lists its own bills.
+    bills_by_doctor = {}
+    bills_by_center = {}
+    for _r in sales_rows:
+        bills_by_doctor.setdefault(_r["doctor_code"], []).append(_r)
+        bills_by_center.setdefault(_r["center_name"] or "Main Branch", []).append(_r)
+
     if view == "doctor":
-        table_title = "Doctor-wise Performance & Commission Summary"
-        table_header_html = "<th>Doctor</th><th>Code</th><th style='text-align:center;'>Patients</th><th style='text-align:right;'>Revenue (LKR)</th><th style='text-align:center;'>Commission %</th><th style='text-align:right;'>Commission (LKR)</th>"
+        table_title = "Doctor-wise Detailed Sales & Commission"
+        table_header_html = "<th>Date</th><th>Invoice/Lab No</th><th>Patient Name</th><th>Test(s) Performed</th><th>Doctor</th><th>Center</th><th style='text-align:right;'>Amount (LKR)</th>"
         body_rows = ""
         total_revenue = 0.0
         total_commission = 0.0
@@ -9287,48 +9316,68 @@ def sales_analytics_page(
             commission = revenue * (rate / 100.0)
             total_revenue += revenue
             total_commission += commission
+            group_bills = bills_by_doctor.get(r["doctor_code"], [])
+            doc_label = html.escape(r["doctor_name"] or "Not Specified")
+            doc_code = html.escape(r["doctor_code"] or "-")
             body_rows += f"""
-            <tr>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(r['doctor_name'] or 'Not Specified')}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['doctor_code'] or '-')}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{r['patient_count']}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{revenue:,.2f}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{rate:.1f}%</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{commission:,.2f}</td>
+            <tr style="background: rgba(15,76,129,0.10);">
+                <td colspan="7" style="padding:10px; border-bottom:1px solid var(--border-color); font-weight:bold; color:#0f4c81;">
+                    {doc_label} ({doc_code}) &mdash; {r['patient_count']} patient(s) &middot; Revenue: LKR {revenue:,.2f} &middot; Commission {rate:.1f}%: LKR {commission:,.2f}
+                </td>
+            </tr>
+            """
+            for b in group_bills:
+                body_rows += _detail_bill_row_html(b)
+            body_rows += f"""
+            <tr style="font-weight:bold; background: rgba(15,76,129,0.04);">
+                <td colspan="6" style="padding:8px 10px; text-align:right; border-bottom:2px solid var(--border-color);">Subtotal &mdash; {doc_label}</td>
+                <td style="padding:8px 10px; text-align:right; border-bottom:2px solid var(--border-color);">{revenue:,.2f}</td>
             </tr>
             """
         if not body_rows:
-            body_rows = '<tr><td colspan="6" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
+            body_rows = '<tr><td colspan="7" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
         footer_html = f"""
         <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
-            <td colspan="3" style="padding:10px; text-align:right;">TOTAL</td>
+            <td colspan="6" style="padding:10px; text-align:right;">TOTAL REVENUE (LKR)</td>
             <td style="padding:10px; text-align:right;">{total_revenue:,.2f}</td>
-            <td></td>
+        </tr>
+        <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
+            <td colspan="6" style="padding:10px; text-align:right;">TOTAL COMMISSION (LKR)</td>
             <td style="padding:10px; text-align:right;">{total_commission:,.2f}</td>
         </tr>
         """
 
     elif view == "center":
-        table_title = "Center-wise Dispatch & Billing Summary"
-        table_header_html = "<th>Center</th><th style='text-align:center;'>Patients</th><th style='text-align:center;'>Tests Dispatched</th><th style='text-align:right;'>Total Billing (LKR)</th>"
+        table_title = "Center-wise Detailed Sales & Billing"
+        table_header_html = "<th>Date</th><th>Invoice/Lab No</th><th>Patient Name</th><th>Test(s) Performed</th><th>Doctor</th><th>Center</th><th style='text-align:right;'>Amount (LKR)</th>"
         body_rows = ""
         total_billing = 0.0
         for r in center_summary_rows:
             billing = r["billing"] or 0
             total_billing += billing
+            c_name = r["center_name"] or "Main Branch"
+            group_bills = bills_by_center.get(c_name, [])
+            c_label = html.escape(c_name)
             body_rows += f"""
-            <tr>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(r['center_name'] or 'Main Branch')}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{r['patient_count']}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:center;">{r['tests_dispatched']}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{billing:,.2f}</td>
+            <tr style="background: rgba(15,76,129,0.10);">
+                <td colspan="7" style="padding:10px; border-bottom:1px solid var(--border-color); font-weight:bold; color:#0f4c81;">
+                    {c_label} &mdash; {r['patient_count']} patient(s) &middot; {r['tests_dispatched']} test(s) dispatched &middot; Billing: LKR {billing:,.2f}
+                </td>
+            </tr>
+            """
+            for b in group_bills:
+                body_rows += _detail_bill_row_html(b)
+            body_rows += f"""
+            <tr style="font-weight:bold; background: rgba(15,76,129,0.04);">
+                <td colspan="6" style="padding:8px 10px; text-align:right; border-bottom:2px solid var(--border-color);">Subtotal &mdash; {c_label}</td>
+                <td style="padding:8px 10px; text-align:right; border-bottom:2px solid var(--border-color);">{billing:,.2f}</td>
             </tr>
             """
         if not body_rows:
-            body_rows = '<tr><td colspan="4" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
+            body_rows = '<tr><td colspan="7" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
         footer_html = f"""
         <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
-            <td colspan="3" style="padding:10px; text-align:right;">TOTAL BILLING (LKR)</td>
+            <td colspan="6" style="padding:10px; text-align:right;">TOTAL BILLING (LKR)</td>
             <td style="padding:10px; text-align:right;">{total_billing:,.2f}</td>
         </tr>
         """
@@ -9479,8 +9528,8 @@ def sales_analytics_page(
 
             <div class="tabs no-print">
                 <a href="{_view_link('table')}" class="tab-link {'active' if view == 'table' else ''}">📋 Sales Table</a>
-                <a href="{_view_link('doctor')}" class="tab-link {'active' if view == 'doctor' else ''}">👨‍⚕️ Doctor-wise Summary</a>
-                <a href="{_view_link('center')}" class="tab-link {'active' if view == 'center' else ''}">🏥 Center-wise Summary</a>
+                <a href="{_view_link('doctor')}" class="tab-link {'active' if view == 'doctor' else ''}">👨‍⚕️ Doctor-wise Details</a>
+                <a href="{_view_link('center')}" class="tab-link {'active' if view == 'center' else ''}">🏥 Center-wise Details</a>
                 <a href="{_view_link('cancelled')}" class="tab-link cancelled-tab {'active' if view == 'cancelled' else ''}">🚫 Cancelled Invoices</a>
             </div>
 
