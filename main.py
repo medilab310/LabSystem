@@ -3368,6 +3368,7 @@ def add_patient_page(request: Request, saved_id: int = None):
                             <option value="Mr.">Mr.</option>
                             <option value="Mrs.">Mrs.</option>
                             <option value="Miss">Miss</option>
+                            <option value="Ms.">Ms.</option>
                             <option value="Rev.">Rev.</option>
                             <option value="Dr.">Dr.</option>
                             <option value="Master">Master</option>
