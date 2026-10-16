@@ -2714,7 +2714,6 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
             </div>
             <div>
                 <a href="/reports/sales-analytics" class="btn-secondary" style="padding: 6px 14px; font-size: 13px; background:#27ae60; margin-right:8px;">💰 Sales & Financial Analytics</a>
-                <a href="/reports/test-wise-analytics" class="btn-secondary" style="padding: 6px 14px; font-size: 13px; background:#0f4c81; margin-right:8px;">🧪 Test-Wise Analytics</a>
                 <a href="/dashboard" class="btn-secondary" style="padding: 6px 14px; font-size: 13px;">← Back to Dashboard</a>
             </div>
         </div>
@@ -4302,9 +4301,6 @@ def seed_standard_tests_and_parameters():
         # susceptibility section is omitted from the printed report
         # (used for "No Growth" culture reports).
         _ensure_column(cursor, "patient_assigned_tests", "hide_abst", "hide_abst INTEGER DEFAULT 0")
-        # Per-assigned-test "Mark as Critical Result" flag (red warning seal
-        # on the printed report). Additive column, default 0 = no change.
-        _ensure_column(cursor, "patient_assigned_tests", "is_critical", "is_critical INTEGER DEFAULT 0")
 
         standards = [
             {
@@ -5975,31 +5971,6 @@ def test_entry_page(patient_id: int, test_id: int):
         </div>
         """
 
-    # ---- Critical Result checkbox (shown for every test) ----
-    current_is_critical = 0
-    try:
-        cursor.execute(
-            "SELECT COALESCE(is_critical, 0) AS is_critical FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?",
-            (patient_id, test_id)
-        )
-        _crit_row = cursor.fetchone()
-        if _crit_row:
-            current_is_critical = int(_crit_row["is_critical"] or 0)
-    except Exception:
-        current_is_critical = 0
-
-    critical_toggle_html = f"""
-    <div style="background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:12px 16px; margin-bottom:16px;">
-        <label style="display:flex; align-items:center; gap:10px; cursor:{"not-allowed" if has_results else "pointer"}; font-size:13.5px; font-weight:700; color:#b91c1c;">
-            <input type="checkbox" name="is_critical" value="1"{" checked" if current_is_critical else ""}{" disabled" if has_results else ""} style="width:17px; height:17px; margin:0; accent-color:#dc2626;">
-            <span>&#9888;&#65039; Mark as Critical Result</span>
-        </label>
-        <div style="font-size:11.5px; color:#b91c1c; margin-top:6px; padding-left:27px;">
-            When ticked, a red warning seal is printed at the bottom of this test's lab report.
-        </div>
-    </div>
-    """
-
     # Save button OR Locked Warning Message
     if has_results:
         save_action_html = """
@@ -6163,7 +6134,6 @@ def test_entry_page(patient_id: int, test_id: int):
                 
                 <form action="/save-specific-test/{patient_id}/{test_id}" method="post">
                     {abst_toggle_html}
-                    {critical_toggle_html}
                     {param_form_html}
                     {save_action_html}
                 </form>
@@ -6315,14 +6285,6 @@ async def save_specific_test(patient_id: int, test_id: int, request: Request):
     try:
         cursor.execute("UPDATE patient_assigned_tests SET hide_abst = ? WHERE patient_id = ? AND test_id = ?",
                        (hide_abst_flag, patient_id, test_id))
-    except Exception:
-        pass
-
-    # Persist the "Mark as Critical Result" flag (absent checkbox = 0).
-    critical_flag = 1 if form_data.get("is_critical") else 0
-    try:
-        cursor.execute("UPDATE patient_assigned_tests SET is_critical = ? WHERE patient_id = ? AND test_id = ?",
-                       (critical_flag, patient_id, test_id))
     except Exception:
         pass
 
@@ -8358,15 +8320,9 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     # the Result Entry screen. Use this to gate any antibiotic-susceptibility
     # block: `if not hide_abst: ...render ABST table...`
     hide_abst = False
-    is_critical_result = False
     
     if assigned_res:
         assigned_keys = assigned_res.keys()
-        if "is_critical" in assigned_keys:
-            try:
-                is_critical_result = bool(int(assigned_res["is_critical"] or 0))
-            except (TypeError, ValueError):
-                is_critical_result = False
         if "hide_abst" in assigned_keys:
             hide_abst = bool(int(assigned_res["hide_abst"] or 0))
         if "result" in assigned_keys and assigned_res["result"]:
@@ -9101,7 +9057,6 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
 
             {("<div class='report-note'><b>Note:</b> " + comment_text + "</div>") if comment_text else ""}
             {test_notes_html}
-            {CRITICAL_SEAL_HTML if is_critical_result else ""}
             <hr class="section-divider">
             <div class="end-report-text">*** END OF REPORT ***</div>
 
@@ -9621,226 +9576,3 @@ def sales_analytics_page(
     </body>
     </html>
     """
-
-
-
-# =================================================================
-# CRITICAL RESULT SEAL, TEST-WISE ANALYTICS, STANDARD BACK BUTTON
-# (new, additive-only block - appended after all existing routes)
-# =================================================================
-
-CRITICAL_SEAL_HTML = """
-<div class="critical-result-seal" style="margin:14px 0 6px 0; padding:10px 14px; border:3px solid #dc2626; border-radius:8px; background:#fef2f2; color:#b91c1c; text-align:center; font-weight:800; font-size:13px; line-height:1.5; letter-spacing:0.3px; page-break-inside:avoid; -webkit-print-color-adjust:exact; print-color-adjust:exact;">
-    &#9888;&#65039; CRITICAL RESULT - ATTENTION REQUIRED<br>IMMEDIATE MEDICAL REVIEW ADVISED
-</div>
-"""
-
-
-def _tests_category_expression(cursor) -> str:
-    """Picks the best available 'category' column on `tests`."""
-    try:
-        cursor.execute("PRAGMA table_info(tests)")
-        cols = {str(r[1]).lower() for r in cursor.fetchall()}
-    except Exception:
-        cols = set()
-    if "category" in cols:
-        return "COALESCE(NULLIF(TRIM(t.category), ''), 'General Tests')"
-    if "department" in cols:
-        return "COALESCE(NULLIF(TRIM(t.department), ''), 'General Tests')"
-    return "'General Tests'"
-
-
-@app.get("/reports/test-wise-analytics", response_class=HTMLResponse)
-def test_wise_analytics_page(request: Request, start_date: str = "", end_date: str = ""):
-    current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_view_reports", "reports"):
-        return render_locked_page("Test-Wise Analytics")
-
-    if not start_date or not end_date:
-        today = now_colombo().date()
-        start_date = start_date or today.replace(day=1).isoformat()
-        end_date = end_date or today.isoformat()
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    rows = []
-    error_msg = ""
-    try:
-        cat_expr = _tests_category_expression(cursor)
-        # Each patients row is the invoice/bill; cancelled bills are excluded.
-        cursor.execute(f"""
-            SELECT {cat_expr} AS category_name,
-                   t.test_name AS test_name,
-                   COUNT(pat.id) AS performed_count
-            FROM patients i
-            JOIN patient_assigned_tests pat ON pat.patient_id = i.id
-            JOIN tests t ON t.id = pat.test_id
-            WHERE (i.is_cancelled IS NULL OR i.is_cancelled = 0)
-              AND DATE(i.created_at) BETWEEN ? AND ?
-            GROUP BY category_name, t.id
-            ORDER BY category_name ASC, performed_count DESC, t.test_name ASC
-        """, (start_date, end_date))
-        rows = cursor.fetchall()
-    except Exception as e:
-        error_msg = str(e)
-    conn.close()
-
-    grouped = {}
-    for r in rows:
-        grouped.setdefault(r["category_name"], []).append((r["test_name"], int(r["performed_count"] or 0)))
-
-    grand_total = 0
-    body = ""
-    for cat, items in grouped.items():
-        cat_total = sum(c for _, c in items)
-        grand_total += cat_total
-        body += f'<tr class="cat-row"><td colspan="2">{html.escape(str(cat))}</td></tr>'
-        for name, cnt in items:
-            body += f'<tr><td>{html.escape(str(name))}</td><td class="num">{cnt}</td></tr>'
-        body += f'<tr class="sub-row"><td>Total - {html.escape(str(cat))}</td><td class="num">{cat_total}</td></tr>'
-    if not body:
-        body = '<tr><td colspan="2" style="text-align:center; padding:28px; color:#64748b;">No performed tests found in this date range.</td></tr>'
-    else:
-        body += f'<tr class="grand-row"><td>GRAND TOTAL</td><td class="num">{grand_total}</td></tr>'
-
-    err_html = f'<p style="color:#c0392b;">Could not load data: {html.escape(error_msg)}</p>' if error_msg else ""
-
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Test-Wise Analytics - MEDISTAR MEDICAL LABORATORY</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-        <style>
-            :root {{ --bg:#f4f7fb; --primary:#0f4c81; --card:#fff; --text:#1e293b; --muted:#64748b; --border:#cbd5e1; }}
-            body {{ font-family: Arial, sans-serif; background:var(--bg); color:var(--text); margin:0; }}
-            .container {{ max-width:900px; margin:0 auto; padding:24px; }}
-            .tabs {{ display:flex; gap:8px; margin:6px 0 18px; }}
-            .tab-link {{ padding:9px 18px; border-radius:20px; text-decoration:none; font-size:13px; font-weight:bold; background:#e2e8f0; color:#334155; }}
-            .tab-link.active {{ background:var(--primary); color:#fff; }}
-            .filter-box {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:18px; display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; margin-bottom:18px; }}
-            .filter-group {{ display:flex; flex-direction:column; gap:5px; }}
-            .filter-group label {{ font-size:12px; font-weight:bold; color:var(--muted); }}
-            .filter-group input {{ padding:8px 12px; border:1px solid var(--border); border-radius:6px; }}
-            .btn {{ background:var(--primary); color:#fff; border:none; padding:9px 18px; border-radius:6px; font-weight:bold; cursor:pointer; font-size:13px; }}
-            .card {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:22px; box-shadow:0 2px 8px rgba(0,0,0,.05); }}
-            table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-            th {{ background:var(--primary); color:#fff; text-align:left; padding:10px 12px; font-size:13px; }}
-            th.num, td.num {{ text-align:right; width:140px; font-variant-numeric:tabular-nums; }}
-            td {{ padding:9px 12px; border-bottom:1px solid #e2e8f0; }}
-            tr.cat-row td {{ background:#eaf1f8; color:var(--primary); font-weight:bold; text-transform:uppercase; font-size:12.5px; letter-spacing:.4px; }}
-            tr.sub-row td {{ background:#f8fafc; font-weight:bold; }}
-            tr.grand-row td {{ background:var(--primary); color:#fff; font-weight:bold; font-size:15px; }}
-            @media print {{ .no-print {{ display:none !important; }} body {{ background:#fff; }} .card {{ border:none; box-shadow:none; padding:0; }} }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="no-print" style="margin-bottom:10px;">
-                <a href="/dashboard" class="back-btn-std" style="display:inline-block; background:#0f4c81; color:#fff; text-decoration:none; padding:8px 16px; border-radius:8px; font-weight:700; font-size:13px;">&larr; Back to Dashboard</a>
-            </div>
-            <h2 style="margin:8px 0 4px;"><i class="fa-solid fa-vials"></i> Test-Wise Analytics</h2>
-            <div class="tabs no-print">
-                <a href="/reports/sales-analytics" class="tab-link">💰 Sales &amp; Financial</a>
-                <a href="/reports/test-wise-analytics" class="tab-link active">🧪 Test-Wise Analytics</a>
-            </div>
-            <form method="GET" action="/reports/test-wise-analytics" class="filter-box no-print">
-                <div class="filter-group"><label>Start Date</label><input type="date" name="start_date" value="{html.escape(start_date)}"></div>
-                <div class="filter-group"><label>End Date</label><input type="date" name="end_date" value="{html.escape(end_date)}"></div>
-                <button type="submit" class="btn">Apply Filter</button>
-                <div style="margin-left:auto; display:flex; gap:8px;">
-                    <button type="button" class="btn" style="background:#27ae60;" onclick="window.print()">🖨️ Print</button>
-                    <button type="button" class="btn" style="background:#1d7a46;" onclick="exportTestWise()">📊 Export to Excel</button>
-                </div>
-            </form>
-            {err_html}
-            <div class="card">
-                <p style="margin:0 0 14px; font-size:12px; color:var(--muted);">Date Range: {html.escape(start_date)} to {html.escape(end_date)} &middot; Cancelled bills excluded</p>
-                <table id="testWiseTable">
-                    <thead><tr><th>Test Name</th><th class="num">Performed Count</th></tr></thead>
-                    <tbody>{body}</tbody>
-                </table>
-            </div>
-        </div>
-        <script>
-            function exportTestWise() {{
-                const wb = XLSX.utils.table_to_book(document.getElementById('testWiseTable'), {{ sheet: "Test-Wise" }});
-                XLSX.writeFile(wb, "Test_Wise_Analytics_" + new Date().toISOString().slice(0, 10) + ".xlsx");
-            }}
-        </script>
-    </body>
-    </html>
-    """
-
-
-# ---- Standard "Back to Dashboard" button (top-left) on every inner page ----
-_BACK_BTN_SKIP_PREFIXES = (
-    "/login", "/logout", "/dashboard", "/public-report", "/shared-report",
-    "/report-view", "/print-report", "/report-download",
-    "/report-letterhead-preview", "/static", "/api",
-)
-
-_BACK_BTN_HTML = (
-    '<style>.mlab-back-bar{padding:10px 16px 0 16px;text-align:left}'
-    '.mlab-back-bar a{display:inline-block;background:#0f4c81;color:#fff;text-decoration:none;'
-    'padding:8px 16px;border-radius:8px;font-weight:700;font-size:13px;font-family:Arial,sans-serif}'
-    '.mlab-back-bar a:hover{background:#0b3a63}'
-    '@media print{.mlab-back-bar{display:none!important}}</style>'
-    '<div class="mlab-back-bar no-print"><a href="/dashboard">&larr; Back to Dashboard</a></div>'
-)
-
-
-class _StandardBackButtonMiddleware:
-    """Pure-ASGI middleware: injects one uniform 'Back to Dashboard' button
-    right after <body> on inner HTML pages that don't already have one."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("method") != "GET":
-            return await self.app(scope, receive, send)
-        path = scope.get("path", "")
-        if path == "/" or path.startswith(_BACK_BTN_SKIP_PREFIXES):
-            return await self.app(scope, receive, send)
-
-        start_msg = None
-        chunks = []
-
-        async def capture_send(message):
-            nonlocal start_msg
-            if message["type"] == "http.response.start":
-                headers = {k.lower(): v for k, v in message.get("headers", [])}
-                is_html = b"text/html" in headers.get(b"content-type", b"")
-                if message.get("status") != 200 or not is_html:
-                    await send(message)
-                    start_msg = "passthrough"
-                else:
-                    start_msg = message
-                return
-            if start_msg == "passthrough":
-                return await send(message)
-            chunks.append(message.get("body", b""))
-            if message.get("more_body", False):
-                return
-            body = b"".join(chunks)
-            try:
-                text = body.decode("utf-8")
-                m = re.search(r"<body[^>]*>", text, flags=re.IGNORECASE)
-                if m and "back to dashboard" not in text.lower():
-                    text = text[:m.end()] + _BACK_BTN_HTML + text[m.end():]
-                    body = text.encode("utf-8")
-            except Exception:
-                pass
-            headers = [(k, v) for (k, v) in start_msg.get("headers", []) if k.lower() != b"content-length"]
-            headers.append((b"content-length", str(len(body)).encode()))
-            await send({**start_msg, "headers": headers})
-            await send({"type": "http.response.body", "body": body})
-
-        await self.app(scope, receive, capture_send)
-
-
-app.add_middleware(_StandardBackButtonMiddleware)
