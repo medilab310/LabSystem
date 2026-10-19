@@ -2612,6 +2612,30 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
                     <td style="padding: 12px; text-align: center;">{count}</td>
                 </tr>
                 """
+        elif report_type == "pricelist":
+            report_title = "Test Price List"
+            table_headers = ("<th style='width:50px;'>#</th><th>Code</th><th>Test Name</th>"
+                             "<th>Department</th><th>Specimen</th>"
+                             "<th style='text-align: right;'>Price (Rs.)</th>")
+
+            cursor.execute(
+                "SELECT test_code, test_name, department, specimen, COALESCE(price, 0) "
+                "FROM tests ORDER BY COALESCE(department, ''), test_name"
+            )
+            results = cursor.fetchall()
+
+            for i, r in enumerate(results, 1):
+                t_code, t_name, t_dept, t_spec, t_price = r
+                table_rows += f"""
+                <tr style="border-bottom: 1px solid var(--border-color);">
+                    <td style="padding: 9px 10px; color: var(--text-muted);">{i}</td>
+                    <td style="padding: 9px 10px;">{html.escape(t_code or '-')}</td>
+                    <td style="padding: 9px 10px; font-weight: bold;">{html.escape(t_name or '')}</td>
+                    <td style="padding: 9px 10px;">{html.escape(t_dept or '-')}</td>
+                    <td style="padding: 9px 10px;">{html.escape(t_spec or '-')}</td>
+                    <td style="padding: 9px 10px; text-align: right; font-weight: bold;">{float(t_price or 0):,.2f}</td>
+                </tr>
+                """
         elif report_type == "center":
             report_title = "Center-wise Collection / Patient Report"
             table_headers = "<th>Center Name</th><th style='text-align: center;'>Total Patients</th>"
@@ -2655,6 +2679,11 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
         table_rows = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: var(--text-muted);">No records found for the selected date range.</td></tr>'
 
     conn.close()
+
+    if report_type == "pricelist":
+        date_line = f"As of {now_colombo().strftime('%Y-%m-%d')}"
+    else:
+        date_line = f"Date Range: {start_date if start_date else 'All Time'} to {end_date if end_date else 'Present'}"
 
     return f"""
     <!DOCTYPE html>
@@ -2726,6 +2755,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
                         <option value="sales" {'selected' if report_type == 'sales' else ''}>📊 Detailed Sales / Patient Report</option>
                         <option value="doctor" {'selected' if report_type == 'doctor' else ''}>👨‍⚕️ Doctor-wise Performance</option>
                         <option value="center" {'selected' if report_type == 'center' else ''}>🏥 Center-wise Report</option>
+                        <option value="pricelist" {'selected' if report_type == 'pricelist' else ''}>💲 Test Price List</option>
                     </select>
                 </div>
                 <div class="filter-group">
@@ -2748,7 +2778,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
                 <div class="report-header">
                     <div>
                         <h3 style="margin: 0; font-size: 18px;">{report_title}</h3>
-                        <p style="margin: 4px 0 0 0; font-size: 12px; color: var(--text-muted);">Date Range: {start_date if start_date else 'All Time'} to {end_date if end_date else 'Present'}</p>
+                        <p style="margin: 4px 0 0 0; font-size: 12px; color: var(--text-muted);">{date_line}</p>
                     </div>
                     <div>
                         <span style="font-size: 12px; font-weight: bold; color: var(--text-muted);">MEDISTAR MEDICAL LABORATORY</span>
@@ -3377,8 +3407,8 @@ def add_patient_page(request: Request, saved_id: int = None):
         center_options = '<option value="Main Branch">Main Branch</option>'
 
     test_checkboxes = "".join([f"""
-        <label class="test-item" data-name="{t[1].lower()}" data-label="{html.escape(t[1])}" data-price="{float(t[2] or 0)}" style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-weight: normal; cursor: pointer; font-size: 14px;">
-            <input type="checkbox" name="test_ids" value="{t[0]}" style="width: 16px; height: 16px; accent-color: #0f4c81;"> <span>{t[1]}</span> <span style="margin-left:auto; color:#64748b; font-size:12px;">Rs.{float(t[2] or 0):,.2f}</span>
+        <label class="test-item" data-name="{t[1].lower()}" data-label="{html.escape(t[1])}" style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-weight: normal; cursor: pointer; font-size: 14px;">
+            <input type="checkbox" name="test_ids" value="{t[0]}" style="width: 16px; height: 16px; accent-color: #0f4c81;"> <span>{t[1]}</span>
         </label>
     """ for t in tests])
 
@@ -3505,7 +3535,7 @@ def add_patient_page(request: Request, saved_id: int = None):
                         {test_checkboxes}
                     </div>
                     <div class="sel-box">
-                        <div class="sel-head"><span>Selected Tests: <span id="selCount">0</span></span><span>Total: Rs. <span id="selTotal">0.00</span></span></div>
+                        <div class="sel-head"><span>Selected Tests: <span id="selCount">0</span></span></div>
                         <div id="selList"><em style="font-size:12px; color:#64748b;">No tests selected yet</em></div>
                     </div>
                 </div>
@@ -3600,30 +3630,24 @@ def add_patient_page(request: Request, saved_id: int = None):
             function updateSelected() {{
                 const boxes = document.querySelectorAll('#testContainer input[name="test_ids"]:checked');
                 const list = document.getElementById("selList");
-                let total = 0;
                 list.innerHTML = "";
                 boxes.forEach(cb => {{
                     const lab = cb.closest(".test-item");
-                    const price = parseFloat(lab.getAttribute("data-price")) || 0;
-                    total += price;
                     const row = document.createElement("div");
                     row.className = "sel-item";
                     const nm = document.createElement("span");
                     nm.className = "nm";
                     nm.textContent = lab.getAttribute("data-label");
-                    const pr = document.createElement("span");
-                    pr.textContent = "Rs." + price.toFixed(2);
                     const x = document.createElement("button");
                     x.type = "button";
                     x.textContent = "\u00d7";
                     x.title = "Remove";
                     x.onclick = () => {{ cb.checked = false; updateSelected(); }};
-                    row.appendChild(nm); row.appendChild(pr); row.appendChild(x);
+                    row.appendChild(nm); row.appendChild(x);
                     list.appendChild(row);
                 }});
                 if (!boxes.length) list.innerHTML = '<em style="font-size:12px; color:#64748b;">No tests selected yet</em>';
                 document.getElementById("selCount").textContent = boxes.length;
-                document.getElementById("selTotal").textContent = total.toFixed(2);
             }}
             document.getElementById("testContainer").addEventListener("change", updateSelected);
 
