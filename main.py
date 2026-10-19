@@ -3253,6 +3253,77 @@ def lookup_patient_by_phone(request: Request, phone: str = ""):
     }
 
 
+
+# -------------------------------------------------------------
+# DOCTOR / CENTER PICKER HELPERS (shared by register + result entry)
+# -------------------------------------------------------------
+# patients.doctor stores a doctor CODE when picked from the list (so
+# commission reports can join to the doctors table) or plain typed text
+# when a manual name is used (no commission rate, reported by name).
+MANUAL_DOCTOR_VALUE = "__manual__"
+
+def _resolve_doctor_value(select_val, manual_val):
+    sel = (select_val or "").strip()
+    if sel == MANUAL_DOCTOR_VALUE:
+        return (manual_val or "").strip() or "None"
+    return sel or "None"
+
+
+def build_doctor_center_fields(cursor, current_doctor, current_center,
+                               doctor_name, manual_name, center_name, input_style=""):
+    """Returns (doctor_html, center_html): dropdowns pre-selected with the
+    patient's current doctor / center. Doctor dropdown also has a
+    'Type manually' option that reveals a free-text box."""
+    cursor.execute("SELECT code, name FROM doctors ORDER BY name")
+    doctors = cursor.fetchall()
+    cursor.execute("SELECT center_name FROM collecting_centers ORDER BY center_name")
+    centers = [c[0] for c in cursor.fetchall() if c[0]]
+
+    cur_doc = (current_doctor or "").strip()
+    codes = {str(d[0]): str(d[1]) for d in doctors}
+    names_to_code = {str(d[1]).strip().lower(): str(d[0]) for d in doctors}
+    manual_text = ""
+    if cur_doc in codes:
+        selected_val = cur_doc
+    elif cur_doc.lower() in names_to_code:
+        selected_val = names_to_code[cur_doc.lower()]
+    elif cur_doc in ("", "None"):
+        selected_val = "None"
+    else:
+        selected_val = MANUAL_DOCTOR_VALUE
+        manual_text = cur_doc
+
+    def _sel(v):
+        return " selected" if v == selected_val else ""
+
+    d_opts = f'<option value="None"{_sel("None")}>-- None --</option>'
+    for code, name in codes.items():
+        d_opts += f'<option value="{html.escape(code)}"{_sel(code)}>{html.escape(name)} ({html.escape(code)})</option>'
+    d_opts += f'<option value="{MANUAL_DOCTOR_VALUE}"{_sel(MANUAL_DOCTOR_VALUE)}>&#9998; Type doctor name manually...</option>'
+
+    show_manual = "block" if selected_val == MANUAL_DOCTOR_VALUE else "none"
+    doctor_html = (
+        f'<select name="{doctor_name}" style="{input_style}" '
+        f'onchange="var m=this.parentNode.querySelector(\'.doctor-manual\'); '
+        f'm.style.display=(this.value===\'{MANUAL_DOCTOR_VALUE}\')?\'block\':\'none\'; '
+        f'if(m.style.display===\'block\') m.focus();">{d_opts}</select>'
+        f'<input type="text" class="doctor-manual" name="{manual_name}" value="{html.escape(manual_text)}" '
+        f'placeholder="Type doctor name" style="{input_style} display:{show_manual}; margin-top:6px;">'
+    )
+
+    cur_center = (current_center or "").strip()
+    center_list = list(centers)
+    if cur_center and cur_center not in center_list:
+        center_list.insert(0, cur_center)
+    if not center_list:
+        center_list = ["Main Branch"]
+    c_opts = "".join(
+        f'<option value="{html.escape(c)}"{" selected" if c == cur_center else ""}>{html.escape(c)}</option>'
+        for c in center_list
+    )
+    center_html = f'<select name="{center_name}" style="{input_style}">{c_opts}</select>'
+    return doctor_html, center_html
+
 @app.get("/add-patient", response_class=HTMLResponse)
 def add_patient_page(request: Request, saved_id: int = None):
     current_user = get_current_user(request)
@@ -3263,7 +3334,7 @@ def add_patient_page(request: Request, saved_id: int = None):
     cursor = conn.cursor()
     
     # 1. Fetch Tests (name වෙනුවට test_name දාලා ඇත)
-    cursor.execute("SELECT id, test_name FROM tests")
+    cursor.execute("SELECT id, test_name, COALESCE(price, 0) FROM tests")
     tests = cursor.fetchall()
 
     # 2. Fetch Doctors from Database
@@ -3294,6 +3365,7 @@ def add_patient_page(request: Request, saved_id: int = None):
     for d in doctors:
         # d[0] = code, d[1] = name
         doctor_options += f'<option value="{d[0]}">{d[1]} ({d[0]})</option>'
+    doctor_options += f'<option value="{MANUAL_DOCTOR_VALUE}">&#9998; Type doctor name manually...</option>'
 
     # Generate Collecting Centers Options dynamically
     center_options = '<option value="">-- Select Center --</option>'
@@ -3305,8 +3377,8 @@ def add_patient_page(request: Request, saved_id: int = None):
         center_options = '<option value="Main Branch">Main Branch</option>'
 
     test_checkboxes = "".join([f"""
-        <label class="test-item" data-name="{t[1].lower()}" style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-weight: normal; cursor: pointer; font-size: 14px;">
-            <input type="checkbox" name="test_ids" value="{t[0]}" style="width: 16px; height: 16px; accent-color: #0f4c81;"> {t[1]}
+        <label class="test-item" data-name="{t[1].lower()}" data-label="{html.escape(t[1])}" data-price="{float(t[2] or 0)}" style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-weight: normal; cursor: pointer; font-size: 14px;">
+            <input type="checkbox" name="test_ids" value="{t[0]}" style="width: 16px; height: 16px; accent-color: #0f4c81;"> <span>{t[1]}</span> <span style="margin-left:auto; color:#64748b; font-size:12px;">Rs.{float(t[2] or 0):,.2f}</span>
         </label>
     """ for t in tests])
 
@@ -3344,7 +3416,12 @@ def add_patient_page(request: Request, saved_id: int = None):
             .btn-save {{ background: #27ae60; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 10px; }}
             .back-link {{ display: inline-block; margin-bottom: 10px; color: #0f4c81; text-decoration: none; font-weight: bold; font-size: 13px; }}
             .test-search {{ margin-bottom: 6px; padding: 7px; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 4px; width: 100%; box-sizing: border-box; }}
-            .test-box {{ border: 1px solid #cbd5e1; padding: 10px; max-height: 120px; overflow-y: auto; border-radius: 5px; background: #fafafa; }}
+            .test-box {{ border: 1px solid #cbd5e1; padding: 10px; max-height: 220px; overflow-y: auto; border-radius: 5px; background: #fafafa; }}
+            .sel-box {{ margin-top: 8px; border: 1px solid #bfdbfe; background: #eff6ff; border-radius: 6px; padding: 8px 10px; }}
+            .sel-head {{ display: flex; justify-content: space-between; font-size: 13px; font-weight: bold; color: #0f4c81; margin-bottom: 4px; }}
+            .sel-item {{ display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; border-top: 1px dashed #bfdbfe; }}
+            .sel-item .nm {{ flex: 1; }}
+            .sel-item button {{ border: none; background: #fee2e2; color: #b91c1c; border-radius: 4px; cursor: pointer; font-weight: bold; padding: 0 7px; }}
         </style>
     </head>
     <body>
@@ -3355,7 +3432,7 @@ def add_patient_page(request: Request, saved_id: int = None):
                 <span class="ref-badge">Ref No: #{next_id}</span>
             </h2>
             {success_banner}
-            <form action="/add-patient" method="post">
+            <form action="/add-patient" method="post" onsubmit="return confirmNoTests()">
                 <div class="form-group" style="margin-bottom: 10px;">
                     <label>Manual Bill No.:</label>
                     <input type="text" name="manual_bill_no" inputmode="numeric" maxlength="4" pattern="[0-9]{{1,4}}"
@@ -3408,9 +3485,10 @@ def add_patient_page(request: Request, saved_id: int = None):
                 <div class="form-group row-group">
                     <div style="flex: 1;">
                         <label>Referred Doctor:</label>
-                        <select name="doctor" id="doctorSelect" required>
+                        <select name="doctor" id="doctorSelect" required onchange="toggleDoctorManual()">
                             {doctor_options}
                         </select>
+                        <input type="text" name="doctor_manual" id="doctorManual" placeholder="Type doctor name" style="display:none; margin-top:6px;">
                     </div>
                     <div style="flex: 1;">
                         <label>Collecting Center:</label>
@@ -3425,6 +3503,10 @@ def add_patient_page(request: Request, saved_id: int = None):
                     <input type="text" id="testSearchInput" class="test-search" placeholder="Type to search tests..." onkeyup="filterTests()">
                     <div class="test-box" id="testContainer">
                         {test_checkboxes}
+                    </div>
+                    <div class="sel-box">
+                        <div class="sel-head"><span>Selected Tests: <span id="selCount">0</span></span><span>Total: Rs. <span id="selTotal">0.00</span></span></div>
+                        <div id="selList"><em style="font-size:12px; color:#64748b;">No tests selected yet</em></div>
                     </div>
                 </div>
 
@@ -3477,7 +3559,9 @@ def add_patient_page(request: Request, saved_id: int = None):
                     if (data.gender) document.getElementById("genderSelect").value = data.gender;
                     if (data.doctor) {{
                         const doctorSel = document.getElementById("doctorSelect");
-                        if ([...doctorSel.options].some(o => o.value === data.doctor)) doctorSel.value = data.doctor;
+                        if ([...doctorSel.options].some(o => o.value === data.doctor)) {{ doctorSel.value = data.doctor; }}
+                        else if (data.doctor && data.doctor !== "None") {{ doctorSel.value = "__manual__"; document.getElementById("doctorManual").value = data.doctor; }}
+                        toggleDoctorManual();
                     }}
                     if (data.collecting_center) {{
                         const centerSel = document.getElementById("centerSelect");
@@ -3504,7 +3588,52 @@ def add_patient_page(request: Request, saved_id: int = None):
                 }}
             }}
 
-            window.onload = autoSelectGender;
+            function toggleDoctorManual() {{
+                const sel = document.getElementById("doctorSelect");
+                const man = document.getElementById("doctorManual");
+                man.style.display = (sel.value === "__manual__") ? "block" : "none";
+                if (sel.value === "__manual__") man.focus();
+            }}
+
+            // Live "selected tests" summary (stays visible even when the
+            // search box hides ticked tests).
+            function updateSelected() {{
+                const boxes = document.querySelectorAll('#testContainer input[name="test_ids"]:checked');
+                const list = document.getElementById("selList");
+                let total = 0;
+                list.innerHTML = "";
+                boxes.forEach(cb => {{
+                    const lab = cb.closest(".test-item");
+                    const price = parseFloat(lab.getAttribute("data-price")) || 0;
+                    total += price;
+                    const row = document.createElement("div");
+                    row.className = "sel-item";
+                    const nm = document.createElement("span");
+                    nm.className = "nm";
+                    nm.textContent = lab.getAttribute("data-label");
+                    const pr = document.createElement("span");
+                    pr.textContent = "Rs." + price.toFixed(2);
+                    const x = document.createElement("button");
+                    x.type = "button";
+                    x.textContent = "\u00d7";
+                    x.title = "Remove";
+                    x.onclick = () => {{ cb.checked = false; updateSelected(); }};
+                    row.appendChild(nm); row.appendChild(pr); row.appendChild(x);
+                    list.appendChild(row);
+                }});
+                if (!boxes.length) list.innerHTML = '<em style="font-size:12px; color:#64748b;">No tests selected yet</em>';
+                document.getElementById("selCount").textContent = boxes.length;
+                document.getElementById("selTotal").textContent = total.toFixed(2);
+            }}
+            document.getElementById("testContainer").addEventListener("change", updateSelected);
+
+            function confirmNoTests() {{
+                const n = document.querySelectorAll('#testContainer input[name="test_ids"]:checked').length;
+                if (n === 0) return confirm("No tests are selected. Save this patient without any tests?");
+                return true;
+            }}
+
+            window.onload = function() {{ autoSelectGender(); updateSelected(); }};
         </script>
     </body>
     </html>
@@ -3557,7 +3686,7 @@ async def add_patient_post(request: Request):
             form_data.get("age_days", 0),
             form_data.get("gender"),
             form_data.get("phone"),
-            form_data.get("doctor", "None"),
+            _resolve_doctor_value(form_data.get("doctor"), form_data.get("doctor_manual")),
             form_data.get("collecting_center", "Main Branch"),
             form_data.get("collecting_center", "Main Branch"),
             registration_timestamp,
@@ -5994,6 +6123,11 @@ def test_entry_page(patient_id: int, test_id: int):
         </form>
         """
 
+    doctor_field_html, center_field_html = build_doctor_center_fields(
+        cursor, p_doctor, p_center_display,
+        "patient_doctor", "patient_doctor_manual", "patient_center",
+        input_style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box;"
+    )
     conn.close()
 
     patient_edit_html = f"""
@@ -6038,11 +6172,11 @@ def test_entry_page(patient_id: int, test_id: int):
                 </div>
                 <div style="flex:1; min-width:150px;">
                     <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Doctor</label>
-                    <input type="text" name="patient_doctor" value="{p_doctor}" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box;">
+                    {doctor_field_html}
                 </div>
                 <div style="flex:1; min-width:150px;">
                     <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Center</label>
-                    <input type="text" name="patient_center" value="{p_center_display}" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box;">
+                    {center_field_html}
                 </div>
             </div>
             <button type="submit" style="background:#0f4c81; color:white; border:none; padding:8px 18px; border-radius:6px; font-weight:600; font-size:13px; cursor:pointer;">
@@ -6162,6 +6296,7 @@ def update_patient_info(
     patient_name: str = Form(...),
     patient_phone: str = Form(None),
     patient_doctor: str = Form(None),
+    patient_doctor_manual: str = Form(None),
     patient_age: str = Form(None),
     patient_age_years: str = Form(None),
     patient_age_months: str = Form(None),
@@ -6200,18 +6335,22 @@ def update_patient_info(
         months = _as_int(patient_age_months)
         days = _as_int(patient_age_days)
 
+    patient_doctor = _resolve_doctor_value(patient_doctor, patient_doctor_manual)
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # phone = COALESCE(?, phone): this form has no phone box, so a
+        # missing value must keep the stored phone (it used to wipe it).
         cursor.execute("""
             UPDATE patients 
-            SET title = ?, name = ?, phone = ?, doctor = ?,
+            SET title = ?, name = ?, phone = COALESCE(?, phone), doctor = ?,
                 age_years = ?, age_months = ?, age_days = ?, age = ?,
-                center = ?, gender = ?
+                center = ?, collecting_center = ?, gender = ?
             WHERE id = ?
         """, (patient_title, patient_name, patient_phone, patient_doctor,
               years, months, days, years,
-              patient_center, patient_gender, patient_id))
+              patient_center, patient_center, patient_gender, patient_id))
         conn.commit()
     except Exception:
         try:
@@ -6366,7 +6505,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     p_gender = p.get("gender") or p.get("sex") or "Male"
     p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
     p_doctor = p.get("doctor") or p.get("doctor_name") or p.get("ref_doctor") or ""
-    p_center = p.get("center") or p.get("branch") or ""
+    p_center = p.get("center") or p.get("collecting_center") or p.get("branch") or ""
 
     # Needed for the same gender/age-aware reference-range lookup that
     # test_entry_page() already uses, so a parameter's correct range shows
@@ -6601,6 +6740,9 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     else:
         categories_html = '<div style="padding: 24px; text-align: center; color: #94a3b8; background: white; border-radius: 8px; border: 1px solid #e2e8f0;">No tests assigned for this patient.</div>'
 
+    doctor_field_html, center_field_html = build_doctor_center_fields(
+        cursor, p_doctor, p_center, "doctor", "doctor_manual", "center"
+    )
     conn.close()
 
     is_verified = (total_tests > 0 and completed_count == total_tests)
@@ -6748,11 +6890,11 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                         </div>
                         <div class="form-group">
                             <label>Doctor</label>
-                            <input type="text" name="doctor" value="{p_doctor}" placeholder="Doctor name">
+                            {doctor_field_html}
                         </div>
                         <div class="form-group">
                             <label>Center / Branch</label>
-                            <input type="text" name="center" value="{p_center}" placeholder="Center name">
+                            {center_field_html}
                         </div>
                         <button type="submit" class="btn-save"><i class="fa-solid fa-floppy-disk"></i> Save Patient Info</button>
                     </form>
@@ -6807,7 +6949,7 @@ async def update_patient_details(request: Request):
         age_days_raw = (form_data.get("age_days") or "").strip()
         gender = (form_data.get("gender") or "").strip()
         phone = (form_data.get("phone") or "").strip()
-        doctor = (form_data.get("doctor") or "").strip()
+        doctor = _resolve_doctor_value(form_data.get("doctor"), form_data.get("doctor_manual"))
         center = (form_data.get("center") or "").strip()
 
         if not name:
@@ -9242,6 +9384,80 @@ def sales_analytics_page(
     except Exception:
         center_summary_rows = []
 
+    # ---- Test-wise counts (overall, per doctor, per center) ----
+    test_summary_rows = []
+    tests_by_doctor = {}
+    tests_by_center = {}
+    test_doc_split = {}
+    test_center_split = {}
+    try:
+        _label = "COALESCE(NULLIF(t.test_code, ''), t.test_name)"
+        cursor.execute(f"""
+            SELECT t.id as test_id, t.test_name, COALESCE(t.test_code, '') as test_code,
+                   COALESCE(t.price, 0) as unit_price,
+                   COUNT(pat.id) as cnt, SUM(COALESCE(t.price, 0)) as amount
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            {where_sql}
+            GROUP BY t.id
+            ORDER BY cnt DESC, t.test_name
+        """, where_params)
+        test_summary_rows = cursor.fetchall()
+
+        cursor.execute(f"""
+            SELECT p.doctor as doctor_code, {_label} as tlabel, COUNT(pat.id) as cnt
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            {where_sql}
+            GROUP BY p.doctor, t.id
+            ORDER BY cnt DESC
+        """, where_params)
+        for r in cursor.fetchall():
+            tests_by_doctor.setdefault(r["doctor_code"], []).append((r["tlabel"], r["cnt"]))
+
+        cursor.execute(f"""
+            SELECT COALESCE(p.center, p.collecting_center, 'Main Branch') as cname,
+                   {_label} as tlabel, COUNT(pat.id) as cnt
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            {where_sql}
+            GROUP BY cname, t.id
+            ORDER BY cnt DESC
+        """, where_params)
+        for r in cursor.fetchall():
+            tests_by_center.setdefault(r["cname"], []).append((r["tlabel"], r["cnt"]))
+
+        cursor.execute(f"""
+            SELECT t.id as test_id, COALESCE(d.name, p.doctor, 'Not Specified') as dname, COUNT(pat.id) as cnt
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            LEFT JOIN doctors d ON d.code = p.doctor
+            {where_sql}
+            GROUP BY t.id, p.doctor
+            ORDER BY cnt DESC
+        """, where_params)
+        for r in cursor.fetchall():
+            test_doc_split.setdefault(r["test_id"], []).append((r["dname"], r["cnt"]))
+
+        cursor.execute(f"""
+            SELECT t.id as test_id, COALESCE(p.center, p.collecting_center, 'Main Branch') as cname,
+                   COUNT(pat.id) as cnt
+            FROM patients p
+            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
+            JOIN tests t ON t.id = pat.test_id
+            {where_sql}
+            GROUP BY t.id, cname
+            ORDER BY cnt DESC
+        """, where_params)
+        for r in cursor.fetchall():
+            test_center_split.setdefault(r["test_id"], []).append((r["cname"], r["cnt"]))
+    except Exception:
+        pass
+
     # ---- Cancelled bills (dedicated audit tab) ----
     cancelled_rows = []
     try:
@@ -9296,6 +9512,22 @@ def sales_analytics_page(
         </tr>
         """
 
+    def _test_count_row_html(items):
+        if not items:
+            return ""
+        total_cnt = sum(c for _, c in items)
+        chips = " &middot; ".join(f"{html.escape(str(n))} &times; <b>{c}</b>" for n, c in items)
+        return f"""
+        <tr style="background: rgba(39,174,96,0.07);">
+            <td colspan="7" style="padding:7px 10px; border-bottom:1px solid var(--border-color); font-size:12.5px;">
+                <b>Test-wise count ({total_cnt} total):</b> {chips}
+            </td>
+        </tr>
+        """
+
+    def _split_text(items):
+        return " &middot; ".join(f"{html.escape(str(n))} &times; <b>{c}</b>" for n, c in items) or "-"
+
     # Group the already-fetched (cancelled-excluded, filtered) bill rows so each
     # doctor / center section lists its own bills.
     bills_by_doctor = {}
@@ -9326,6 +9558,7 @@ def sales_analytics_page(
                 </td>
             </tr>
             """
+            body_rows += _test_count_row_html(tests_by_doctor.get(r["doctor_code"], []))
             for b in group_bills:
                 body_rows += _detail_bill_row_html(b)
             body_rows += f"""
@@ -9365,6 +9598,7 @@ def sales_analytics_page(
                 </td>
             </tr>
             """
+            body_rows += _test_count_row_html(tests_by_center.get(c_name, []))
             for b in group_bills:
                 body_rows += _detail_bill_row_html(b)
             body_rows += f"""
@@ -9379,6 +9613,39 @@ def sales_analytics_page(
         <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
             <td colspan="6" style="padding:10px; text-align:right;">TOTAL BILLING (LKR)</td>
             <td style="padding:10px; text-align:right;">{total_billing:,.2f}</td>
+        </tr>
+        """
+
+    elif view == "tests":
+        table_title = "Test-wise Count & Revenue"
+        table_header_html = "<th>#</th><th>Test</th><th>Code</th><th style='text-align:right;'>Count</th><th style='text-align:right;'>Unit Price</th><th style='text-align:right;'>Revenue (LKR)</th><th>Doctor-wise count</th><th>Center-wise count</th>"
+        body_rows = ""
+        total_count = 0
+        total_amount = 0.0
+        for idx, r in enumerate(test_summary_rows, 1):
+            total_count += r["cnt"] or 0
+            total_amount += r["amount"] or 0
+            body_rows += f"""
+            <tr>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{idx}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(r['test_name'] or '')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['test_code'] or '')}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right; font-weight:bold;">{r['cnt']}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(r['unit_price'] or 0):,.2f}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(r['amount'] or 0):,.2f}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-size:12px;">{_split_text(test_doc_split.get(r['test_id'], []))}</td>
+                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-size:12px;">{_split_text(test_center_split.get(r['test_id'], []))}</td>
+            </tr>
+            """
+        if not body_rows:
+            body_rows = '<tr><td colspan="8" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
+        footer_html = f"""
+        <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
+            <td colspan="3" style="padding:10px; text-align:right;">TOTAL TESTS / REVENUE</td>
+            <td style="padding:10px; text-align:right;">{total_count}</td>
+            <td></td>
+            <td style="padding:10px; text-align:right;">{total_amount:,.2f}</td>
+            <td colspan="2"></td>
         </tr>
         """
 
@@ -9530,6 +9797,7 @@ def sales_analytics_page(
                 <a href="{_view_link('table')}" class="tab-link {'active' if view == 'table' else ''}">📋 Sales Table</a>
                 <a href="{_view_link('doctor')}" class="tab-link {'active' if view == 'doctor' else ''}">👨‍⚕️ Doctor-wise Details</a>
                 <a href="{_view_link('center')}" class="tab-link {'active' if view == 'center' else ''}">🏥 Center-wise Details</a>
+                <a href="{_view_link('tests')}" class="tab-link {'active' if view == 'tests' else ''}">🧪 Test-wise Count</a>
                 <a href="{_view_link('cancelled')}" class="tab-link cancelled-tab {'active' if view == 'cancelled' else ''}">🚫 Cancelled Invoices</a>
             </div>
 
