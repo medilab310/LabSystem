@@ -1645,7 +1645,7 @@ def login_page(error: str = ""):
          background-size:cover; background-position:center; background-repeat:no-repeat; background-attachment:fixed; background-color:var(--bgc); }
   .login-card { width:100%; max-width:420px; background:#fff; border-radius:18px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,.35); }
   .card-top { background:linear-gradient(90deg,var(--a1),var(--a2)); padding:22px 24px 18px; text-align:center; color:#fff; }
-  .login-logo { display:block; width:130px; height:130px; object-fit:contain; margin:0 auto 10px; background:#fff; border-radius:50%; padding:10px; }
+  .login-logo { display:block; width:180px; height:180px; object-fit:contain; margin:0 auto 10px; background:#fff; border-radius:50%; padding:10px; }
   .card-top h2 { margin:0; font-size:19px; font-weight:800; letter-spacing:.5px; }
   .card-top p { margin:4px 0 0; font-size:12.5px; opacity:.9; }
   .card-body { padding:26px 28px 28px; }
@@ -1667,7 +1667,7 @@ def login_page(error: str = ""):
   .btn-login:hover { filter:brightness(1.08); }
   .btn-login:disabled { opacity:.75; cursor:wait; }
   .foot { text-align:center; margin-top:16px; font-size:11.5px; color:#94a3b8; }
-  @media (max-width:420px) { .card-body { padding:22px 18px 22px; } .login-logo { width:104px; height:104px; } }
+  @media (max-width:420px) { .card-body { padding:22px 18px 22px; } .login-logo { width:140px; height:140px; } }
 </style>
 </head>
 <body>
