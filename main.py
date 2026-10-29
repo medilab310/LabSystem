@@ -2118,469 +2118,784 @@ def init_db():
 # silently wiped out every route registered above this point.
 
 # -------------------------------------------------------------
-# 1. MAIN DASHBOARD (Updated Big Action Buttons UI with User Management)
+# 1. MAIN DASHBOARD (sidebar layout, live stats, registrations
+#    chart, calendar, quick actions). Same links / same data as before.
 # -------------------------------------------------------------
+def _dash_trend_html(cur, prev):
+    """Small coloured trend chip comparing `cur` against `prev`."""
+    if prev <= 0:
+        if cur > 0:
+            return '<span class="ms-trend up"><i class="fa-solid fa-arrow-up"></i> New</span>'
+        return '<span class="ms-trend flat"><i class="fa-solid fa-minus"></i> 0%</span>'
+    pct = int(round((cur - prev) * 100.0 / prev))
+    if pct > 0:
+        return f'<span class="ms-trend up"><i class="fa-solid fa-arrow-up"></i> +{pct}%</span>'
+    if pct < 0:
+        return f'<span class="ms-trend down"><i class="fa-solid fa-arrow-down"></i> {pct}%</span>'
+    return '<span class="ms-trend flat"><i class="fa-solid fa-minus"></i> 0%</span>'
+
+
+_DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lab System - Dashboard</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem('lab_theme');
+      if (t && t !== 'light') { document.documentElement.setAttribute('data-theme', t); }
+    } catch (e) {}
+  })();
+</script>
+<style>
+  :root {
+    --bg: #eef3fb;
+    --header-bg: linear-gradient(90deg, #0f3b8f 0%, #0d47a1 100%);
+    --sidebar-bg: #f4f7fd;
+    --card: #ffffff;
+    --text: #12296b;
+    --muted: #6b7a99;
+    --border: #e3eaf6;
+    --primary: #0d47a1;
+    --primary-soft: #dce8fb;
+    --table-head: #0d47a1;
+    --row-hover: rgba(13, 71, 161, 0.04);
+    --chart-line: #2563eb;
+    --green: #16a34a;
+    --red: #dc2626;
+    --shadow: 0 6px 22px rgba(13, 71, 161, 0.07);
+    --tint-blue: linear-gradient(135deg, #eaf1ff, #ffffff);
+    --tint-green: linear-gradient(135deg, #e8f8ef, #ffffff);
+    --tint-purple: linear-gradient(135deg, #f1eaff, #ffffff);
+    --qa-blue: #e6efff;
+    --qa-green: #e5f7ec;
+    --qa-purple: #efe8ff;
+    --qa-orange: #fff0e1;
+    --help-bg: linear-gradient(90deg, #0f3b8f, #0d47a1);
+  }
+  [data-theme="dark"] {
+    --bg: #0b1437;
+    --header-bg: linear-gradient(90deg, #0d1840, #111c44);
+    --sidebar-bg: #0f1a40;
+    --card: #111c44;
+    --text: #ffffff;
+    --muted: #8f9bba;
+    --border: #1e2b5c;
+    --primary: #38bdf8;
+    --primary-soft: #1b2a5e;
+    --table-head: #1b2a5e;
+    --row-hover: rgba(255, 255, 255, 0.04);
+    --chart-line: #38bdf8;
+    --green: #4ade80;
+    --red: #f87171;
+    --shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+    --tint-blue: linear-gradient(135deg, #16246a, #111c44);
+    --tint-green: linear-gradient(135deg, #123a3a, #111c44);
+    --tint-purple: linear-gradient(135deg, #2a2468, #111c44);
+    --qa-blue: #17265f;
+    --qa-green: #123a3a;
+    --qa-purple: #2a2468;
+    --qa-orange: #3a2a1a;
+    --help-bg: linear-gradient(90deg, #1b2a5e, #16246a);
+  }
+  [data-theme="emerald"] {
+    --bg: #effaf3;
+    --header-bg: linear-gradient(90deg, #064e3b, #065f46);
+    --sidebar-bg: #f1fbf5;
+    --card: #ffffff;
+    --text: #064e3b;
+    --muted: #4d8a74;
+    --border: #cdeedd;
+    --primary: #065f46;
+    --primary-soft: #d3f3e2;
+    --table-head: #065f46;
+    --row-hover: rgba(6, 95, 70, 0.05);
+    --chart-line: #059669;
+    --green: #059669;
+    --red: #dc2626;
+    --shadow: 0 6px 22px rgba(6, 95, 70, 0.08);
+    --tint-blue: linear-gradient(135deg, #e3f6ec, #ffffff);
+    --tint-green: linear-gradient(135deg, #e8f8ef, #ffffff);
+    --tint-purple: linear-gradient(135deg, #e9f7f2, #ffffff);
+    --qa-blue: #dff5e9;
+    --qa-green: #e5f7ec;
+    --qa-purple: #e3f4ef;
+    --qa-orange: #fdf1e0;
+    --help-bg: linear-gradient(90deg, #064e3b, #065f46);
+  }
+
+  html body.ms { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, Roboto, sans-serif; min-height: 100vh; }
+  .ms *, .ms *::before, .ms *::after { box-sizing: border-box; }
+  .ms a { text-decoration: none; }
+
+  /* ---------- Header ---------- */
+  .ms-header { background: var(--header-bg); color: #fff; height: 84px; padding: 0 26px; display: flex; align-items: center; justify-content: space-between; gap: 14px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12); position: relative; z-index: 30; }
+  .ms-brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+  .ms-burger { display: none; background: rgba(255, 255, 255, 0.15); color: #fff; border: 0; width: 40px; height: 40px; border-radius: 10px; font-size: 17px; cursor: pointer; padding: 0; }
+  .ms-burger:hover { background: rgba(255, 255, 255, 0.25); }
+  .ms-logo { font-size: 38px; line-height: 1; }
+  .ms-brand h1 { margin: 0; color: #fff; font-size: 24px; font-weight: 800; letter-spacing: 0.6px; white-space: nowrap; }
+  .ms-brand p { margin: 3px 0 0; font-size: 13px; color: #fff; opacity: 0.92; }
+  .ms-hright { display: flex; align-items: center; gap: 12px; }
+  .ms-clock { display: flex; align-items: center; gap: 10px; border: 1px solid rgba(255, 255, 255, 0.3); border-radius: 26px; padding: 7px 18px; background: rgba(255, 255, 255, 0.06); }
+  .ms-clock i { font-size: 20px; }
+  .ms-clock b { display: block; font-size: 14px; font-weight: 700; line-height: 1.2; }
+  .ms-clock span { display: block; font-size: 12px; opacity: 0.85; line-height: 1.2; }
+  .ms-theme { display: flex; align-items: center; gap: 8px; background: #1d5bc4; border-radius: 26px; padding: 0 14px; height: 44px; }
+  [data-theme="dark"] .ms-theme { background: #26357a; }
+  [data-theme="emerald"] .ms-theme { background: #0a7a58; }
+  .ms-theme i { color: #ffc83d; font-size: 18px; }
+  .ms-theme select { appearance: none; -webkit-appearance: none; background: transparent; border: 0; outline: none; color: #fff; font-weight: 700; font-size: 13.5px; padding: 0 22px 0 0; cursor: pointer; font-family: inherit; background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'/></svg>"); background-repeat: no-repeat; background-position: right center; }
+  .ms-theme select option { background: #111c44; color: #fff; }
+  .ms-user { position: relative; }
+  .ms-user-btn { display: flex; align-items: center; gap: 9px; background: transparent; border: 0; color: #fff; cursor: pointer; font-family: inherit; font-size: 14px; font-weight: 700; padding: 4px 6px; border-radius: 26px; }
+  .ms-user-btn:hover { background: rgba(255, 255, 255, 0.12); }
+  .ms-avatar { width: 38px; height: 38px; border-radius: 50%; background: #fff; color: #1d5bc4; display: grid; place-items: center; font-size: 20px; }
+  .ms-user-menu { display: none; position: absolute; right: 0; top: 52px; min-width: 210px; background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; z-index: 60; }
+  .ms-user-menu.open { display: block; }
+  .ms-user-menu .ms-um-head { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .ms-user-menu .ms-um-head b { display: block; font-size: 14px; }
+  .ms-user-menu .ms-um-head span { font-size: 12px; color: var(--muted); }
+  .ms-user-menu a { display: flex; align-items: center; gap: 10px; padding: 11px 16px; color: var(--text); font-size: 13.5px; font-weight: 600; }
+  .ms-user-menu a:hover { background: var(--primary-soft); }
+  .ms-user-menu a i { width: 16px; color: var(--primary); }
+  .ms-logout { background: #ef4444; color: #fff; border: 0; border-radius: 10px; padding: 0 20px; height: 44px; font-weight: 700; font-size: 14px; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-family: inherit; }
+  .ms-logout:hover { background: #dc2626; color: #fff; }
+
+  /* ---------- Layout ---------- */
+  .ms-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100vh - 84px); }
+  .ms-sidebar { background: var(--sidebar-bg); border-right: 1px solid var(--border); padding: 18px 14px 20px; display: flex; flex-direction: column; position: sticky; top: 0; height: calc(100vh - 84px); overflow-y: auto; }
+  .ms-nav { display: flex; flex-direction: column; gap: 6px; }
+  .ms-nav a { display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-radius: 12px; color: var(--text); font-size: 15px; font-weight: 600; transition: background 0.15s, transform 0.15s; }
+  .ms-nav a i { width: 24px; text-align: center; font-size: 19px; color: var(--primary); opacity: 0.8; }
+  .ms-nav a:hover { background: var(--primary-soft); }
+  .ms-nav a.active { background: var(--primary-soft); font-weight: 700; }
+  .ms-nav a.active i { opacity: 1; }
+  .ms-side-foot { margin-top: auto; text-align: center; padding: 30px 8px 6px; color: var(--muted); }
+  .ms-side-foot i { font-size: 38px; color: #38a3e8; display: block; margin-bottom: 8px; }
+  .ms-side-foot p { margin: 0; font-family: 'Segoe Script', 'Brush Script MT', cursive; font-style: italic; font-size: 15px; line-height: 1.5; }
+  .ms-scrim { display: none; }
+
+  .ms-main { padding: 22px 28px 30px; min-width: 0; }
+  .ms-welcome { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
+  .ms-welcome-l { display: flex; align-items: center; gap: 14px; }
+  .ms-wave { font-size: 40px; line-height: 1; }
+  .ms-welcome h2 { margin: 0; font-size: 24px; font-weight: 800; color: var(--text); }
+  .ms-welcome p { margin: 3px 0 0; color: var(--muted); font-size: 14px; }
+  .ms-datechip { background: var(--card); border: 1px solid var(--border); box-shadow: var(--shadow); border-radius: 12px; padding: 11px 18px; font-weight: 700; font-size: 13.5px; display: inline-flex; align-items: center; gap: 10px; white-space: nowrap; }
+  .ms-datechip i { color: var(--primary); }
+
+  .ms-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 20px; align-items: start; }
+  .ms-col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+
+  .ms-panel { background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); padding: 20px 22px; }
+  .ms-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+  .ms-panel-title { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .ms-panel-title > i { font-size: 26px; color: var(--primary); }
+  .ms-panel-title h3 { margin: 0; font-size: 17px; font-weight: 800; color: var(--text); }
+  .ms-panel-title p { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
+  .ms-viewall { background: var(--primary-soft); color: var(--primary); font-size: 12.5px; font-weight: 700; border-radius: 20px; padding: 8px 16px; display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .ms-viewall:hover { filter: brightness(0.96); }
+
+  /* ---------- Stat cards ---------- */
+  .ms-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+  .ms-stat { border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); padding: 20px; display: flex; gap: 16px; align-items: flex-start; }
+  .ms-stat.blue { background: var(--tint-blue); }
+  .ms-stat.green { background: var(--tint-green); }
+  .ms-stat.purple { background: var(--tint-purple); }
+  .ms-stat-ico { width: 56px; height: 56px; flex: 0 0 56px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-size: 23px; }
+  .blue .ms-stat-ico { background: linear-gradient(135deg, #3b82f6, #2563eb); }
+  .green .ms-stat-ico { background: linear-gradient(135deg, #22c55e, #15803d); }
+  .purple .ms-stat-ico { background: linear-gradient(135deg, #a855f7, #7c3aed); }
+  .ms-stat h4 { margin: 0; font-size: 15px; font-weight: 800; }
+  .blue h4 { color: #1d4ed8; } .green h4 { color: #15803d; } .purple h4 { color: #7c3aed; }
+  [data-theme="dark"] .blue h4 { color: #7fb1ff; } [data-theme="dark"] .green h4 { color: #6ee7a0; } [data-theme="dark"] .purple h4 { color: #c4a1ff; }
+  .ms-stat .ms-num { font-size: 34px; font-weight: 800; line-height: 1.15; margin: 4px 0 6px; color: var(--text); }
+  .ms-stat-sub { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
+  .ms-trend { font-weight: 800; font-size: 12.5px; display: inline-flex; align-items: center; gap: 4px; }
+  .ms-trend.up { color: var(--green); } .ms-trend.down { color: var(--red); } .ms-trend.flat { color: var(--muted); }
+  .ms-trend-badge { background: rgba(22, 163, 74, 0.1); border-radius: 6px; padding: 3px 8px; font-size: 11px; }
+
+  /* ---------- Chart ---------- */
+  .ms-chart-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 270px; gap: 18px; align-items: stretch; }
+  #msChart { width: 100%; min-height: 210px; }
+  #msChart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .ms-axis { fill: var(--muted); font-size: 11px; }
+  .ms-grid-line { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; }
+  .ms-line { fill: none; stroke: var(--chart-line); stroke-width: 2.2; stroke-linecap: round; }
+  .ms-dot { fill: var(--chart-line); stroke: var(--card); stroke-width: 2; cursor: pointer; }
+  .ms-minis { display: flex; flex-direction: column; gap: 10px; }
+  .ms-mini { flex: 1; border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; display: flex; align-items: center; gap: 12px; background: var(--card); }
+  .ms-mini > i { font-size: 22px; color: var(--primary); width: 30px; text-align: center; }
+  .ms-mini small { display: block; color: var(--muted); font-size: 12px; }
+  .ms-mini b { font-size: 21px; font-weight: 800; }
+  .ms-mini .ms-trend { margin-left: auto; background: rgba(22, 163, 74, 0.08); border-radius: 6px; padding: 3px 8px; font-size: 11px; }
+  .ms-mini .ms-trend.down { background: rgba(220, 38, 38, 0.08); }
+  .ms-mini .ms-trend.flat { background: rgba(107, 122, 153, 0.1); }
+
+  /* ---------- Table ---------- */
+  .ms-table-scroll { overflow-x: auto; }
+  .ms-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .ms-table th { background: var(--table-head); color: #fff; text-align: left; padding: 9px 12px; font-weight: 700; font-size: 13px; }
+  .ms-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--text); }
+  .ms-table tbody tr:hover { background: var(--row-hover); }
+  .ms-table .c { text-align: center; }
+  .ms-table .mut { color: var(--muted); }
+  .ms-table .strong { font-weight: 700; }
+  .ms-view { background: var(--primary-soft); color: var(--primary); font-weight: 700; font-size: 12px; border-radius: 16px; padding: 5px 14px; display: inline-flex; align-items: center; gap: 6px; }
+  .ms-view:hover { background: var(--primary); color: #fff; }
+
+  /* ---------- Status card ---------- */
+  .ms-status { display: flex; align-items: flex-start; gap: 16px; position: relative; overflow: hidden; }
+  .ms-status-ico { width: 58px; height: 58px; flex: 0 0 58px; border-radius: 50%; display: grid; place-items: center; font-size: 28px; color: #fff; background: linear-gradient(135deg, #22c55e, #16a34a); }
+  .ms-status-ico.info { background: linear-gradient(135deg, #3b82f6, #2563eb); }
+  .ms-status-ico.warn { background: linear-gradient(135deg, #f59e0b, #d97706); }
+  .ms-status h4 { margin: 0; font-size: 15px; font-weight: 800; }
+  .ms-status .ms-sval { font-size: 28px; font-weight: 800; color: var(--green); line-height: 1.2; }
+  .ms-status .ms-sval.info { color: var(--primary); }
+  .ms-status .ms-sval.warn { color: #d97706; }
+  .ms-status p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .ms-arrows { margin-left: auto; display: flex; gap: 8px; }
+  .ms-arrow { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; display: grid; place-items: center; font-size: 12px; padding: 0; }
+  .ms-arrow:hover { background: var(--primary-soft); }
+  .ms-shield { position: absolute; right: 18px; bottom: 8px; font-size: 46px; color: var(--green); opacity: 0.12; }
+
+  /* ---------- Calendar ---------- */
+  .ms-cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .ms-cal-head .t { display: flex; align-items: center; gap: 12px; font-weight: 800; font-size: 16px; }
+  .ms-cal-head .t i { color: var(--primary); font-size: 20px; }
+  .ms-cal-week, .ms-cal-days { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; }
+  .ms-cal-week { font-size: 12px; font-weight: 700; color: var(--muted); margin-bottom: 8px; }
+  .ms-cal-days { gap: 6px 4px; }
+  .ms-cal-day { height: 34px; width: 34px; margin: 0 auto; border-radius: 50%; display: grid; place-items: center; font-size: 12.5px; font-weight: 600; background: var(--primary-soft); color: var(--text); }
+  .ms-cal-day.out { opacity: 0.4; background: transparent; }
+  .ms-cal-day.today { background: var(--primary); color: #fff; font-weight: 800; box-shadow: 0 4px 10px rgba(13, 71, 161, 0.35); }
+  [data-theme="dark"] .ms-cal-day.today { color: #0b1437; }
+
+  /* ---------- Quick actions ---------- */
+  .ms-qa-title { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 15px; margin-bottom: 12px; }
+  .ms-qa-title i { color: #3b82f6; }
+  .ms-qa-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .ms-qa { display: flex; align-items: center; gap: 10px; padding: 12px 12px; border-radius: 12px; color: var(--text); font-size: 12px; font-weight: 700; transition: transform 0.15s, box-shadow 0.15s; }
+  .ms-qa:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+  .ms-qa i.ic { font-size: 24px; }
+  .ms-qa i.ar { margin-left: auto; font-size: 11px; opacity: 0.7; }
+  .ms-qa.blue { background: var(--qa-blue); } .ms-qa.blue i.ic { color: #2563eb; }
+  .ms-qa.green { background: var(--qa-green); } .ms-qa.green i.ic { color: #16a34a; }
+  .ms-qa.purple { background: var(--qa-purple); } .ms-qa.purple i.ic { color: #7c3aed; }
+  .ms-qa.orange { background: var(--qa-orange); } .ms-qa.orange i.ic { color: #f97316; }
+  .ms-help { background: var(--help-bg); color: #fff; border-radius: 14px; padding: 16px 18px; display: flex; align-items: center; gap: 14px; }
+  .ms-help > i { font-size: 34px; }
+  .ms-help b { display: block; font-size: 14.5px; }
+  .ms-help span { font-size: 12px; opacity: 0.85; }
+  .ms-support { margin-left: auto; background: rgba(255, 255, 255, 0.18); border: 0; color: #fff; font-weight: 700; font-size: 12.5px; border-radius: 10px; padding: 9px 16px; cursor: pointer; font-family: inherit; display: inline-flex; align-items: center; gap: 8px; }
+  .ms-support:hover { background: rgba(255, 255, 255, 0.28); }
+
+  /* ---------- Modal ---------- */
+  .ms-modal { display: none; position: fixed; inset: 0; background: rgba(8, 20, 60, 0.55); z-index: 90; align-items: center; justify-content: center; padding: 20px; }
+  .ms-modal.open { display: flex; }
+  .ms-modal-box { background: var(--card); color: var(--text); border-radius: 16px; padding: 26px; max-width: 380px; width: 100%; text-align: center; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3); }
+  .ms-modal-box i { font-size: 36px; color: var(--primary); }
+  .ms-modal-box h3 { margin: 10px 0 6px; color: var(--text); }
+  .ms-modal-box p { margin: 0 0 18px; color: var(--muted); font-size: 14px; }
+  .ms-modal-box button { background: var(--primary); color: #fff; border: 0; border-radius: 10px; padding: 10px 26px; font-weight: 700; cursor: pointer; font-family: inherit; }
+
+  /* ---------- Responsive ---------- */
+  @media (max-width: 1280px) {
+    .ms-grid { grid-template-columns: minmax(0, 1fr); }
+    .ms-chart-wrap { grid-template-columns: minmax(0, 1fr) 250px; }
+  }
+  @media (max-width: 992px) {
+    .ms-burger { display: inline-block; }
+    .ms-layout { grid-template-columns: minmax(0, 1fr); }
+    .ms-sidebar { position: fixed; top: 84px; left: 0; width: 270px; height: calc(100vh - 84px); z-index: 50; transform: translateX(-102%); transition: transform 0.25s; box-shadow: 8px 0 30px rgba(0, 0, 0, 0.2); }
+    .ms-sidebar.open { transform: translateX(0); }
+    .ms-scrim.open { display: block; position: fixed; inset: 84px 0 0 0; background: rgba(8, 20, 60, 0.4); z-index: 40; }
+    .ms-clock, .ms-brand p { display: none; }
+    .ms-stats { grid-template-columns: minmax(0, 1fr); }
+    .ms-chart-wrap { grid-template-columns: minmax(0, 1fr); }
+    .ms-minis { flex-direction: row; flex-wrap: wrap; }
+    .ms-mini { min-width: 200px; }
+  }
+  @media (max-width: 640px) {
+    .ms-header { padding: 0 12px; }
+    .ms-brand h1 { font-size: 15px; white-space: normal; line-height: 1.15; }
+    .ms-logo { display: none; }
+    .ms-theme { display: none; }
+    .ms-user-btn .nm { display: none; }
+    .ms-main { padding: 16px 12px 24px; }
+    .ms-welcome { flex-direction: column; align-items: flex-start; }
+    .ms-qa-grid { grid-template-columns: 1fr; }
+    .ms-help { flex-wrap: wrap; }
+  }
+</style>
+</head>
+<body class="ms">
+
+<header class="ms-header">
+  <div class="ms-brand">
+    <button class="ms-burger" id="msBurger" type="button" aria-label="Menu"><i class="fa-solid fa-bars"></i></button>
+    <div class="ms-logo"><i class="fa-solid fa-flask-vial"></i></div>
+    <div>
+      <h1>MEDISTAR MEDICAL LABORATORY</h1>
+      <p>Patient &amp; Laboratory Report Management System</p>
+    </div>
+  </div>
+  <div class="ms-hright">
+    <div class="ms-clock">
+      <i class="fa-regular fa-clock"></i>
+      <div><b id="msClock">--:--:--</b><span id="msClockDate">&nbsp;</span></div>
+    </div>
+    <div class="ms-theme">
+      <i class="fa-solid fa-sun"></i>
+      <select id="themeSwitcher" onchange="changeTheme(this.value)" aria-label="Theme">
+        <option value="light">Classic Blue</option>
+        <option value="dark">Dark Mode</option>
+        <option value="emerald">Emerald Green</option>
+      </select>
+    </div>
+    <div class="ms-user" id="msUser">
+      <button class="ms-user-btn" id="msUserBtn" type="button">
+        <span class="ms-avatar"><i class="fa-solid fa-circle-user"></i></span>
+        <span class="nm">__USERNAME__</span>
+        <i class="fa-solid fa-chevron-down" style="font-size: 11px;"></i>
+      </button>
+      <div class="ms-user-menu" id="msUserMenu">
+        <div class="ms-um-head"><b>__USERNAME__</b><span>__ROLE__</span></div>
+        <a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>
+        <a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>
+        <a href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
+      </div>
+    </div>
+    <a href="/logout" class="ms-logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
+  </div>
+</header>
+
+<div class="ms-layout">
+  <aside class="ms-sidebar" id="msSidebar">
+    <nav class="ms-nav">
+      <a href="/dashboard" class="active"><i class="fa-solid fa-house"></i> Dashboard</a>
+      <a href="/add-patient"><i class="fa-solid fa-user-plus"></i> Register Patient</a>
+      <a href="/patients-dashboard"><i class="fa-solid fa-print"></i> Test Results &amp; Print</a>
+      <a href="/reports"><i class="fa-solid fa-chart-line"></i> Reports &amp; Analytics</a>
+      <a href="/manage-tests"><i class="fa-solid fa-gear"></i> Manage Tests</a>
+      <a href="/manage-doctors"><i class="fa-solid fa-user-doctor"></i> Manage Doctors</a>
+      <a href="/manage-centers"><i class="fa-solid fa-hospital"></i> Centers</a>
+      <a href="/share-reports"><i class="fa-solid fa-share-nodes"></i> Share Reports</a>
+      <a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>
+      <a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>
+    </nav>
+    <div class="ms-side-foot">
+      <i class="fa-solid fa-heart-pulse"></i>
+      <p>Better Care<br>Through Accurate Results</p>
+    </div>
+  </aside>
+  <div class="ms-scrim" id="msScrim"></div>
+
+  <main class="ms-main">
+    <div class="ms-welcome">
+      <div class="ms-welcome-l">
+        <div class="ms-wave">&#128075;</div>
+        <div>
+          <h2>Welcome Back, __USERNAME__!</h2>
+          <p>Here's what's happening at your laboratory today.</p>
+        </div>
+      </div>
+      <div class="ms-datechip"><i class="fa-regular fa-calendar-days"></i> <span id="msDateChip">&nbsp;</span></div>
+    </div>
+
+    <div class="ms-grid">
+      <!-- ===== LEFT COLUMN ===== -->
+      <div class="ms-col">
+        <div class="ms-stats">
+          <div class="ms-stat blue">
+            <div class="ms-stat-ico"><i class="fa-solid fa-user-group"></i></div>
+            <div>
+              <h4>Total Patients</h4>
+              <div class="ms-num">__TOTAL_PATIENTS__</div>
+              <div class="ms-stat-sub">__PATIENT_TREND__ <span>vs last month</span></div>
+            </div>
+          </div>
+          <div class="ms-stat green">
+            <div class="ms-stat-ico"><i class="fa-solid fa-print"></i></div>
+            <div>
+              <h4>Completed Reports</h4>
+              <div class="ms-num">__COMPLETED__</div>
+              <div class="ms-stat-sub"><span>__COMPLETED_SUB__</span></div>
+            </div>
+          </div>
+          <div class="ms-stat purple">
+            <div class="ms-stat-ico"><i class="fa-solid fa-vial"></i></div>
+            <div>
+              <h4>Available Tests</h4>
+              <div class="ms-num">__TESTS__</div>
+              <div class="ms-stat-sub"><span>__TESTS_SUB__</span></div>
+            </div>
+          </div>
+        </div>
+
+        <section class="ms-panel">
+          <div class="ms-panel-head">
+            <div class="ms-panel-title">
+              <i class="fa-solid fa-chart-column"></i>
+              <div>
+                <h3>Patient Registrations Overview</h3>
+                <p>Recent patient registrations in the system</p>
+              </div>
+            </div>
+            <a href="/patients-dashboard" class="ms-viewall">View All <i class="fa-solid fa-chevron-right" style="font-size: 10px;"></i></a>
+          </div>
+          <div class="ms-chart-wrap">
+            <div id="msChart"></div>
+            <div class="ms-minis">
+              <div class="ms-mini"><i class="fa-solid fa-user-group"></i><div><small>Today's Registrations</small><b>__TODAY_COUNT__</b></div>__TODAY_TREND__</div>
+              <div class="ms-mini"><i class="fa-regular fa-calendar-check"></i><div><small>This Week</small><b>__WEEK_COUNT__</b></div>__WEEK_TREND__</div>
+              <div class="ms-mini"><i class="fa-regular fa-calendar"></i><div><small>This Month</small><b>__MONTH_COUNT__</b></div>__MONTH_TREND__</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="ms-panel">
+          <div class="ms-panel-head">
+            <div class="ms-panel-title">
+              <i class="fa-solid fa-user-gear"></i>
+              <h3>Recent Patient Registrations</h3>
+            </div>
+            <a href="/patients-dashboard" class="ms-viewall">View All <i class="fa-solid fa-chevron-right" style="font-size: 10px;"></i></a>
+          </div>
+          <div class="ms-table-scroll">
+            <table class="ms-table">
+              <thead>
+                <tr><th>Ref</th><th>Name</th><th>Phone</th><th>Doctor</th><th class="c">Action</th></tr>
+              </thead>
+              <tbody>
+                __RECENT_ROWS__
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <!-- ===== RIGHT COLUMN ===== -->
+      <div class="ms-col">
+        <section class="ms-panel ms-status" id="msStatus">
+          <div class="ms-status-ico" id="msStatusIco"><i class="fa-solid fa-check"></i></div>
+          <div>
+            <h4 id="msStatusLabel">Status</h4>
+            <div class="ms-sval" id="msStatusVal">Active</div>
+            <p id="msStatusSub">System is running smoothly</p>
+          </div>
+          <div class="ms-arrows">
+            <button class="ms-arrow" id="msStPrev" type="button" aria-label="Previous"><i class="fa-solid fa-chevron-left"></i></button>
+            <button class="ms-arrow" id="msStNext" type="button" aria-label="Next"><i class="fa-solid fa-chevron-right"></i></button>
+          </div>
+          <i class="fa-solid fa-shield-halved ms-shield"></i>
+        </section>
+
+        <section class="ms-panel">
+          <div class="ms-cal-head">
+            <div class="t"><i class="fa-regular fa-calendar-days"></i> <span id="msCalTitle">Month Year</span></div>
+            <div class="ms-arrows">
+              <button class="ms-arrow" id="msCalPrev" type="button" aria-label="Previous month"><i class="fa-solid fa-chevron-left"></i></button>
+              <button class="ms-arrow" id="msCalNext" type="button" aria-label="Next month"><i class="fa-solid fa-chevron-right"></i></button>
+            </div>
+          </div>
+          <div class="ms-cal-week"><div>Su</div><div>Mo</div><div>Tu</div><div>We</div><div>Th</div><div>Fr</div><div>Sa</div></div>
+          <div class="ms-cal-days" id="msCalDays"></div>
+        </section>
+
+        <section class="ms-panel">
+          <div class="ms-qa-title"><i class="fa-solid fa-bolt"></i> Quick Actions</div>
+          <div class="ms-qa-grid">
+            <a href="/add-patient" class="ms-qa blue"><i class="fa-solid fa-user-plus ic"></i> Register Patient <i class="fa-solid fa-chevron-right ar"></i></a>
+            <a href="/patients-dashboard" class="ms-qa green"><i class="fa-solid fa-print ic"></i> Test Results &amp; Print <i class="fa-solid fa-chevron-right ar"></i></a>
+            <a href="/reports" class="ms-qa purple"><i class="fa-solid fa-chart-line ic"></i> Reports &amp; Analytics <i class="fa-solid fa-chevron-right ar"></i></a>
+            <a href="/manage-tests" class="ms-qa orange"><i class="fa-solid fa-flask ic"></i> Manage Tests <i class="fa-solid fa-chevron-right ar"></i></a>
+          </div>
+        </section>
+
+        <div class="ms-help">
+          <i class="fa-solid fa-flask-vial"></i>
+          <div><b>Need Help?</b><span>Contact your system administrator</span></div>
+          <button class="ms-support" id="msSupportBtn" type="button"><i class="fa-solid fa-headset"></i> Support</button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="ms-modal" id="msModal">
+  <div class="ms-modal-box">
+    <i class="fa-solid fa-headset"></i>
+    <h3>Need Help?</h3>
+    <p>Please contact your system administrator for support with the laboratory system.</p>
+    <button type="button" id="msModalClose">Close</button>
+  </div>
+</div>
+
+<script>
+  var CHART_DATA = __CHART_JSON__;
+  var STATUS_SLIDES = __STATUS_JSON__;
+
+  /* ---------- Clock + date ---------- */
+  var DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  function two(n) { return String(n).padStart(2, '0'); }
+  function tick() {
+    var d = new Date();
+    var h = d.getHours(), ap = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    document.getElementById('msClock').textContent = two(h) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()) + ' ' + ap;
+    var short = MONTHS[d.getMonth()].slice(0, 3);
+    document.getElementById('msClockDate').textContent = short + ' ' + d.getDate() + ', ' + d.getFullYear();
+    document.getElementById('msDateChip').textContent = DAYS[d.getDay()] + ', ' + d.getDate() + ' ' + short + ' ' + d.getFullYear();
+  }
+  tick(); setInterval(tick, 1000);
+
+  /* ---------- Theme ---------- */
+  function changeTheme(t) {
+    if (t === 'light') { document.documentElement.removeAttribute('data-theme'); }
+    else { document.documentElement.setAttribute('data-theme', t); }
+    try { localStorage.setItem('lab_theme', t); } catch (e) {}
+  }
+  (function () {
+    var sel = document.getElementById('themeSwitcher');
+    var t = 'light';
+    try { t = localStorage.getItem('lab_theme') || 'light'; } catch (e) {}
+    sel.value = t;
+  })();
+
+  /* ---------- User menu / sidebar / modal ---------- */
+  var userBtn = document.getElementById('msUserBtn'), userMenu = document.getElementById('msUserMenu');
+  userBtn.addEventListener('click', function (e) { e.stopPropagation(); userMenu.classList.toggle('open'); });
+  document.addEventListener('click', function (e) { if (!document.getElementById('msUser').contains(e.target)) userMenu.classList.remove('open'); });
+  var side = document.getElementById('msSidebar'), scrim = document.getElementById('msScrim');
+  function toggleSide(open) { side.classList.toggle('open', open); scrim.classList.toggle('open', open); }
+  document.getElementById('msBurger').addEventListener('click', function () { toggleSide(!side.classList.contains('open')); });
+  scrim.addEventListener('click', function () { toggleSide(false); });
+  var modal = document.getElementById('msModal');
+  document.getElementById('msSupportBtn').addEventListener('click', function () { modal.classList.add('open'); });
+  document.getElementById('msModalClose').addEventListener('click', function () { modal.classList.remove('open'); });
+  modal.addEventListener('click', function (e) { if (e.target === modal) modal.classList.remove('open'); });
+
+  /* ---------- Status card slider ---------- */
+  var stIdx = 0;
+  function showStatus() {
+    var s = STATUS_SLIDES[stIdx];
+    document.getElementById('msStatusLabel').textContent = s.label;
+    var v = document.getElementById('msStatusVal');
+    v.textContent = s.value; v.className = 'ms-sval ' + s.tone;
+    document.getElementById('msStatusSub').textContent = s.sub;
+    var ico = document.getElementById('msStatusIco');
+    ico.className = 'ms-status-ico ' + s.tone;
+    ico.innerHTML = '<i class="fa-solid ' + s.icon + '"></i>';
+  }
+  document.getElementById('msStPrev').addEventListener('click', function () { stIdx = (stIdx - 1 + STATUS_SLIDES.length) % STATUS_SLIDES.length; showStatus(); });
+  document.getElementById('msStNext').addEventListener('click', function () { stIdx = (stIdx + 1) % STATUS_SLIDES.length; showStatus(); });
+  showStatus();
+
+  /* ---------- Calendar ---------- */
+  var calNow = new Date(), calY = calNow.getFullYear(), calM = calNow.getMonth();
+  function renderCal() {
+    document.getElementById('msCalTitle').textContent = MONTHS[calM] + ' ' + calY;
+    var first = new Date(calY, calM, 1).getDay();
+    var start = new Date(calY, calM, 1 - first);
+    var html = '';
+    var today = new Date();
+    for (var i = 0; i < 42; i++) {
+      var d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+      var cls = 'ms-cal-day';
+      if (d.getMonth() !== calM) cls += ' out';
+      if (d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate()) cls += ' today';
+      html += '<div><div class="' + cls + '">' + d.getDate() + '</div></div>';
+    }
+    document.getElementById('msCalDays').innerHTML = html;
+  }
+  document.getElementById('msCalPrev').addEventListener('click', function () { calM--; if (calM < 0) { calM = 11; calY--; } renderCal(); });
+  document.getElementById('msCalNext').addEventListener('click', function () { calM++; if (calM > 11) { calM = 0; calY++; } renderCal(); });
+  renderCal();
+
+  /* ---------- Registrations chart (inline SVG, no library) ---------- */
+  function renderChart() {
+    var box = document.getElementById('msChart');
+    var data = CHART_DATA;
+    if (!box || !data.length) return;
+    var W = Math.max(box.clientWidth, 320), H = 220, pl = 34, pr = 16, pt = 14, pb = 30;
+    var max = 0;
+    data.forEach(function (d) { if (d.value > max) max = d.value; });
+    var rough = Math.max(max, 1) / 4;
+    var mag = Math.pow(10, Math.floor(Math.log(rough) / Math.LN10));
+    var norm = rough / mag;
+    var step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+    var top = Math.max(step * Math.ceil(max / step), step);
+    var n = data.length;
+    var pts = data.map(function (d, i) {
+      return { x: pl + (n === 1 ? 0 : i * (W - pl - pr) / (n - 1)), y: pt + (H - pt - pb) * (1 - d.value / top), d: d };
+    });
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Patient registrations, last 7 days">';
+    svg += '<defs><linearGradient id="msArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" style="stop-color:var(--chart-line);stop-opacity:0.28"/><stop offset="100%" style="stop-color:var(--chart-line);stop-opacity:0.02"/></linearGradient></defs>';
+    for (var v = 0; v <= top + 0.0001; v += step) {
+      var y = pt + (H - pt - pb) * (1 - v / top);
+      svg += '<line class="ms-grid-line" x1="' + pl + '" x2="' + (W - pr) + '" y1="' + y + '" y2="' + y + '"/>';
+      svg += '<text class="ms-axis" x="' + (pl - 8) + '" y="' + (y + 4) + '" text-anchor="end">' + v + '</text>';
+    }
+    var path = 'M' + pts[0].x + ' ' + pts[0].y;
+    for (var i = 0; i < pts.length - 1; i++) {
+      var p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+      var c1x = p1.x + (p2.x - p0.x) / 6, c1y = p1.y + (p2.y - p0.y) / 6;
+      var c2x = p2.x - (p3.x - p1.x) / 6, c2y = p2.y - (p3.y - p1.y) / 6;
+      c1y = Math.min(Math.max(c1y, pt), H - pb); c2y = Math.min(Math.max(c2y, pt), H - pb);
+      path += ' C' + c1x + ' ' + c1y + ',' + c2x + ' ' + c2y + ',' + p2.x + ' ' + p2.y;
+    }
+    var baseY = H - pb;
+    svg += '<path d="' + path + ' L' + pts[pts.length - 1].x + ' ' + baseY + ' L' + pts[0].x + ' ' + baseY + ' Z" fill="url(#msArea)"/>';
+    svg += '<path class="ms-line" d="' + path + '"/>';
+    pts.forEach(function (p) {
+      svg += '<circle class="ms-dot" cx="' + p.x + '" cy="' + p.y + '" r="4"><title>' + p.d.label + ': ' + p.d.value + ' patient' + (p.d.value === 1 ? '' : 's') + '</title></circle>';
+      svg += '<text class="ms-axis" x="' + p.x + '" y="' + (H - 8) + '" text-anchor="middle">' + p.d.label + '</text>';
+    });
+    svg += '</svg>';
+    box.innerHTML = svg;
+  }
+  renderChart();
+  var rzT; window.addEventListener('resize', function () { clearTimeout(rzT); rzT = setTimeout(renderChart, 120); });
+</script>
+</body>
+</html>
+"""
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
+def dashboard(request: Request):
+    import json as _json
+    from datetime import timedelta
+
+    user = getattr(request.state, "user", None) or get_current_user(request)
+    raw_name = (user.get("username") or "").strip() or "User"
+    display_name = raw_name[:1].upper() + raw_name[1:]
+    role_label = (user.get("role") or "").strip() or "User"
+
+    today = now_colombo().date()
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     cursor.execute("SELECT COUNT(*) FROM patients")
     total_patients = cursor.fetchone()[0]
-    
+
     try:
         cursor.execute("SELECT COUNT(DISTINCT patient_id) FROM patient_assigned_tests WHERE result IS NOT NULL AND result != ''")
         completed_reports = cursor.fetchone()[0]
-    except:
+    except Exception:
         completed_reports = 0
-    
+
     cursor.execute("SELECT COUNT(*) FROM tests")
     total_tests = cursor.fetchone()[0]
-    
+
+    try:
+        cursor.execute("SELECT COUNT(DISTINCT department) FROM tests WHERE department IS NOT NULL AND department != ''")
+        dept_count = cursor.fetchone()[0]
+    except Exception:
+        dept_count = 0
+
     cursor.execute("SELECT id, title, name, phone, doctor FROM patients WHERE (is_cancelled IS NULL OR is_cancelled = 0) ORDER BY id DESC LIMIT 5")
     recent_patients = cursor.fetchall()
-    
+
+    # Registrations per day (created_at is stored as local Colombo time,
+    # so the first 10 chars are the local calendar date).
+    month_start = today.replace(day=1)
+    prev_month_end = month_start - timedelta(days=1)
+    prev_month_start = prev_month_end.replace(day=1)
+    earliest = min(prev_month_start, today - timedelta(days=13))
+    daily = {}
+    try:
+        cursor.execute(
+            "SELECT substr(created_at, 1, 10), COUNT(*) FROM patients "
+            "WHERE (is_cancelled IS NULL OR is_cancelled = 0) AND created_at IS NOT NULL "
+            "AND substr(created_at, 1, 10) >= ? GROUP BY substr(created_at, 1, 10)",
+            (earliest.isoformat(),),
+        )
+        for r in cursor.fetchall():
+            daily[str(r[0])] = int(r[1])
+    except Exception:
+        daily = {}
+
+    try:
+        cursor.execute(
+            "SELECT COUNT(DISTINCT patient_id) FROM patient_assigned_tests "
+            "WHERE (result IS NULL OR result = '') "
+            "AND patient_id IN (SELECT id FROM patients WHERE is_cancelled IS NULL OR is_cancelled = 0)"
+        )
+        pending_reports = cursor.fetchone()[0]
+    except Exception:
+        pending_reports = 0
+
     conn.close()
+
+    def span(a, b):
+        return sum(daily.get((a + timedelta(days=i)).isoformat(), 0) for i in range((b - a).days + 1))
+
+    today_c = daily.get(today.isoformat(), 0)
+    yest_c = daily.get((today - timedelta(days=1)).isoformat(), 0)
+    week_c = span(today - timedelta(days=6), today)
+    prev_week_c = span(today - timedelta(days=13), today - timedelta(days=7))
+    month_c = span(month_start, today)
+    prev_month_c = span(prev_month_start, prev_month_end)
+
+    chart = []
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        chart.append({"label": f"{d.strftime('%b')} {d.day}", "value": daily.get(d.isoformat(), 0)})
+
+    rate = int(round(completed_reports * 100.0 / total_patients)) if total_patients else 0
+    status_slides = [
+        {"label": "Status", "value": "Active", "sub": "System is running smoothly", "tone": "ok", "icon": "fa-check"},
+        {"label": "Today", "value": str(today_c), "sub": "patients registered today", "tone": "info", "icon": "fa-user-group"},
+        {"label": "Pending Reports", "value": str(pending_reports), "sub": "patients awaiting results", "tone": "warn", "icon": "fa-hourglass-half"},
+    ]
 
     recent_rows = ""
     if recent_patients:
         for p in recent_patients:
             p_id, title, name, phone, doctor = p
-            p_phone = phone if phone else 'N/A'
-            recent_rows += f"""
-            <tr>
-                <td style="padding: 5px 8px; font-weight: 700;">#{p_id}</td>
-                <td style="padding: 5px 8px; font-weight: 600;">{title} {name}</td>
-                <td style="padding: 5px 8px; opacity: 0.8;">{p_phone}</td>
-                <td style="padding: 5px 8px;">{doctor}</td>
-                <td style="padding: 5px 8px; text-align: center;">
-                    <a href="/patient-results/{p_id}" class="view-btn"><i class="fa-solid fa-eye"></i> View</a>
-                </td>
-            </tr>
-            """
+            p_name = html.escape(f"{title or ''} {name or ''}".strip())
+            p_phone = html.escape(str(phone)) if phone else "N/A"
+            p_doctor = html.escape(str(doctor)) if doctor else "&mdash;"
+            recent_rows += (
+                f'<tr><td class="strong">#{p_id}</td><td class="strong">{p_name}</td>'
+                f'<td class="mut">{p_phone}</td><td>{p_doctor}</td>'
+                f'<td class="c"><a href="/patient-results/{p_id}" class="ms-view"><i class="fa-solid fa-eye"></i> View</a></td></tr>'
+            )
     else:
-        recent_rows = '<tr><td colspan="5" style="padding: 20px; text-align: center; color: var(--text-muted);">No patients registered yet.</td></tr>'
+        recent_rows = '<tr><td colspan="5" class="c mut" style="padding: 20px;">No patients registered yet.</td></tr>'
 
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Lab System - Dashboard</title>
-        <!-- FontAwesome Icons -->
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-            :root {{
-                --bg-color: #f4f7fe;
-                --header-bg: #0d47a1;
-                --card-bg: #ffffff;
-                --text-main: #1b2559;
-                --text-muted: #707eae;
-                --border-color: #e2e8f0;
-                --btn-bg: #ffffff;
-                --btn-color: #0d47a1;
-                --btn-hover-bg: #0d47a1;
-                --btn-hover-color: #ffffff;
-                --accent-green: #2e7d32;
-                --shadow: 0px 8px 24px rgba(0, 0, 0, 0.05);
-                --table-header: #0d47a1;
-            }}
+    replacements = {
+        "__USERNAME__": html.escape(display_name),
+        "__ROLE__": html.escape(role_label),
+        "__TOTAL_PATIENTS__": str(total_patients),
+        "__PATIENT_TREND__": _dash_trend_html(month_c, prev_month_c),
+        "__COMPLETED__": str(completed_reports),
+        "__COMPLETED_SUB__": f"{rate}% of all patients",
+        "__TESTS__": str(total_tests),
+        "__TESTS_SUB__": f"across {dept_count} department{'s' if dept_count != 1 else ''}",
+        "__RECENT_ROWS__": recent_rows,
+        "__TODAY_COUNT__": str(today_c),
+        "__TODAY_TREND__": _dash_trend_html(today_c, yest_c),
+        "__WEEK_COUNT__": str(week_c),
+        "__WEEK_TREND__": _dash_trend_html(week_c, prev_week_c),
+        "__MONTH_COUNT__": str(month_c),
+        "__MONTH_TREND__": _dash_trend_html(month_c, prev_month_c),
+        "__CHART_JSON__": _json.dumps(chart),
+        "__STATUS_JSON__": _json.dumps(status_slides),
+    }
+    page = _DASHBOARD_TEMPLATE
+    for key, val in replacements.items():
+        page = page.replace(key, val)
+    return page
 
-            [data-theme="dark"] {{
-                --bg-color: #0b1437;
-                --header-bg: #111c44;
-                --card-bg: #111c44;
-                --text-main: #ffffff;
-                --text-muted: #8f9bba;
-                --border-color: #1b254b;
-                --btn-bg: #1b254b;
-                --btn-color: #38bdf8;
-                --btn-hover-bg: #38bdf8;
-                --btn-hover-color: #0b1437;
-                --accent-green: #4ade80;
-                --shadow: 0px 8px 24px rgba(0, 0, 0, 0.3);
-                --table-header: #1b254b;
-            }}
-
-            [data-theme="emerald"] {{
-                --bg-color: #f0fdf4;
-                --header-bg: #065f46;
-                --card-bg: #ffffff;
-                --text-main: #064e3b;
-                --text-muted: #047857;
-                --border-color: #a7f3d0;
-                --btn-bg: #ffffff;
-                --btn-color: #065f46;
-                --btn-hover-bg: #065f46;
-                --btn-hover-color: #ffffff;
-                --accent-green: #10b981;
-                --shadow: 0px 8px 24px rgba(6, 95, 70, 0.08);
-                --table-header: #065f46;
-            }}
-
-            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; transition: background 0.3s, color 0.3s; }}
-            body {{ background: var(--bg-color); color: var(--text-main); }}
-
-            /* Smart Top Navbar */
-            .header {{
-                background: var(--header-bg);
-                color: white;
-                padding: 14px 28px;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            }}
-            .header h2 {{ margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0.5px; display: flex; align-items: center; gap: 10px; }}
-            .header p {{ margin: 2px 0 0 0; font-size: 12px; opacity: 0.8; }}
-
-            .header-right {{ display: flex; align-items: center; gap: 15px; }}
-            .live-clock {{
-                font-size: 13px;
-                font-weight: 600;
-                background: rgba(255, 255, 255, 0.15);
-                padding: 6px 14px;
-                border-radius: 20px;
-                color: #ffffff;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-            }}
-
-            .theme-select {{
-                background: rgba(255, 255, 255, 0.2);
-                color: white;
-                border: 1px solid rgba(255, 255, 255, 0.3);
-                padding: 6px 12px;
-                border-radius: 20px;
-                cursor: pointer;
-                font-weight: 600;
-                font-size: 13px;
-                outline: none;
-            }}
-            .theme-select option {{ background: #111c44; color: white; }}
-
-            .logout-btn {{
-                background: #e53e3e;
-                color: white;
-                border: none;
-                padding: 7px 16px;
-                border-radius: 8px;
-                font-weight: 600;
-                font-size: 13px;
-                cursor: pointer;
-                text-decoration: none;
-                transition: 0.2s;
-            }}
-            .logout-btn:hover {{ background: #c53030; }}
-
-            .container {{ padding: 22px 28px; max-width: 1440px; margin: auto; }}
-
-            /* Stat Cards Grid */
-            .cards-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px; margin-bottom: 22px; }}
-            .card {{
-                background: var(--card-bg);
-                padding: 18px;
-                border-radius: 12px;
-                box-shadow: var(--shadow);
-                border-left: 5px solid var(--btn-color);
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-            .card.status-card {{ border-left-color: var(--accent-green); }}
-            .card-content h3 {{ margin: 0 0 4px 0; font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }}
-            .card-content .number {{ font-size: 24px; font-weight: 700; color: var(--text-main); margin: 0; }}
-            .card-icon {{ font-size: 28px; opacity: 0.25; color: var(--text-main); }}
-
-            /* Big Prominent Action Tabs */
-            .btn-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                gap: 16px;
-                margin-bottom: 26px;
-            }}
-            .action-btn {{
-                background: var(--card-bg);
-                border: 2px solid var(--border-color);
-                padding: 16px 20px;
-                border-radius: 14px;
-                text-decoration: none;
-                color: var(--btn-color);
-                font-weight: 700;
-                font-size: 15px;
-                box-shadow: var(--shadow);
-                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-                display: flex;
-                align-items: center;
-                justify-content: flex-start;
-                gap: 14px;
-            }}
-            .action-btn i {{
-                font-size: 22px;
-            }}
-            .action-btn:hover {{
-                background: var(--btn-hover-bg);
-                color: var(--btn-hover-color);
-                border-color: var(--btn-hover-bg);
-                transform: translateY(-4px);
-                box-shadow: 0px 12px 28px rgba(0, 0, 0, 0.12);
-            }}
-
-            /* Primary Highlight Tabs */
-            .action-btn.primary-highlight {{
-                background: var(--header-bg);
-                color: #ffffff;
-                border-color: var(--header-bg);
-            }}
-            .action-btn.primary-highlight:hover {{
-                opacity: 0.92;
-                transform: translateY(-4px);
-            }}
-
-            /* Bottom Layout: Table + Calendar */
-            .bottom-grid {{ display: grid; grid-template-columns: 2.8fr 1.2fr; gap: 20px; }}
-            @media (max-width: 992px) {{ .bottom-grid {{ grid-template-columns: 1fr; }} }}
-
-            .section-box {{
-                background: var(--card-bg);
-                padding: 18px 22px;
-                border-radius: 14px;
-                box-shadow: var(--shadow);
-                border: 1px solid var(--border-color);
-            }}
-            .section-box h3 {{
-                margin-top: 0;
-                margin-bottom: 14px;
-                font-size: 15px;
-                font-weight: 700;
-                color: var(--text-main);
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }}
-
-            /* Compact Table */
-            .compact-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-            .compact-table th {{
-                background: var(--table-header);
-                color: white;
-                text-align: left;
-                padding: 5px 8px;
-                font-weight: 600;
-            }}
-            .compact-table td {{ padding: 5px 8px; border-bottom: 1px solid var(--border-color); }}
-            .compact-table tr:hover {{ background-color: rgba(0,0,0,0.02); }}
-
-            .view-btn {{
-                color: var(--btn-color);
-                text-decoration: none;
-                font-size: 12px;
-                font-weight: 700;
-                background: rgba(13, 71, 161, 0.1);
-                padding: 6px 12px;
-                border-radius: 6px;
-                transition: 0.2s;
-            }}
-            .view-btn:hover {{ background: var(--btn-color); color: white; }}
-
-            /* Mini Calendar Widget */
-            .calendar {{ text-align: center; }}
-            .calendar-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; font-weight: 700; font-size: 14px; color: var(--text-main); }}
-            .calendar-weekdays {{ display: grid; grid-template-columns: repeat(7, 1fr); font-size: 12px; font-weight: 700; color: var(--text-muted); margin-bottom: 8px; }}
-            .calendar-days {{ display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }}
-            .calendar-day {{ padding: 7px 0; font-size: 12px; border-radius: 6px; color: var(--text-main); background: rgba(0,0,0,0.02); }}
-            .calendar-day.today {{ background: var(--btn-color) !important; color: white !important; font-weight: 700; }}
-        </style>
-    </head>
-    <body>
-        <!-- Modern Header -->
-        <div class="header">
-            <div>
-                <h2><i class="fa-solid fa-flask-vial"></i> MEDISTAR MEDICAL LABORATORY</h2>
-                <p>Patient & Laboratory Report Management System</p>
-            </div>
-            <div class="header-right">
-                <div class="live-clock">
-                    <i class="fa-regular fa-clock"></i> <span id="liveClock">00:00:00 AM</span>
-                </div>
-                <select id="themeSwitcher" class="theme-select" onchange="changeTheme(this.value)">
-                    <option value="light">☀️ Classic Blue</option>
-                    <option value="dark">🌙 Dark Mode</option>
-                    <option value="emerald">🌿 Emerald Green</option>
-                </select>
-                <a href="/logout" class="logout-btn"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
-            </div>
-        </div>
-
-        <div class="container">
-            
-            <!-- Cards Section -->
-            <div class="cards-grid">
-                <div class="card">
-                    <div class="card-content">
-                        <h3>Total Patients</h3>
-                        <p class="number">{total_patients}</p>
-                    </div>
-                    <div class="card-icon"><i class="fa-solid fa-users"></i></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-content">
-                        <h3>Completed Reports</h3>
-                        <p class="number">{completed_reports}</p>
-                    </div>
-                    <div class="card-icon"><i class="fa-solid fa-file-medical"></i></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-content">
-                        <h3>Available Tests</h3>
-                        <p class="number">{total_tests}</p>
-                    </div>
-                    <div class="card-icon"><i class="fa-solid fa-vials"></i></div>
-                </div>
-
-                <div class="card status-card">
-                    <div class="card-content">
-                        <h3>Status</h3>
-                        <p class="number" style="color: var(--accent-green); font-size: 18px;">Active</p>
-                    </div>
-                    <div class="card-icon" style="color: var(--accent-green);"><i class="fa-solid fa-circle-check"></i></div>
-                </div>
-            </div>
-
-            <!-- Big Prominent Action Tabs -->
-            <div class="btn-grid">
-                <a href="/add-patient" class="action-btn primary-highlight">
-                    <i class="fa-solid fa-user-plus"></i> Register Patient
-                </a>
-                <a href="/patients-dashboard" class="action-btn primary-highlight">
-                    <i class="fa-solid fa-print"></i> Test Results & Print
-                </a>
-                <a href="/reports" class="action-btn">
-                    <i class="fa-solid fa-chart-line"></i> Reports & Analytics
-                </a>
-                <a href="/manage-tests" class="action-btn">
-                    <i class="fa-solid fa-microscope"></i> Manage Tests
-                </a>
-                <a href="/manage-doctors" class="action-btn">
-                    <i class="fa-solid fa-user-doctor"></i> Manage Doctors
-                </a>
-                <a href="/manage-centers" class="action-btn">
-                    <i class="fa-solid fa-hospital"></i> Centers
-                </a>
-                <a href="/share-reports" class="action-btn">
-                    <i class="fa-brands fa-whatsapp"></i> Share Reports
-                </a>
-                <a href="/print-settings" class="action-btn">
-                    <i class="fa-solid fa-sliders"></i> Print Settings
-                </a>
-                <!-- User Management Button Added Here -->
-                <a href="/manage-users" class="action-btn">
-                    <i class="fa-solid fa-user-gear"></i> Manage Users
-                </a>
-            </div>
-
-            <!-- Bottom Section: Table + Calendar -->
-            <div class="bottom-grid">
-                
-                <!-- Compact Table -->
-                <div class="section-box">
-                    <h3>
-                        <span>Recent Patient Registrations</span>
-                        <i class="fa-solid fa-list-check" style="opacity: 0.5;"></i>
-                    </h3>
-                    <table class="compact-table">
-                        <thead>
-                            <tr>
-                                <th>Ref</th>
-                                <th>Name</th>
-                                <th>Phone</th>
-                                <th>Doctor</th>
-                                <th style="text-align: center;">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {recent_rows}
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- Mini Calendar -->
-                <div class="section-box calendar">
-                    <div class="calendar-header">
-                        <span id="monthYear">Month Year</span>
-                        <i class="fa-solid fa-calendar-days" style="color: var(--btn-color);"></i>
-                    </div>
-                    <div class="calendar-weekdays">
-                        <div>Su</div><div>Mo</div><div>Tu</div><div>We</div><div>Th</div><div>Fr</div><div>Sa</div>
-                    </div>
-                    <div class="calendar-days" id="calendarDays"></div>
-                </div>
-
-            </div>
-        </div>
-
-        <script>
-            // Realtime Live Clock
-            function updateClock() {{
-                const now = new Date();
-                let hours = now.getHours();
-                const minutes = String(now.getMinutes()).padStart(2, '0');
-                const seconds = String(now.getSeconds()).padStart(2, '0');
-                const ampm = hours >= 12 ? 'PM' : 'AM';
-                hours = hours % 12 || 12;
-                document.getElementById('liveClock').innerText = `${{String(hours).padStart(2, '0')}}:${{minutes}}:${{seconds}} ${{ampm}}`;
-            }}
-            setInterval(updateClock, 1000);
-            updateClock();
-
-            // Dynamic Mini Calendar Render
-            function renderCalendar() {{
-                const now = new Date();
-                const year = now.getFullYear();
-                const month = now.getMonth();
-                const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-                document.getElementById('monthYear').innerText = `${{months[month]}} ${{year}}`;
-
-                const firstDayIndex = new Date(year, month, 1).getDay();
-                const totalDays = new Date(year, month + 1, 0).getDate();
-                const currentDay = now.getDate();
-
-                let daysHTML = '';
-                for (let i = 0; i < firstDayIndex; i++) daysHTML += `<div></div>`;
-                for (let i = 1; i <= totalDays; i++) {{
-                    let className = (i === currentDay) ? 'calendar-day today' : 'calendar-day';
-                    daysHTML += `<div class="${{className}}">${{i}}</div>`;
-                }}
-                document.getElementById('calendarDays').innerHTML = daysHTML;
-            }}
-            renderCalendar();
-
-            // Theme Switcher Logic
-            function changeTheme(theme) {{
-                if (theme === 'light') {{
-                    document.documentElement.removeAttribute('data-theme');
-                    localStorage.setItem('lab_theme', 'light');
-                }} else {{
-                    document.documentElement.setAttribute('data-theme', theme);
-                    localStorage.setItem('lab_theme', theme);
-                }}
-            }}
-
-            window.onload = function() {{
-                const savedTheme = localStorage.getItem('lab_theme');
-                if (savedTheme && savedTheme !== 'light') {{
-                    document.documentElement.setAttribute('data-theme', savedTheme);
-                    document.getElementById('themeSwitcher').value = savedTheme;
-                }}
-            }}
-        </script>
-    </body>
-    </html>
-    """
 
 # -------------------------------------------------------------
 # 2. MANAGE USERS ROUTE (100% Crash-Proof & Error-Free)
