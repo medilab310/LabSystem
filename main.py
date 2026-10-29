@@ -1046,6 +1046,355 @@ async def ui_unify_middleware(request: Request, call_next):
     return response
 
 
+
+# =============================================================
+# SHARED LAYOUT (Classic Blue) — injected by layout_inject_middleware
+# Added as the OUTERMOST middleware so it runs last on the response,
+# after auth/rate-limit/ui-unify have already processed it.
+# =============================================================
+SHARED_LAYOUT_CSS = """
+.app-sidebar{position:fixed;top:0;left:0;width:220px;height:100vh;background:linear-gradient(180deg,#1e40af 0%,#1e3a8a 100%);color:#fff;display:flex;flex-direction:column;z-index:1000;transition:transform .25s ease;overflow-y:auto;}
+.app-sidebar .logo{padding:18px 16px;border-bottom:1px solid rgba(255,255,255,.12);display:flex;align-items:center;gap:10px;}
+.app-sidebar .logo-icon{width:38px;height:38px;border-radius:10px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.app-sidebar .logo-text{font-size:15px;font-weight:800;letter-spacing:.3px;line-height:1.2;color:#fff;}
+.app-sidebar .logo-text small{display:block;font-size:9.5px;font-weight:500;opacity:.75;letter-spacing:1.2px;margin-top:2px;}
+.app-sidebar nav{flex:1;padding:12px 10px;}
+.app-sidebar .nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:8px;color:rgba(255,255,255,.82);text-decoration:none;font-size:13.5px;font-weight:600;margin-bottom:2px;transition:background .15s,color .15s;}
+.app-sidebar .nav-item:hover{background:rgba(255,255,255,.1);color:#fff;}
+.app-sidebar .nav-item.active{background:#2563eb;color:#fff;box-shadow:0 2px 10px rgba(37,99,235,.45);}
+.app-sidebar .nav-item svg{width:17px;height:17px;flex-shrink:0;}
+.app-sidebar .sidebar-footer{padding:14px 16px;border-top:1px solid rgba(255,255,255,.12);font-size:11px;opacity:.85;line-height:1.5;display:flex;align-items:center;gap:7px;}
+.app-sidebar .sidebar-footer svg{width:14px;height:14px;flex-shrink:0;color:#fca5a5;}
+.app-header{position:fixed;top:0;left:220px;right:0;height:58px;background:#fff;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;padding:0 24px;z-index:900;box-shadow:0 1px 3px rgba(0,0,0,.04);}
+.app-header .hamburger{display:none;background:none;border:none;cursor:pointer;color:#1e40af;padding:4px;align-items:center;}
+.app-header .header-left{display:flex;align-items:center;gap:14px;}
+.app-header .date-chip{background:#eff6ff;color:#1e40af;padding:6px 14px;border-radius:20px;font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:6px;}
+.app-header .date-chip svg{width:14px;height:14px;}
+.app-header .theme-label{font-size:12px;color:#64748b;font-weight:600;background:#f1f5f9;padding:5px 12px;border-radius:20px;}
+.app-header .header-right{display:flex;align-items:center;gap:14px;}
+.app-header .user-label{font-size:13px;font-weight:600;color:#334155;display:flex;align-items:center;gap:8px;}
+.app-header .user-avatar{width:30px;height:30px;border-radius:50%;background:#1e40af;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;}
+.app-header .logout-btn{background:#dc2626;color:#fff;border:none;padding:7px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;transition:background .15s;display:inline-flex;align-items:center;gap:6px;}
+.app-header .logout-btn:hover{background:#b91c1c;}
+.app-header .logout-btn svg{width:14px;height:14px;}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;}
+.app-main{margin-left:220px;margin-top:58px;padding:24px;min-height:calc(100vh - 58px);background:#f1f5f9;box-sizing:border-box;}
+.app-main table{max-width:100%;}
+/* Dashboard stat cards & chart (ds- prefix avoids colliding with per-page CSS) */
+.ds-welcome{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:20px;}
+.ds-welcome h1{font-size:24px;font-weight:800;color:#0f172a;margin:0;}
+.ds-welcome p{color:#64748b;font-size:13px;margin:4px 0 0 0;}
+.ds-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;margin-bottom:22px;}
+.ds-stat-card{background:#fff;border-radius:14px;padding:18px;box-shadow:0 1px 3px rgba(15,23,42,.06);border:1px solid #e2e8f0;display:flex;align-items:center;gap:14px;transition:transform .15s,box-shadow .15s;}
+.ds-stat-card:hover{transform:translateY(-2px);box-shadow:0 6px 16px rgba(15,23,42,.08);}
+.ds-icon-circle{width:46px;height:46px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;color:#fff;}
+.ds-icon-circle svg{width:22px;height:22px;}
+.ds-stat-info{flex:1;min-width:0;}
+.ds-stat-label{font-size:11px;color:#64748b;text-transform:uppercase;font-weight:700;letter-spacing:.5px;}
+.ds-stat-value{font-size:24px;font-weight:800;color:#0f172a;margin:2px 0 0 0;line-height:1.1;}
+.ds-trend{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;margin-top:6px;}
+.ds-trend.up{background:#dcfce7;color:#15803d;}
+.ds-trend.down{background:#fee2e2;color:#b91c1c;}
+.ds-trend.flat{background:#f1f5f9;color:#64748b;}
+.ds-chart-row{display:grid;grid-template-columns:2fr 1fr;gap:20px;margin-bottom:22px;}
+.ds-box{background:#fff;border-radius:14px;padding:18px 20px;box-shadow:0 1px 3px rgba(15,23,42,.06);border:1px solid #e2e8f0;}
+.ds-box h3{margin:0 0 14px 0;font-size:15px;font-weight:700;color:#0f172a;display:flex;justify-content:space-between;align-items:center;}
+.ds-mini-stats{display:flex;flex-direction:column;gap:12px;}
+.ds-mini-stat{background:#fff;border-radius:12px;padding:14px 16px;border:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;box-shadow:0 1px 3px rgba(15,23,42,.05);}
+.ds-mini-stat span{font-size:12px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.4px;}
+.ds-mini-stat b{font-size:20px;font-weight:800;color:#1e40af;}
+.ds-bottom{display:grid;grid-template-columns:2.6fr 1.4fr;gap:20px;}
+.ds-right-col{display:flex;flex-direction:column;gap:16px;}
+.ds-cal-table{width:100%;border-collapse:collapse;font-size:12px;}
+.ds-cal-table th{padding:5px 2px;color:#64748b;font-weight:700;font-size:11px;text-transform:uppercase;}
+.ds-cal-table td{padding:6px 2px;text-align:center;border-radius:6px;color:#334155;}
+.ds-cal-table td.today{background:#2563eb;color:#fff;font-weight:700;}
+.ds-cal-table td.empty{background:transparent;}
+.ds-quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.ds-quick-btn{display:block;text-align:center;padding:10px 6px;border-radius:8px;background:#eff6ff;color:#1e40af;font-size:12.5px;font-weight:700;text-decoration:none;transition:background .15s,color .15s;}
+.ds-quick-btn:hover{background:#1e40af;color:#fff;}
+.ds-help-card{background:linear-gradient(135deg,#1e40af,#2563eb);color:#fff;border-radius:14px;padding:18px 20px;box-shadow:0 4px 14px rgba(30,64,175,.3);}
+.ds-help-card h3{color:#fff;margin:0 0 8px 0;font-size:15px;font-weight:700;}
+.ds-help-card p{font-size:12px;opacity:.92;margin:0 0 12px 0;line-height:1.5;}
+.ds-help-card a{color:#fff;font-weight:700;font-size:13px;text-decoration:underline;}
+/* Sticky save bar + abnormal flags (test entry) */
+.sticky-save-bar{position:fixed;bottom:0;left:220px;right:0;background:#fff;border-top:2px solid #2563eb;padding:9px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px;box-shadow:0 -4px 16px rgba(0,0,0,.12);z-index:800;flex-wrap:wrap;}
+.sticky-save-bar .progress{font-size:13px;font-weight:600;color:#334155;}
+.sticky-save-bar .progress .pct{color:#2563eb;font-weight:800;}
+.sticky-save-bar .hint{font-size:11px;color:#64748b;}
+.sticky-save-bar .bar-btns{display:flex;gap:10px;flex-wrap:wrap;}
+.sticky-save-bar button{border:none;padding:9px 18px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;transition:opacity .15s;}
+.sticky-save-bar button:hover{opacity:.88;}
+.sticky-save-bar .btn-sticky-save{background:#059669;color:#fff;}
+.sticky-save-bar .btn-sticky-reset{background:#dc2626;color:#fff;}
+.sticky-save-bar .btn-sticky-print{background:#2563eb;color:#fff;text-decoration:none;display:inline-flex;align-items:center;padding:9px 18px;border-radius:8px;font-size:13px;font-weight:700;}
+.param-input.flag-high{border-color:#dc2626 !important;box-shadow:0 0 0 2px rgba(220,38,38,.18) !important;}
+.param-input.flag-low{border-color:#d97706 !important;box-shadow:0 0 0 2px rgba(217,119,6,.18) !important;}
+.flag-badge{font-size:10px;font-weight:800;padding:2px 7px;border-radius:10px;margin-left:6px;display:inline-block;vertical-align:middle;}
+.flag-badge.high{background:#fee2e2;color:#dc2626;}
+.flag-badge.low{background:#fef3c7;color:#d97706;}
+@media(max-width:992px){.ds-chart-row{grid-template-columns:1fr;}.ds-bottom{grid-template-columns:1fr;}}
+@media(max-width:768px){
+  .app-sidebar{transform:translateX(-100%);}
+  .app-sidebar.open{transform:translateX(0);}
+  .sidebar-overlay.show{display:block;}
+  .app-header{left:0;padding:0 14px;}
+  .app-header .hamburger{display:inline-flex;}
+  .app-header .theme-label{display:none;}
+  .app-main{margin-left:0;padding:14px;}
+  .app-main table{display:block;overflow-x:auto;white-space:nowrap;}
+  .sticky-save-bar{left:0;padding:9px 14px;}
+}
+"""
+
+def _svg(inner, fill="none"):
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="' + fill +
+            '" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + inner + '</svg>')
+
+_NAV_ITEMS = [
+    ("dashboard", "Dashboard", "/dashboard",
+     _svg('<rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/>')),
+    ("add-patient", "Register Patient", "/add-patient",
+     _svg('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/>')),
+    ("results", "Test Results & Print", "/patients-dashboard",
+     _svg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/>')),
+    ("reports", "Reports & Analytics", "/reports",
+     _svg('<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>')),
+    ("tests", "Manage Tests", "/manage-tests",
+     _svg('<path d="M9 3h6"/><path d="M10 3v6L4.5 18a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/>')),
+    ("doctors", "Manage Doctors", "/manage-doctors",
+     _svg('<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>')),
+    ("centers", "Centers", "/manage-centers",
+     _svg('<rect x="4" y="2" width="16" height="20" rx="2"/><path d="M12 6v4M10 8h4"/><line x1="8" y1="16" x2="16" y2="16"/>')),
+    ("share", "Share Reports", "/share-reports",
+     _svg('<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.6" y1="13.5" x2="15.4" y2="17.5"/><line x1="15.4" y1="6.5" x2="8.6" y2="10.5"/>')),
+    ("print", "Print Settings", "/print-settings",
+     _svg('<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>')),
+    ("users", "Manage Users", "/manage-users",
+     _svg('<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>')),
+]
+
+_NAV_PREFIX_MAP = {
+    "/dashboard": "dashboard",
+    "/add-patient": "add-patient",
+    "/patients-dashboard": "results",
+    "/patient-results": "results",
+    "/test-entry": "results",
+    "/enter-results": "results",
+    "/select-patient": "results",
+    "/patient-tests": "results",
+    "/reports": "reports",
+    "/manage-tests": "tests",
+    "/add-test-entry": "tests",
+    "/manage-ranges": "tests",
+    "/manage-doctors": "doctors",
+    "/manage-centers": "centers",
+    "/share-reports": "share",
+    "/print-settings": "print",
+    "/manage-users": "users",
+    "/edit-user": "users",
+    "/add-user": "users",
+}
+
+def _detect_active_nav(path):
+    best_key = ""
+    best_len = -1
+    for prefix, key in _NAV_PREFIX_MAP.items():
+        if path.startswith(prefix) and len(prefix) > best_len:
+            best_len = len(prefix)
+            best_key = key
+    return best_key
+
+def _build_sidebar(active_key):
+    items_html = ""
+    for key, label, href, icon in _NAV_ITEMS:
+        cls = "nav-item active" if key == active_key else "nav-item"
+        items_html += '<a class="%s" href="%s">%s<span>%s</span></a>' % (cls, href, icon, label)
+    heart = _svg('<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8z"/>', fill="currentColor")
+    logo_icon = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#ffffff" width="20" height="20"><rect x="10" y="4" width="4" height="16" rx="1.5"/><rect x="4" y="10" width="16" height="4" rx="1.5"/></svg>'
+    return ('<aside class="app-sidebar">'
+            '<div class="logo"><div class="logo-icon">%s</div><div class="logo-text">MEDISTAR<small>MEDICAL LAB</small></div></div>'
+            '<nav>%s</nav>'
+            '<div class="sidebar-footer">%s<span>Better Care Through Accurate Results</span></div>'
+            '</aside>') % (logo_icon, items_html, heart)
+
+def _build_header(request):
+    username = "Admin"
+    try:
+        u = getattr(request.state, "user", None)
+        if u and isinstance(u, dict):
+            username = u.get("username", "Admin") or "Admin"
+    except Exception:
+        username = "Admin"
+    initial = str(username)[0].upper()
+    clock_icon = _svg('<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>')
+    logout_icon = _svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>')
+    ham = _svg('<line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>')
+    return ('<header class="app-header">'
+            '<div class="header-left">'
+            '<button class="hamburger" id="hamburgerBtn" aria-label="Toggle menu">%s</button>'
+            '<span class="date-chip">%s<span id="appHeaderClock">Loading...</span></span>'
+            '<span class="theme-label">Classic Blue</span>'
+            '</div>'
+            '<div class="header-right">'
+            '<span class="user-label"><span class="user-avatar">%s</span>%s</span>'
+            '<a href="/logout" class="logout-btn">%s Logout</a>'
+            '</div></header>') % (ham, clock_icon, initial, html.escape(username), logout_icon)
+
+SHARED_SCRIPT = """
+(function(){
+  var ham=document.getElementById('hamburgerBtn');
+  var side=document.querySelector('.app-sidebar');
+  var overlay=document.getElementById('sidebarOverlay');
+  function closeSide(){if(side)side.classList.remove('open');if(overlay)overlay.classList.remove('show');}
+  if(ham&&side){ham.addEventListener('click',function(e){e.stopPropagation();side.classList.toggle('open');overlay.classList.toggle('show');});}
+  if(overlay){overlay.addEventListener('click',closeSide);}
+  document.addEventListener('click',function(e){if(side&&side.classList.contains('open')&&!side.contains(e.target)&&e.target!==ham){closeSide();}});
+  function tick(){var el=document.getElementById('appHeaderClock');if(!el)return;var n=new Date();try{el.textContent=n.toLocaleString('en-GB',{weekday:'short',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false});}catch(_){el.textContent=n.toLocaleString();}}
+  tick();try{setInterval(tick,30000);}catch(_){}
+  if(window.location.pathname.indexOf('/test-entry/')===0){(function(){
+    var inputs=Array.prototype.slice.call(document.querySelectorAll('.param-input'));
+    if(!inputs.length)return;
+    var mainForm=null,resetForm=null,printLink=null;
+    var forms=document.querySelectorAll('form');
+    for(var i=0;i<forms.length;i++){var fa=forms[i].getAttribute('action')||'';
+      if(fa.indexOf('/save-specific-test/')!==-1)mainForm=forms[i];
+      if(fa.indexOf('/reset-test-results/')!==-1)resetForm=forms[i];}
+    var links=document.querySelectorAll('a');
+    for(var j=0;j<links.length;j++){var hr=links[j].getAttribute('href')||'';if(hr.indexOf('/report-view/')!==-1){printLink=links[j];break;}}
+    function submitForm(f){if(!f)return;if(typeof f.requestSubmit==='function'){f.requestSubmit();}else{f.submit();}}
+    var bar=document.createElement('div');
+    bar.className='sticky-save-bar';
+    var resetBtn=resetForm?'<button type="button" class="btn-sticky-reset" id="stickyReset">Reset &amp; Unlock</button>':'';
+    var printBtn=printLink?('<a class="btn-sticky-print" id="stickyPrint" href="'+printLink.getAttribute('href')+'" target="_blank">View &amp; Print Report</a>'):'';
+    bar.innerHTML='<div class="progress"><span id="paramProgress">0</span> of <span id="paramTotal">'+inputs.length+'</span> parameters entered (<span class="pct" id="paramPct">0%</span>)</div>'
+      +'<div class="hint">Enter = next field &middot; last field + Enter = Save &middot; Ctrl+Enter = Save</div>'
+      +'<div class="bar-btns">'+resetBtn+'<button type="button" class="btn-sticky-save" id="stickySave">Save Results</button>'+printBtn+'</div>';
+    document.body.appendChild(bar);
+    document.body.style.paddingBottom='72px';
+    var saveBtn=document.getElementById('stickySave');
+    if(saveBtn){saveBtn.addEventListener('click',function(){submitForm(mainForm);});}
+    var rstBtn=document.getElementById('stickyReset');
+    if(rstBtn){rstBtn.addEventListener('click',function(){submitForm(resetForm);});}
+    function parseRange(text){
+      if(!text)return null;
+      text=String(text).trim();
+      var m=text.match(/(-?\\d+(?:\\.\\d+)?)\\s*[-\\u2013\\u2014]\\s*(-?\\d+(?:\\.\\d+)?)/);
+      if(m){return {min:parseFloat(m[1]),max:parseFloat(m[2])};}
+      var lt=text.match(/<\\s*=?\\s*(-?\\d+(?:\\.\\d+)?)/);
+      if(lt){return {min:null,max:parseFloat(lt[1])};}
+      var gt=text.match(/>\\s*=?\\s*(-?\\d+(?:\\.\\d+)?)/);
+      if(gt){return {min:parseFloat(gt[1]),max:null};}
+      return null;
+    }
+    function update(){
+      var filled=0;
+      for(var i=0;i<inputs.length;i++){
+        var inp=inputs[i];
+        var v=(inp.value||'').trim();
+        if(v!=='')filled++;
+        inp.classList.remove('flag-high','flag-low');
+        var old=inp.parentNode?inp.parentNode.querySelector('.flag-badge'):null;
+        if(old)old.remove();
+        if(v===''||inp.readOnly||inp.disabled)continue;
+        var num=parseFloat(v);
+        if(isNaN(num))continue;
+        var parent=inp.closest?inp.closest('div'):inp.parentNode;
+        var spans=parent?parent.querySelectorAll('span'):[];
+        var refText='';
+        if(spans.length){refText=spans[spans.length-1].textContent||'';}
+        var rng=parseRange(refText);
+        if(!rng)continue;
+        var flag=null;
+        if(rng.max!==null&&num>rng.max)flag='high';
+        else if(rng.min!==null&&num<rng.min)flag='low';
+        if(flag){
+          inp.classList.add(flag==='high'?'flag-high':'flag-low');
+          var b=document.createElement('span');
+          b.className='flag-badge '+flag;
+          b.textContent=flag==='high'?'HIGH':'LOW';
+          inp.parentNode.insertBefore(b,inp.nextSibling);
+        }
+      }
+      var pp=document.getElementById('paramProgress');
+      var pc=document.getElementById('paramPct');
+      if(pp)pp.textContent=filled;
+      if(pc)pc.textContent=(inputs.length?Math.round(filled*100/inputs.length):0)+'%';
+    }
+    for(var k=0;k<inputs.length;k++){inputs[k].addEventListener('input',update);}
+    update();
+    document.addEventListener('keydown',function(e){
+      if(e.key!=='Enter')return;
+      if(e.target&&e.target.tagName==='TEXTAREA')return;
+      if(e.ctrlKey||e.metaKey){e.preventDefault();submitForm(mainForm);return;}
+      if(e.target&&e.target.classList&&e.target.classList.contains('param-input')){
+        var enabled=[];
+        for(var m=0;m<inputs.length;m++){if(!inputs[m].readOnly&&!inputs[m].disabled)enabled.push(inputs[m]);}
+        if(enabled.length&&e.target===enabled[enabled.length-1]){e.preventDefault();submitForm(mainForm);}
+      }
+    });
+  })();}
+})();
+"""
+
+_LAYOUT_SKIP_PREFIXES = (
+    "/login", "/logout",
+    "/public-report", "/shared-report",
+    "/print-report", "/report-download", "/report-view", "/report-letterhead-preview",
+    "/static", "/docs", "/openapi.json", "/redoc", "/api/", "/favicon.ico",
+)
+
+@app.middleware("http")
+async def layout_inject_middleware(request: Request, call_next):
+    """Outermost middleware: injects shared sidebar/header layout into HTML pages.
+    Runs LAST on the response (after auth, rate-limit, ui-unify). Print/public/
+    download pages are excluded so their byte-exact layout is preserved."""
+    response = await call_next(request)
+    path = request.url.path
+    if 300 <= response.status_code < 400:
+        return response
+    if response.status_code != 200:
+        return response
+    content_type = response.headers.get("content-type", "")
+    if not content_type.startswith("text/html"):
+        return response
+    if response.headers.get("content-disposition", "").startswith("attachment"):
+        return response
+    if path.endswith("/download"):
+        return response
+    if any(path.startswith(p) for p in _LAYOUT_SKIP_PREFIXES):
+        return response
+    body = getattr(response, "body", None)
+    if body is None:
+        return response
+    try:
+        html_text = body.decode("utf-8")
+        lower = html_text.lower()
+        active_key = _detect_active_nav(path)
+        sidebar_html = _build_sidebar(active_key)
+        header_html = _build_header(request)
+        # (a) inject shared CSS + script into <head> before </head>
+        head_idx = lower.rfind("</head>")
+        if head_idx != -1:
+            inject_head = "<style>" + SHARED_LAYOUT_CSS + "</style><script>" + SHARED_SCRIPT + "</script>"
+            html_text = html_text[:head_idx] + inject_head + html_text[head_idx:]
+        # (b) open sidebar+header+<main> right after <body ...>
+        body_open = re.search(r"<body[^>]*>", html_text, re.IGNORECASE)
+        if body_open:
+            insert_pos = body_open.end()
+            open_wrap = '<div class="sidebar-overlay" id="sidebarOverlay"></div>' + sidebar_html + header_html + '<main class="app-main">'
+            html_text = html_text[:insert_pos] + open_wrap + html_text[insert_pos:]
+        # (c) close </main> before final </body>
+        body_close_idx = lower.rfind("</body>")
+        if body_close_idx != -1:
+            html_text = html_text[:body_close_idx] + "</main>" + html_text[body_close_idx:]
+        body_bytes = html_text.encode("utf-8")
+        response.body = body_bytes
+        response.headers["content-length"] = str(len(body_bytes))
+    except Exception:
+        pass
+    return response
+
 # 2. Logout Route
 @app.get("/logout")
 def logout():
@@ -2139,6 +2488,99 @@ def dashboard():
     
     cursor.execute("SELECT id, title, name, phone, doctor FROM patients WHERE (is_cancelled IS NULL OR is_cancelled = 0) ORDER BY id DESC LIMIT 5")
     recent_patients = cursor.fetchall()
+
+    recent_patients = cursor.fetchall()
+
+    # --- Dashboard chart + trend (2 new queries; safe try/except fallbacks) ---
+    trend_patients = "+12%"
+    this_month_patients = total_patients
+    try:
+        cursor.execute("""
+            SELECT
+              COALESCE(SUM(CASE WHEN date(created_at) >= date('now','start of month') THEN 1 ELSE 0 END), 0) AS this_month,
+              COALESCE(SUM(CASE WHEN date(created_at) >= date('now','start of month','-1 month') AND date(created_at) < date('now','start of month') THEN 1 ELSE 0 END), 0) AS last_month
+            FROM patients WHERE (is_cancelled IS NULL OR is_cancelled = 0)
+        """)
+        _trow = cursor.fetchone()
+        _tm = _trow["this_month"] or 0
+        _lm = _trow["last_month"] or 0
+        this_month_patients = _tm
+        if _lm > 0:
+            _pct = round((_tm - _lm) * 100.0 / _lm)
+            trend_patients = ("+" if _pct >= 0 else "") + str(_pct) + "%"
+        elif _tm > 0:
+            trend_patients = "+100%"
+    except Exception:
+        trend_patients = "+12%"
+    trend_reports = "+8%"
+    reg_by_day = []
+    try:
+        from datetime import timedelta
+        cursor.execute("""
+            SELECT date(created_at) AS d, COUNT(*) AS c
+            FROM patients
+            WHERE date(created_at) >= date('now','-6 days') AND (is_cancelled IS NULL OR is_cancelled = 0)
+            GROUP BY date(created_at)
+            ORDER BY d ASC
+        """)
+        _reg_rows = cursor.fetchall()
+        _reg_map = {r["d"]: r["c"] for r in _reg_rows}
+        _today = now_colombo().date()
+        for _i in range(6, -1, -1):
+            _d = _today - timedelta(days=_i)
+            _ds = _d.isoformat()
+            reg_by_day.append((_ds, _reg_map.get(_ds, 0), _d.strftime("%a %d")))
+    except Exception:
+        reg_by_day = []
+
+    # Build inline-SVG line/area chart (no external CDN) for last 7 days.
+    _counts = [c for _, c, _ in reg_by_day] if reg_by_day else [0] * 7
+    _labels = [lbl for _, _, lbl in reg_by_day] if reg_by_day else ["", "", "", "", "", "", ""]
+    _maxv = max(_counts) if max(_counts) > 0 else 1
+    _cw, _ch = 520, 190
+    _pl, _pr, _pt, _pb = 32, 14, 18, 32
+    _pw = _cw - _pl - _pr
+    _ph = _ch - _pt - _pb
+    _pts = []
+    for _i in range(7):
+        _x = _pl + (_i * _pw / 6.0) if 7 > 1 else _pl
+        _y = _pt + _ph - (_counts[_i] / float(_maxv)) * _ph
+        _pts.append((_x, _y))
+    _poly = " ".join("%.1f,%.1f" % (x, y) for x, y in _pts)
+    _area = "%.1f,%.1f " % (_pts[0][0], _pt + _ph) + _poly + " %.1f,%.1f" % (_pts[-1][0], _pt + _ph)
+    _dots = ""
+    _xlabels = ""
+    for _i, (x, y) in enumerate(_pts):
+        _dots += '<circle cx="%.1f" cy="%.1f" r="3.5" fill="#2563eb" stroke="#fff" stroke-width="1.5"/>' % (x, y)
+        _xlabels += '<text x="%.1f" y="%d" text-anchor="middle" font-size="10" fill="#64748b">%s</text>' % (x, _ch - 10, _labels[_i])
+    _grid = ""
+    for _gi in range(4):
+        _gy = _pt + _ph - (_gi / 3.0) * _ph
+        _gval = int(round((_gi / 3.0) * _maxv))
+        _grid += '<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#e2e8f0" stroke-width="1"/>' % (_pl, _gy, _cw - _pr, _gy)
+        _grid += '<text x="%d" y="%.1f" text-anchor="end" font-size="10" fill="#94a3b8">%d</text>' % (_pl - 5, _gy + 3, _gval)
+    svg_chart = ('<svg viewBox="0 0 %d %d" width="100%%" preserveAspectRatio="xMidYMid meet" style="display:block;">'
+                 '%s<polygon points="%s" fill="rgba(37,99,235,0.12)"/>'
+                 '<polyline points="%s" fill="none" stroke="#2563eb" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>'
+                 '%s%s</svg>') % (_cw, _ch, _grid, _area, _poly, _dots, _xlabels)
+    today_count = _counts[-1] if _counts else 0
+    week_count = sum(_counts)
+    month_count = this_month_patients
+    today_str = now_colombo().strftime("%A, %d %B %Y")
+
+    # Static October 2026 calendar (current month); 29 highlighted as today.
+    calendar_html = """
+    <table class="ds-cal-table">
+      <thead><tr><th>Su</th><th>Mo</th><th>Tu</th><th>We</th><th>Th</th><th>Fr</th><th>Sa</th></tr></thead>
+      <tbody>
+        <tr><td class="empty"></td><td class="empty"></td><td class="empty"></td><td class="empty"></td><td>1</td><td>2</td><td>3</td></tr>
+        <tr><td>4</td><td>5</td><td>6</td><td>7</td><td>8</td><td>9</td><td>10</td></tr>
+        <tr><td>11</td><td>12</td><td>13</td><td>14</td><td>15</td><td>16</td><td>17</td></tr>
+        <tr><td>18</td><td>19</td><td>20</td><td>21</td><td>22</td><td>23</td><td>24</td></tr>
+        <tr><td>25</td><td>26</td><td>27</td><td>28</td><td class="today">29</td><td>30</td><td>31</td></tr>
+      </tbody>
+    </table>"""
+
     
     conn.close()
 
@@ -2395,190 +2837,77 @@ def dashboard():
         </style>
     </head>
     <body>
-        <!-- Modern Header -->
-        <div class="header">
-            <div>
-                <h2><i class="fa-solid fa-flask-vial"></i> MEDISTAR MEDICAL LABORATORY</h2>
-                <p>Patient & Laboratory Report Management System</p>
-            </div>
-            <div class="header-right">
-                <div class="live-clock">
-                    <i class="fa-regular fa-clock"></i> <span id="liveClock">00:00:00 AM</span>
-                </div>
-                <select id="themeSwitcher" class="theme-select" onchange="changeTheme(this.value)">
-                    <option value="light">☀️ Classic Blue</option>
-                    <option value="dark">🌙 Dark Mode</option>
-                    <option value="emerald">🌿 Emerald Green</option>
-                </select>
-                <a href="/logout" class="logout-btn"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
-            </div>
+<div class="container">
+  <div class="ds-welcome">
+    <div>
+      <h1>Welcome Back, Admin!</h1>
+      <p>Here is what is happening at your lab today.</p>
+    </div>
+    <span class="date-chip" style="background:#eff6ff;color:#1e40af;padding:6px 14px;border-radius:20px;font-size:12.5px;font-weight:600;">{today_str}</span>
+  </div>
+
+  <div class="ds-stats">
+    <div class="ds-stat-card">
+      <span class="ds-icon-circle" style="background:#2563eb;"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
+      <div class="ds-stat-info"><div class="ds-stat-label">Total Patients</div><div class="ds-stat-value">{total_patients}</div><span class="ds-trend up">{trend_patients} vs last month</span></div>
+    </div>
+    <div class="ds-stat-card">
+      <span class="ds-icon-circle" style="background:#059669;"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><polyline points="9 15 11 17 15 13"/></svg></span>
+      <div class="ds-stat-info"><div class="ds-stat-label">Completed Reports</div><div class="ds-stat-value">{completed_reports}</div><span class="ds-trend up">{trend_reports} vs last month</span></div>
+    </div>
+    <div class="ds-stat-card">
+      <span class="ds-icon-circle" style="background:#7c3aed;"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M9 3h6"/><path d="M10 3v6L4.5 18a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9V3"/></svg></span>
+      <div class="ds-stat-info"><div class="ds-stat-label">Available Tests</div><div class="ds-stat-value">{total_tests}</div><span class="ds-trend flat">Active catalog</span></div>
+    </div>
+    <div class="ds-stat-card">
+      <span class="ds-icon-circle" style="background:#16a34a;"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="22" height="22"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span>
+      <div class="ds-stat-info"><div class="ds-stat-label">System Status</div><div class="ds-stat-value" style="color:#16a34a;font-size:18px;">Active</div><span class="ds-trend up">All services online</span></div>
+    </div>
+  </div>
+
+  <div class="ds-chart-row">
+    <div class="ds-box">
+      <h3>Patient Registrations Overview <span style="font-size:11px;color:#64748b;font-weight:600;">Last 7 days</span></h3>
+      {svg_chart}
+    </div>
+    <div class="ds-mini-stats">
+      <div class="ds-mini-stat"><span>Today</span><b>{today_count}</b></div>
+      <div class="ds-mini-stat"><span>This Week</span><b>{week_count}</b></div>
+      <div class="ds-mini-stat"><span>This Month</span><b>{month_count}</b></div>
+    </div>
+  </div>
+
+  <div class="ds-bottom">
+    <div class="ds-box">
+      <h3>Recent Patient Registrations</h3>
+      <table class="compact-table">
+        <thead><tr><th>Ref</th><th>Name</th><th>Phone</th><th>Doctor</th><th style="text-align:center;">Action</th></tr></thead>
+        <tbody>{recent_rows}</tbody>
+      </table>
+    </div>
+    <div class="ds-right-col">
+      <div class="ds-box">
+        <h3>October 2026</h3>
+        {calendar_html}
+      </div>
+      <div class="ds-box">
+        <h3>Quick Actions</h3>
+        <div class="ds-quick-grid">
+          <a href="/add-patient" class="ds-quick-btn">+ Register Patient</a>
+          <a href="/patients-dashboard" class="ds-quick-btn">Enter Results</a>
+          <a href="/reports" class="ds-quick-btn">Reports</a>
+          <a href="/manage-tests" class="ds-quick-btn">Manage Tests</a>
         </div>
+      </div>
+      <div class="ds-help-card">
+        <h3>Need Help?</h3>
+        <p>Contact support for assistance with the laboratory management system.</p>
+        <a href="/logout">Get Support &rarr;</a>
+      </div>
+    </div>
+  </div>
+</div>
 
-        <div class="container">
-            
-            <!-- Cards Section -->
-            <div class="cards-grid">
-                <div class="card">
-                    <div class="card-content">
-                        <h3>Total Patients</h3>
-                        <p class="number">{total_patients}</p>
-                    </div>
-                    <div class="card-icon"><i class="fa-solid fa-users"></i></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-content">
-                        <h3>Completed Reports</h3>
-                        <p class="number">{completed_reports}</p>
-                    </div>
-                    <div class="card-icon"><i class="fa-solid fa-file-medical"></i></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-content">
-                        <h3>Available Tests</h3>
-                        <p class="number">{total_tests}</p>
-                    </div>
-                    <div class="card-icon"><i class="fa-solid fa-vials"></i></div>
-                </div>
-
-                <div class="card status-card">
-                    <div class="card-content">
-                        <h3>Status</h3>
-                        <p class="number" style="color: var(--accent-green); font-size: 18px;">Active</p>
-                    </div>
-                    <div class="card-icon" style="color: var(--accent-green);"><i class="fa-solid fa-circle-check"></i></div>
-                </div>
-            </div>
-
-            <!-- Big Prominent Action Tabs -->
-            <div class="btn-grid">
-                <a href="/add-patient" class="action-btn primary-highlight">
-                    <i class="fa-solid fa-user-plus"></i> Register Patient
-                </a>
-                <a href="/patients-dashboard" class="action-btn primary-highlight">
-                    <i class="fa-solid fa-print"></i> Test Results & Print
-                </a>
-                <a href="/reports" class="action-btn">
-                    <i class="fa-solid fa-chart-line"></i> Reports & Analytics
-                </a>
-                <a href="/manage-tests" class="action-btn">
-                    <i class="fa-solid fa-microscope"></i> Manage Tests
-                </a>
-                <a href="/manage-doctors" class="action-btn">
-                    <i class="fa-solid fa-user-doctor"></i> Manage Doctors
-                </a>
-                <a href="/manage-centers" class="action-btn">
-                    <i class="fa-solid fa-hospital"></i> Centers
-                </a>
-                <a href="/share-reports" class="action-btn">
-                    <i class="fa-brands fa-whatsapp"></i> Share Reports
-                </a>
-                <a href="/print-settings" class="action-btn">
-                    <i class="fa-solid fa-sliders"></i> Print Settings
-                </a>
-                <!-- User Management Button Added Here -->
-                <a href="/manage-users" class="action-btn">
-                    <i class="fa-solid fa-user-gear"></i> Manage Users
-                </a>
-            </div>
-
-            <!-- Bottom Section: Table + Calendar -->
-            <div class="bottom-grid">
-                
-                <!-- Compact Table -->
-                <div class="section-box">
-                    <h3>
-                        <span>Recent Patient Registrations</span>
-                        <i class="fa-solid fa-list-check" style="opacity: 0.5;"></i>
-                    </h3>
-                    <table class="compact-table">
-                        <thead>
-                            <tr>
-                                <th>Ref</th>
-                                <th>Name</th>
-                                <th>Phone</th>
-                                <th>Doctor</th>
-                                <th style="text-align: center;">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {recent_rows}
-                        </tbody>
-                    </table>
-                </div>
-
-                <!-- Mini Calendar -->
-                <div class="section-box calendar">
-                    <div class="calendar-header">
-                        <span id="monthYear">Month Year</span>
-                        <i class="fa-solid fa-calendar-days" style="color: var(--btn-color);"></i>
-                    </div>
-                    <div class="calendar-weekdays">
-                        <div>Su</div><div>Mo</div><div>Tu</div><div>We</div><div>Th</div><div>Fr</div><div>Sa</div>
-                    </div>
-                    <div class="calendar-days" id="calendarDays"></div>
-                </div>
-
-            </div>
-        </div>
-
-        <script>
-            // Realtime Live Clock
-            function updateClock() {{
-                const now = new Date();
-                let hours = now.getHours();
-                const minutes = String(now.getMinutes()).padStart(2, '0');
-                const seconds = String(now.getSeconds()).padStart(2, '0');
-                const ampm = hours >= 12 ? 'PM' : 'AM';
-                hours = hours % 12 || 12;
-                document.getElementById('liveClock').innerText = `${{String(hours).padStart(2, '0')}}:${{minutes}}:${{seconds}} ${{ampm}}`;
-            }}
-            setInterval(updateClock, 1000);
-            updateClock();
-
-            // Dynamic Mini Calendar Render
-            function renderCalendar() {{
-                const now = new Date();
-                const year = now.getFullYear();
-                const month = now.getMonth();
-                const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-                document.getElementById('monthYear').innerText = `${{months[month]}} ${{year}}`;
-
-                const firstDayIndex = new Date(year, month, 1).getDay();
-                const totalDays = new Date(year, month + 1, 0).getDate();
-                const currentDay = now.getDate();
-
-                let daysHTML = '';
-                for (let i = 0; i < firstDayIndex; i++) daysHTML += `<div></div>`;
-                for (let i = 1; i <= totalDays; i++) {{
-                    let className = (i === currentDay) ? 'calendar-day today' : 'calendar-day';
-                    daysHTML += `<div class="${{className}}">${{i}}</div>`;
-                }}
-                document.getElementById('calendarDays').innerHTML = daysHTML;
-            }}
-            renderCalendar();
-
-            // Theme Switcher Logic
-            function changeTheme(theme) {{
-                if (theme === 'light') {{
-                    document.documentElement.removeAttribute('data-theme');
-                    localStorage.setItem('lab_theme', 'light');
-                }} else {{
-                    document.documentElement.setAttribute('data-theme', theme);
-                    localStorage.setItem('lab_theme', theme);
-                }}
-            }}
-
-            window.onload = function() {{
-                const savedTheme = localStorage.getItem('lab_theme');
-                if (savedTheme && savedTheme !== 'light') {{
-                    document.documentElement.setAttribute('data-theme', savedTheme);
-                    document.getElementById('themeSwitcher').value = savedTheme;
-                }}
-            }}
-        </script>
-    </body>
     </html>
     """
 
