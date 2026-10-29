@@ -1210,6 +1210,12 @@ def _shell_sidebar_html(user: dict, active: str) -> str:
             parts.append(f'<div class="ms-sec"><span>{sec}</span></div>' + "".join(links))
     return (
         '<aside class="ms-sidebar" id="msSidebar">'
+        '<div class="ms-mobile-only ms-m-tools">'
+        '<form action="/patients-dashboard" method="get"><i class="fa-solid fa-magnifying-glass"></i>'
+        '<input type="text" name="search" placeholder="Search patient..." autocomplete="off"></form>'
+        '<select class="ms-theme-m" onchange="changeTheme(this.value)" aria-label="Theme">'
+        '<option value="light">Classic Blue</option><option value="dark">Dark Mode</option><option value="emerald">Emerald Green</option></select>'
+        '</div>'
         '<button class="ms-collapse" id="msCollapse" type="button" title="Collapse / expand menu">'
         '<i class="fa-solid fa-angles-left"></i><span class="lbl">Collapse menu</span></button>'
         '<nav class="ms-nav">' + "".join(parts) + '</nav>'
@@ -1323,6 +1329,43 @@ html body.ms{margin:0 !important;padding:0 !important;display:block !important;b
 # Extra rules shared by the dashboard AND wrapped pages: global search,
 # New Patient button, sidebar section labels, collapse, breadcrumb, page panel.
 _SHELL_EXTRA_CSS = """
+.ms-brandlink{display:flex;align-items:center;gap:14px;color:#fff;min-width:0;text-decoration:none;}
+.ms-brandtxt{min-width:0;}
+.ms-brandtxt h1{margin:0;color:#fff;font-size:24px;font-weight:800;letter-spacing:.6px;white-space:nowrap;line-height:1.15;}
+.ms-brandtxt p{margin:3px 0 0;font-size:13px;color:#fff;opacity:.92;line-height:1.2;white-space:nowrap;}
+.ms-logo{flex:0 0 auto;font-size:38px;line-height:1;}
+.ms-brand{flex:0 1 auto;}
+html body.ms{overflow-x:hidden;}
+.ms-layout,.ms-main{min-width:0;}
+.ms-mobile-only{display:none;}
+@media (max-width:1100px){.ms-brandtxt h1{font-size:19px;letter-spacing:.3px;}}
+@media (max-width:992px){
+ .ms-header{height:64px;padding:0 12px;gap:8px;}
+ .ms-burger{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:44px;height:44px;}
+ .ms-brandtxt h1{font-size:15px;white-space:normal;line-height:1.1;letter-spacing:.2px;}
+ .ms-brandtxt p{display:none;}
+ .ms-logo{font-size:26px;}
+ .ms-brandlink{gap:8px;}
+ .ms-search,.ms-clock,.ms-theme,.ms-logout{display:none !important;}
+ .ms-newpt{height:40px;padding:0 12px;}
+ .ms-newpt span{display:none;}
+ .ms-hright{gap:6px;flex:0 0 auto;}
+ .ms-user-btn .nm,.ms-user-btn > i.fa-chevron-down{display:none;}
+ .ms-avatar{width:40px;height:40px;}
+ .ms-user-menu{top:48px;}
+ .ms-sidebar{top:64px !important;height:calc(100vh - 64px) !important;height:calc(100dvh - 64px) !important;width:280px;}
+ .ms-scrim.open{inset:64px 0 0 0 !important;}
+ .ms-layout{min-height:calc(100vh - 64px);}
+ .ms-mobile-only{display:block;}
+ .ms-m-tools{padding:2px 4px 10px;display:flex;flex-direction:column;gap:10px;}
+ .ms-m-tools form{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0 12px;height:42px;margin:0;}
+ .ms-m-tools input{flex:1;min-width:0;border:0;outline:none;background:transparent;color:var(--text);font-size:14px;padding:0;box-shadow:none;}
+ .ms-m-tools select{width:100%;height:42px;border:1px solid var(--border);border-radius:12px;background:var(--card);color:var(--text);font-size:14px;font-weight:600;padding:0 10px;}
+ .ms-collapse{display:none;}
+ .ms-main{padding:14px 10px 24px;}
+ .ms-page{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+}
+@media (max-width:420px){.ms-brandtxt h1{font-size:13px;}}
 .ms-hright{flex:1;justify-content:flex-end;min-width:0;}
 .ms-search{display:flex;align-items:center;gap:8px;flex:1;max-width:330px;min-width:140px;height:44px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);border-radius:26px;padding:0 14px;margin:0;}
 .ms-search:focus-within{background:rgba(255,255,255,.24);}
@@ -1405,6 +1448,14 @@ _SHELL_CORE_JS = """
 # Used on BOTH the dashboard and wrapped pages (idempotent, no overlap with core).
 _SHELL_EXTRA_JS = """
 (function () {
+  var tm = document.querySelector('.ms-theme-m');
+  if (tm) { var tv = 'light'; try { tv = localStorage.getItem('lab_theme') || 'light'; } catch (e) {} tm.value = tv; }
+  var sbar = document.getElementById('msSidebar');
+  if (sbar) sbar.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('a') && window.innerWidth <= 992) {
+      sbar.classList.remove('open'); var sc = document.getElementById('msScrim'); if (sc) sc.classList.remove('open');
+    }
+  });
   var btn = document.getElementById('msCollapse');
   if (btn) btn.addEventListener('click', function () {
     var c = document.documentElement.classList.toggle('ms-collapsed');
@@ -6781,95 +6832,161 @@ def delete_range(range_id: int, param_id: int):
 
 
 @app.get("/select-patient", response_class=HTMLResponse)
-def select_patient(search: str = "", selected_patient_id: int = None):
+def select_patient(search: str = "", selected_patient_id: int = None, status: str = "all"):
+    """Result Entry: pick a patient and jump straight into their results.
+
+    Status is computed from the REAL result tables (patient_assigned_tests.result
+    and patient_parameter_results) - the old version joined the unused `reports`
+    table, so every patient stayed "Pending" forever after results were saved.
+    """
+    status = status if status in ("all", "pending", "partial", "done") else "all"
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    if search:
-        search_term = f"%{search}%"
-        cursor.execute("""
-            SELECT p.id, p.title, p.name, p.age_years, p.age_months, p.age_days, p.gender, p.phone,
-                   CASE WHEN r.id IS NULL THEN 'Pending' ELSE 'Verified' END as status,
-                   r.id as report_id
-            FROM patients p
-            LEFT JOIN reports r ON p.id = r.patient_id
-            WHERE (p.name LIKE ? OR p.phone LIKE ?) AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)
-            ORDER BY p.id DESC
-        """, (search_term, search_term))
-    else:
-        cursor.execute("""
-            SELECT p.id, p.title, p.name, p.age_years, p.age_months, p.age_days, p.gender, p.phone,
-                   CASE WHEN r.id IS NULL THEN 'Pending' ELSE 'Verified' END as status,
-                   r.id as report_id
-            FROM patients p
-            LEFT JOIN reports r ON p.id = r.patient_id
-            WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)
-            ORDER BY p.id DESC
-            LIMIT 20
-        """)
-    
+    where_sql = "WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0)"
+    params = []
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        where_sql += " AND (p.name LIKE ? OR p.phone LIKE ? OR CAST(p.id AS TEXT) LIKE ? OR p.manual_bill_no LIKE ?)"
+        params += [term, term, term, term]
+
+    cursor.execute(f"""
+        SELECT p.id, p.title, p.name, p.age_years, p.age_months, p.age_days, p.gender, p.phone, p.created_at
+        FROM patients p {where_sql}
+        ORDER BY p.id DESC LIMIT 150
+    """, params)
     patients = cursor.fetchall()
+    ids = [r["id"] for r in patients]
+
+    tests_by_patient = {}
+    done_pairs = set()
+    if ids:
+        ph = ",".join("?" for _ in ids)
+        cursor.execute(f"""
+            SELECT pat.patient_id, pat.test_id, pat.result,
+                   COALESCE(NULLIF(t.test_code, ''), t.test_name, 'Test') AS label
+            FROM patient_assigned_tests pat
+            LEFT JOIN tests t ON t.id = pat.test_id
+            WHERE pat.patient_id IN ({ph})
+            ORDER BY pat.id
+        """, ids)
+        for r in cursor.fetchall():
+            tests_by_patient.setdefault(r["patient_id"], []).append((r["test_id"], str(r["label"]), r["result"]))
+        cursor.execute(f"""
+            SELECT DISTINCT patient_id, test_id FROM patient_parameter_results
+            WHERE patient_id IN ({ph}) AND result_value IS NOT NULL AND TRIM(result_value) != ''
+        """, ids)
+        for r in cursor.fetchall():
+            done_pairs.add((r["patient_id"], r["test_id"]))
     conn.close()
 
-    patient_cards = ""
+    def _has_text(v):
+        txt = re.sub(r"<[^>]*>", "", str(v or "")).replace("&nbsp;", "").strip()
+        return bool(txt) and txt.lower() != "none"
+
+    counts = {"all": 0, "pending": 0, "partial": 0, "done": 0}
+    cards = []
     for row in patients:
-        age_str = f"{row['age_years']}Y {row['age_months']}M {row['age_days']}D"
-        checked = "checked" if selected_patient_id and row["id"] == selected_patient_id else ""
-        
-        badge_bg = "#27ae60" if row["status"] == "Verified" else "#e74c3c"
-        status_text = row["status"]
+        tests = tests_by_patient.get(row["id"], [])
+        total = len(tests)
+        finished = sum(1 for (tid, _l, res) in tests if _has_text(res) or (row["id"], tid) in done_pairs)
+        if total == 0:
+            st = "pending"
+        elif finished >= total:
+            st = "done"
+        elif finished == 0:
+            st = "pending"
+        else:
+            st = "partial"
+        counts["all"] += 1
+        counts[st] += 1
+        if status != "all" and st != status:
+            continue
+        if len(cards) >= 40:
+            continue
 
-        patient_cards += f"""
-            <label style="display: flex; align-items: center; justify-content: space-between; padding: 12px 15px; border-bottom: 1px solid #eee; cursor: pointer;">
-                <div style="display: flex; align-items: center; gap: 12px;">
-                    <input type="radio" name="selected_patient_id" value="{row["id"]}" {checked} onclick="document.getElementById('patient_id_input').value = '{row["id"]}'" style="width: 18px; height: 18px; accent-color: #0f4c81;">
-                    <div>
-                        <div style="font-size: 16px; font-weight: bold; color: #333;">{row["title"]} {row["name"]}</div>
-                        <div style="font-size: 13px; color: #666; margin-top: 3px;">Age: {age_str} | Gender: {row["gender"]} | Ph: {row["phone"] if row["phone"] else "N/A"}</div>
-                    </div>
-                </div>
-                <div>
-                    <span style="background-color: {badge_bg}; color: white; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: bold;">
-                        {status_text}
-                    </span>
-                </div>
-            </label>
-        """
+        badge = {
+            "done": ("#16a34a", "&#10003; Completed"),
+            "partial": ("#f59e0b", "&#9201; Partial"),
+            "pending": ("#e74c3c", "&#9203; Pending"),
+        }[st]
+        age_str = f"{row['age_years'] or 0}Y {row['age_months'] or 0}M {row['age_days'] or 0}D"
+        chips = "".join(
+            f'<span class="chip{" ok" if (_r and _has_text(_r)) or (row["id"], _t) in done_pairs else ""}">{html.escape(_l)}</span>'
+            for (_t, _l, _r) in tests
+        ) or '<span style="color:#94a3b8;font-size:12px;">No tests assigned</span>'
+        date_str = str(row["created_at"] or "").split("T")[0].split(" ")[0]
+        cards.append(f"""
+        <a class="pt-row" href="/patient-results/{row['id']}">
+            <div class="pt-main">
+                <div class="pt-name">{html.escape(((row['title'] or '') + ' ' + (row['name'] or '')).strip())}
+                    <span class="pt-ref">#{row['id']}</span></div>
+                <div class="pt-meta">Age: {age_str} &nbsp;|&nbsp; {html.escape(row['gender'] or '-')} &nbsp;|&nbsp; Ph: {html.escape(row['phone'] or 'N/A')} &nbsp;|&nbsp; {date_str}</div>
+                <div class="pt-chips">{chips}</div>
+            </div>
+            <div class="pt-side">
+                <span class="pt-badge" style="background:{badge[0]};">{badge[1]} ({finished}/{total})</span>
+                <span class="pt-go">Enter Result &rarr;</span>
+            </div>
+        </a>""")
 
+    def _tab(key, label):
+        qs = f"status={key}" + (f"&search={quote(search)}" if search else "")
+        active = " active" if status == key else ""
+        return f'<a class="tab{active}" href="/select-patient?{qs}">{label} <b>{counts[key]}</b></a>'
+
+    empty = '<div style="padding:34px; text-align:center; color:#94a3b8;">No patients found.</div>'
     return f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Lab System - Select Patient</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Result Entry</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 40px; }}
-            .form-card {{ background: white; padding: 30px; border-radius: 12px; max-width: 650px; margin: auto; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
-            .btn-next {{ background: #0f4c81; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }}
-            .btn-search {{ background: #2980b9; color: white; border: none; padding: 10px 15px; border-radius: 6px; font-weight: bold; cursor: pointer; }}
-            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0f4c81; text-decoration: none; font-weight: bold; }}
-            .patient-list-container {{ max-height: 320px; overflow-y: auto; border: 1px solid #ccc; border-radius: 8px; background: white; }}
+            .re-wrap {{ max-width: 980px; margin: auto; }}
+            .re-card {{ background:#fff; border:1px solid #e2e8f0; border-radius:14px; padding:20px; box-shadow:0 4px 15px rgba(0,0,0,0.06); }}
+            .re-card h2 {{ margin:0 0 4px; color:#0f4c81; font-size:20px; }}
+            .re-sub {{ color:#64748b; font-size:13px; margin-bottom:14px; }}
+            .re-search {{ display:flex; gap:8px; margin-bottom:12px; }}
+            .re-search input {{ flex:1; min-width:0; padding:11px 14px; border:1px solid #cbd5e1; border-radius:10px; font-size:14px; }}
+            .re-search button {{ background:#0f4c81; color:#fff; border:0; border-radius:10px; padding:0 20px; font-weight:700; cursor:pointer; }}
+            .tabs {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }}
+            .tab {{ padding:7px 14px; border-radius:20px; background:#e2e8f0; color:#334155; text-decoration:none; font-size:13px; font-weight:700; }}
+            .tab b {{ background:rgba(0,0,0,.08); border-radius:10px; padding:1px 8px; margin-left:4px; font-size:12px; }}
+            .tab.active {{ background:#0f4c81; color:#fff; }}
+            .tab.active b {{ background:rgba(255,255,255,.25); }}
+            .pt-list {{ border:1px solid #e2e8f0; border-radius:12px; overflow:hidden; }}
+            .pt-row {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:13px 16px; border-bottom:1px solid #eef2f7; text-decoration:none; color:inherit; background:#fff; }}
+            .pt-row:last-child {{ border-bottom:0; }}
+            .pt-row:hover {{ background:#f1f6ff; }}
+            .pt-name {{ font-size:15.5px; font-weight:700; color:#0f172a; }}
+            .pt-ref {{ color:#0f4c81; font-size:12px; margin-left:6px; }}
+            .pt-meta {{ font-size:12.5px; color:#64748b; margin-top:3px; }}
+            .pt-chips {{ margin-top:6px; display:flex; gap:5px; flex-wrap:wrap; }}
+            .chip {{ background:#fee2e2; color:#b91c1c; border-radius:6px; padding:2px 8px; font-size:11.5px; font-weight:700; }}
+            .chip.ok {{ background:#dcfce7; color:#15803d; }}
+            .pt-side {{ display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; }}
+            .pt-badge {{ color:#fff; border-radius:20px; padding:4px 12px; font-size:12px; font-weight:700; white-space:nowrap; }}
+            .pt-go {{ color:#0f4c81; font-size:12.5px; font-weight:700; }}
+            @media (max-width:640px) {{ .pt-row {{ flex-direction:column; align-items:flex-start; }} .pt-side {{ flex-direction:row; align-items:center; }} }}
         </style>
     </head>
     <body>
-        <div class="form-card">
-            <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
-            <h2 style="color: #0f4c81; margin-top: 0;">Step 1: Select Patient</h2>
-
-            <form action="/select-patient" method="get" style="margin-bottom: 15px;">
-                <div style="display: flex; gap: 8px;">
-                    <input type="text" name="search" value="{search}" placeholder="Search name or phone..." style="flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 6px;">
-                    <button type="submit" class="btn-search">Search</button>
-                </div>
+        <div class="re-wrap"><div class="re-card">
+            <h2>Result Entry</h2>
+            <div class="re-sub">Tap a patient to enter results, then save and print. Status updates automatically from the saved results.</div>
+            <form class="re-search" method="get" action="/select-patient">
+                <input type="hidden" name="status" value="{status}">
+                <input type="text" name="search" value="{html.escape(search or '')}" placeholder="Search name, phone, ref no or bill no..." autofocus>
+                <button type="submit">Search</button>
             </form>
-
-            <form onsubmit="event.preventDefault(); var pid = document.getElementById('patient_id_input').value; if(pid) {{ window.location.href='/patient-results/' + pid; }} else {{ alert('Please select a patient first.'); }}">
-                <input type="hidden" id="patient_id_input" value="{selected_patient_id if selected_patient_id else ''}">
-                <div class="patient-list-container">
-                    {patient_cards}
-                </div>
-                <button type="submit" class="btn-next">Next: View Patient Tests</button>
-            </form>
-        </div>
+            <div class="tabs">
+                {_tab('all', 'All')}{_tab('pending', 'Pending')}{_tab('partial', 'Partial')}{_tab('done', 'Completed')}
+            </div>
+            <div class="pt-list">{''.join(cards) if cards else empty}</div>
+            <div style="font-size:12px;color:#94a3b8;margin-top:10px;">Showing the latest {counts['all']} matching patients (max 40 per tab).</div>
+        </div></div>
     </body>
     </html>
     """
