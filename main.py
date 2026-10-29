@@ -908,7 +908,7 @@ async def session_auth_middleware(request: Request, call_next):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT username, role, permissions FROM users WHERE username = ?", (sess["username"],))
+        cursor.execute("SELECT * FROM users WHERE username = ?", (sess["username"],))
         row = cursor.fetchone()
         conn.close()
     except Exception:
@@ -925,6 +925,7 @@ async def session_auth_middleware(request: Request, call_next):
         "username": row["username"],
         "role": row["role"] or "",
         "permissions": {p for p in (row["permissions"] or "").split(",") if p},
+        "flags": {c: int(row[c] or 0) for c in GRANULAR_PERMISSIONS if c in row.keys() and row[c] is not None},
     }
     return await call_next(request)
 
@@ -1044,6 +1045,492 @@ async def ui_unify_middleware(request: Request, call_next):
     except Exception:
         pass
     return response
+
+
+# -------------------------------------------------------------
+# APP SHELL: one shared header + grouped left sidebar for EVERY page
+# -------------------------------------------------------------
+# The dashboard owns its own full layout (see _DASHBOARD_TEMPLATE) but
+# builds its header/sidebar from the same functions below. Every other
+# authenticated HTML page is wrapped by `app_shell_middleware` so that
+# all 30+ legacy pages get the same look, the same left sidebar, and no
+# more "Back to Dashboard" buttons - without rewriting each route.
+
+# (key, label, icon, href, legacy_permission_key, granular_flag_column)
+_SHELL_NAV = [
+    ("Main", [
+        ("dashboard", "Dashboard", "fa-house", "/dashboard", None, None),
+        ("register", "Register Patient", "fa-user-plus", "/add-patient", "add_patient", None),
+        ("results", "Test Results & Print", "fa-print", "/patients-dashboard", None, None),
+        ("entry", "Result Entry", "fa-file-pen", "/select-patient", None, None),
+        ("cancel", "Cancel Bills", "fa-ban", "/patients-dashboard?tab=cancel_bills", None, "can_cancel_bills"),
+    ]),
+    ("Analytics", [
+        ("reports", "Reports & Analytics", "fa-chart-line", "/reports", "reports", "can_view_reports"),
+        ("sales", "Sales & Finance", "fa-sack-dollar", "/reports/sales-analytics", "reports", "can_view_reports"),
+        ("pricelist", "Test Price List", "fa-tags", "/reports?report_type=pricelist", "reports", "can_view_reports"),
+        ("share", "Share Reports", "fa-share-nodes", "/share-reports", "share_reports", None),
+    ]),
+    ("Setup", [
+        ("tests", "Manage Tests", "fa-gear", "/manage-tests", "manage_tests", None),
+        ("doctors", "Manage Doctors", "fa-user-doctor", "/manage-doctors", "manage_doctors", None),
+        ("centers", "Centers", "fa-hospital", "/manage-centers", "manage_centers", None),
+        ("print", "Print Settings", "fa-sliders", "/print-settings", "print_settings", None),
+    ]),
+    ("Admin", [
+        ("users", "Manage Users", "fa-user-gear", "/manage-users", "manage_users", "can_manage_users"),
+    ]),
+]
+
+# Which sidebar item is "active" for which URL path (first match wins).
+_SHELL_MATCH = [
+    ("sales", ("/reports/sales-analytics",)),
+    ("reports", ("/reports",)),
+    ("results", ("/patients-dashboard", "/patient-results", "/patient-tests", "/test-entry")),
+    ("entry", ("/select-patient", "/add-test-entry")),
+    ("register", ("/add-patient",)),
+    ("share", ("/share-reports",)),
+    ("tests", ("/manage-tests", "/edit-test-category", "/manage-ranges", "/edit-parameter", "/load-standard-templates")),
+    ("doctors", ("/manage-doctors",)),
+    ("centers", ("/manage-centers",)),
+    ("print", ("/print-settings",)),
+    ("users", ("/manage-users", "/edit-user")),
+    ("dashboard", ("/dashboard",)),
+]
+
+
+def _shell_can(user: dict, perm, flag) -> bool:
+    """Used ONLY to decide which sidebar links to show. Real access control
+    still happens inside every route - hiding a link is never security."""
+    if perm is None and flag is None:
+        return True
+    if is_super_admin(user):
+        return True
+    if (user.get("role") or "").strip().lower() in FULL_ACCESS_ROLES:
+        return True
+    if perm and perm in (user.get("permissions") or set()):
+        return True
+    if flag and (user.get("flags") or {}).get(flag):
+        return True
+    return False
+
+
+def _shell_active_key(path: str, query: str) -> str:
+    q = query or ""
+    if path == "/patients-dashboard" and "tab=cancel_bills" in q:
+        return "cancel"
+    if path == "/reports" and "report_type=pricelist" in q:
+        return "pricelist"
+    for key, prefixes in _SHELL_MATCH:
+        for p in prefixes:
+            if path == p or path.startswith(p + "/"):
+                return key
+    return ""
+
+
+def _shell_nav_item(key: str):
+    for _sec, items in _SHELL_NAV:
+        for it in items:
+            if it[0] == key:
+                return it
+    return None
+
+
+def _shell_header_html(user: dict) -> str:
+    raw = (user.get("username") or "").strip() or "User"
+    name = html.escape(raw[:1].upper() + raw[1:])
+    role = html.escape((user.get("role") or "").strip() or "User")
+
+    new_btn = ""
+    if _shell_can(user, "add_patient", None):
+        new_btn = ('<a href="/add-patient" class="ms-newpt" title="Register a new patient (Alt+N)">'
+                   '<i class="fa-solid fa-user-plus"></i><span>New Patient</span></a>')
+
+    menu_links = ""
+    if _shell_can(user, "manage_users", "can_manage_users"):
+        menu_links += '<a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>'
+    if _shell_can(user, "print_settings", None):
+        menu_links += '<a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>'
+    menu_links += '<a href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>'
+
+    return f"""<header class="ms-header">
+  <div class="ms-brand">
+    <button class="ms-burger" id="msBurger" type="button" aria-label="Menu"><i class="fa-solid fa-bars"></i></button>
+    <a href="/dashboard" class="ms-brandlink">
+      <div class="ms-logo"><i class="fa-solid fa-flask-vial"></i></div>
+      <div class="ms-brandtxt"><h1>MEDISTAR MEDICAL LABORATORY</h1><p>Patient &amp; Laboratory Report Management System</p></div>
+    </a>
+  </div>
+  <div class="ms-hright">
+    <form class="ms-search" action="/patients-dashboard" method="get" role="search">
+      <i class="fa-solid fa-magnifying-glass"></i>
+      <input type="text" name="search" id="msGlobalSearch" placeholder="Search patient name or ref no..." autocomplete="off">
+      <kbd>/</kbd>
+    </form>
+    <div class="ms-clock">
+      <i class="fa-regular fa-clock"></i>
+      <div><b id="msClock">--:--:--</b><span id="msClockDate">&nbsp;</span></div>
+    </div>
+    {new_btn}
+    <div class="ms-theme">
+      <i class="fa-solid fa-sun"></i>
+      <select id="themeSwitcher" onchange="changeTheme(this.value)" aria-label="Theme">
+        <option value="light">Classic Blue</option>
+        <option value="dark">Dark Mode</option>
+        <option value="emerald">Emerald Green</option>
+      </select>
+    </div>
+    <div class="ms-user" id="msUser">
+      <button class="ms-user-btn" id="msUserBtn" type="button">
+        <span class="ms-avatar"><i class="fa-solid fa-circle-user"></i></span>
+        <span class="nm">{name}</span>
+        <i class="fa-solid fa-chevron-down" style="font-size: 11px;"></i>
+      </button>
+      <div class="ms-user-menu" id="msUserMenu">
+        <div class="ms-um-head"><b>{name}</b><span>{role}</span></div>
+        {menu_links}
+      </div>
+    </div>
+    <a href="/logout" class="ms-logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
+  </div>
+</header>"""
+
+
+def _shell_sidebar_html(user: dict, active: str) -> str:
+    parts = []
+    for sec, items in _SHELL_NAV:
+        links = []
+        for key, label, icon, href, perm, flag in items:
+            if not _shell_can(user, perm, flag):
+                continue
+            cls = ' class="active"' if key == active else ""
+            esc = html.escape(label)
+            links.append(f'<a href="{href}"{cls} title="{esc}"><i class="fa-solid {icon}"></i><span class="lbl">{esc}</span></a>')
+        if links:
+            parts.append(f'<div class="ms-sec"><span>{sec}</span></div>' + "".join(links))
+    return (
+        '<aside class="ms-sidebar" id="msSidebar">'
+        '<button class="ms-collapse" id="msCollapse" type="button" title="Collapse / expand menu">'
+        '<i class="fa-solid fa-angles-left"></i><span class="lbl">Collapse menu</span></button>'
+        '<nav class="ms-nav">' + "".join(parts) + '</nav>'
+        '<div class="ms-side-foot"><i class="fa-solid fa-heart-pulse"></i>'
+        '<p>Better Care<br>Through Accurate Results</p></div>'
+        '</aside><div class="ms-scrim" id="msScrim"></div>'
+    )
+
+
+def _shell_quick_actions_html(user: dict) -> str:
+    items = [
+        ("blue", "fa-user-plus", "Register Patient", "/add-patient", "add_patient", None),
+        ("green", "fa-print", "Test Results & Print", "/patients-dashboard", None, None),
+        ("purple", "fa-chart-line", "Reports & Analytics", "/reports", "reports", "can_view_reports"),
+        ("orange", "fa-flask", "Manage Tests", "/manage-tests", "manage_tests", None),
+        ("green", "fa-sack-dollar", "Sales & Finance", "/reports/sales-analytics", "reports", "can_view_reports"),
+        ("blue", "fa-share-nodes", "Share Reports", "/share-reports", "share_reports", None),
+        ("orange", "fa-tags", "Test Price List", "/reports?report_type=pricelist", "reports", "can_view_reports"),
+        ("purple", "fa-ban", "Cancel Bills", "/patients-dashboard?tab=cancel_bills", None, "can_cancel_bills"),
+    ]
+    out = []
+    for color, icon, label, href, perm, flag in items:
+        if not _shell_can(user, perm, flag):
+            continue
+        out.append(f'<a href="{href}" class="ms-qa {color}"><i class="fa-solid {icon} ic"></i> {html.escape(label)} '
+                   f'<i class="fa-solid fa-chevron-right ar"></i></a>')
+    return "".join(out)
+
+
+_SHELL_HEAD_SCRIPT = """<script>
+(function () {
+  try {
+    var t = localStorage.getItem('lab_theme');
+    if (t && t !== 'light') { document.documentElement.setAttribute('data-theme', t); }
+    if (localStorage.getItem('lab_sidebar') === '1') { document.documentElement.classList.add('ms-collapsed'); }
+  } catch (e) {}
+})();
+</script>"""
+
+# Theme variables + header + sidebar styles for WRAPPED pages (the dashboard
+# template already carries its own copy of these).
+_SHELL_BASE_CSS = """
+:root{--bg:#eef3fb;--header-bg:linear-gradient(90deg,#0f3b8f 0%,#0d47a1 100%);--sidebar-bg:#f4f7fd;--card:#ffffff;--text:#12296b;--muted:#6b7a99;--border:#e3eaf6;--primary:#0d47a1;--primary-soft:#dce8fb;--shadow:0 6px 22px rgba(13,71,161,.07);}
+[data-theme="dark"]{--bg:#0b1437;--header-bg:linear-gradient(90deg,#0d1840,#111c44);--sidebar-bg:#0f1a40;--card:#111c44;--text:#ffffff;--muted:#8f9bba;--border:#1e2b5c;--primary:#38bdf8;--primary-soft:#1b2a5e;--shadow:0 6px 22px rgba(0,0,0,.35);}
+[data-theme="emerald"]{--bg:#effaf3;--header-bg:linear-gradient(90deg,#064e3b,#065f46);--sidebar-bg:#f1fbf5;--card:#ffffff;--text:#064e3b;--muted:#4d8a74;--border:#cdeedd;--primary:#065f46;--primary-soft:#d3f3e2;--shadow:0 6px 22px rgba(6,95,70,.08);}
+html body.ms{margin:0 !important;padding:0 !important;display:block !important;background:var(--bg) !important;color:var(--text);font-family:'Segoe UI',system-ui,Roboto,sans-serif !important;min-height:100vh;}
+.ms-header,.ms-header *,.ms-sidebar,.ms-sidebar *,.ms-crumb,.ms-crumb *{box-sizing:border-box;}
+.ms-header a,.ms-sidebar a,.ms-crumb a{text-decoration:none;}
+.ms-header{background:var(--header-bg);color:#fff;height:84px;padding:0 26px;display:flex;align-items:center;justify-content:space-between;gap:14px;box-shadow:0 4px 14px rgba(0,0,0,.12);position:relative;z-index:30;}
+.ms-brand{display:flex;align-items:center;gap:14px;min-width:0;}
+.ms-brandlink{display:flex;align-items:center;gap:14px;color:#fff;min-width:0;}
+.ms-burger{display:none;background:rgba(255,255,255,.15);color:#fff;border:0;width:40px;height:40px;border-radius:10px;font-size:17px;cursor:pointer;padding:0;}
+.ms-logo{font-size:38px;line-height:1;}
+.ms-brand h1{margin:0;color:#fff;font-size:24px;font-weight:800;letter-spacing:.6px;white-space:nowrap;}
+.ms-brand p{margin:3px 0 0;font-size:13px;color:#fff;opacity:.92;}
+.ms-hright{display:flex;align-items:center;gap:12px;}
+.ms-clock{display:flex;align-items:center;gap:10px;border:1px solid rgba(255,255,255,.3);border-radius:26px;padding:7px 18px;background:rgba(255,255,255,.06);}
+.ms-clock i{font-size:20px;}
+.ms-clock b{display:block;font-size:14px;font-weight:700;line-height:1.2;}
+.ms-clock span{display:block;font-size:12px;opacity:.85;line-height:1.2;}
+.ms-theme{display:flex;align-items:center;gap:8px;background:#1d5bc4;border-radius:26px;padding:0 14px;height:44px;}
+[data-theme="dark"] .ms-theme{background:#26357a;}
+[data-theme="emerald"] .ms-theme{background:#0a7a58;}
+.ms-theme i{color:#ffc83d;font-size:18px;}
+.ms-theme select{appearance:none;-webkit-appearance:none;width:auto;background:transparent;border:0;outline:none;color:#fff;font-weight:700;font-size:13.5px;padding:0 22px 0 0;margin:0;cursor:pointer;font-family:inherit;box-shadow:none;border-radius:0;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'/></svg>");background-repeat:no-repeat;background-position:right center;}
+.ms-theme select option{background:#111c44;color:#fff;}
+.ms-user{position:relative;}
+.ms-user-btn{display:flex;align-items:center;gap:9px;background:transparent;border:0;color:#fff;cursor:pointer;font-family:inherit;font-size:14px;font-weight:700;padding:4px 6px;border-radius:26px;width:auto;margin:0;}
+.ms-user-btn:hover{background:rgba(255,255,255,.12);}
+.ms-avatar{width:38px;height:38px;border-radius:50%;background:#fff;color:#1d5bc4;display:grid;place-items:center;font-size:20px;}
+.ms-user-menu{display:none;position:absolute;right:0;top:52px;min-width:210px;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);overflow:hidden;z-index:60;}
+.ms-user-menu.open{display:block;}
+.ms-user-menu .ms-um-head{padding:12px 16px;border-bottom:1px solid var(--border);}
+.ms-user-menu .ms-um-head b{display:block;font-size:14px;}
+.ms-user-menu .ms-um-head span{font-size:12px;color:var(--muted);}
+.ms-user-menu a{display:flex;align-items:center;gap:10px;padding:11px 16px;color:var(--text);font-size:13.5px;font-weight:600;}
+.ms-user-menu a:hover{background:var(--primary-soft);}
+.ms-user-menu a i{width:16px;color:var(--primary);}
+.ms-logout{background:#ef4444;color:#fff;border:0;border-radius:10px;padding:0 20px;height:44px;font-weight:700;font-size:14px;display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-family:inherit;}
+.ms-logout:hover{background:#dc2626;color:#fff;}
+.ms-layout{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:calc(100vh - 84px);}
+.ms-sidebar{background:var(--sidebar-bg);border-right:1px solid var(--border);padding:14px 14px 20px;display:flex;flex-direction:column;position:sticky;top:0;height:calc(100vh - 84px);overflow-y:auto;}
+.ms-nav{display:flex;flex-direction:column;gap:4px;}
+.ms-nav a{display:flex;align-items:center;gap:16px;padding:11px 16px;border-radius:12px;color:var(--text);font-size:15px;font-weight:600;transition:background .15s,transform .15s;}
+.ms-nav a i{width:24px;text-align:center;font-size:19px;color:var(--primary);opacity:.8;}
+.ms-nav a:hover{background:var(--primary-soft);}
+.ms-nav a.active{background:var(--primary-soft);font-weight:700;}
+.ms-nav a.active i{opacity:1;}
+.ms-side-foot{margin-top:auto;text-align:center;padding:24px 8px 6px;color:var(--muted);}
+.ms-side-foot i{font-size:38px;color:#38a3e8;display:block;margin-bottom:8px;}
+.ms-side-foot p{margin:0;font-family:'Segoe Script','Brush Script MT',cursive;font-style:italic;font-size:15px;line-height:1.5;}
+.ms-scrim{display:none;}
+.ms-main{padding:18px 28px 30px;min-width:0;}
+@media (max-width:992px){
+ .ms-burger{display:inline-block;}
+ .ms-layout{grid-template-columns:minmax(0,1fr);}
+ .ms-sidebar{position:fixed;top:84px;left:0;width:270px;height:calc(100vh - 84px);z-index:50;transform:translateX(-102%);transition:transform .25s;box-shadow:8px 0 30px rgba(0,0,0,.2);}
+ .ms-sidebar.open{transform:translateX(0);}
+ .ms-scrim.open{display:block;position:fixed;inset:84px 0 0 0;background:rgba(8,20,60,.4);z-index:40;}
+ .ms-clock,.ms-brand p{display:none;}
+}
+@media (max-width:640px){
+ .ms-header{padding:0 12px;}
+ .ms-brand h1{font-size:15px;white-space:normal;line-height:1.15;}
+ .ms-logo,.ms-theme{display:none;}
+ .ms-user-btn .nm{display:none;}
+ .ms-main{padding:14px 10px 24px;}
+}
+"""
+
+# Extra rules shared by the dashboard AND wrapped pages: global search,
+# New Patient button, sidebar section labels, collapse, breadcrumb, page panel.
+_SHELL_EXTRA_CSS = """
+.ms-hright{flex:1;justify-content:flex-end;min-width:0;}
+.ms-search{display:flex;align-items:center;gap:8px;flex:1;max-width:330px;min-width:140px;height:44px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28);border-radius:26px;padding:0 14px;margin:0;}
+.ms-search:focus-within{background:rgba(255,255,255,.24);}
+.ms-search i{color:#fff;opacity:.85;font-size:15px;}
+.ms-search input{flex:1;min-width:0;width:100%;height:auto;background:transparent;border:0;outline:none;box-shadow:none;border-radius:0;padding:0;margin:0;color:#fff;font-size:13.5px;font-family:inherit;}
+.ms-search input::placeholder{color:rgba(255,255,255,.75);}
+.ms-search kbd{font-family:inherit;font-size:11px;font-weight:700;background:rgba(255,255,255,.22);border-radius:6px;padding:2px 7px;color:#fff;}
+.ms-newpt{background:#22c55e;color:#fff;border-radius:26px;height:44px;padding:0 18px;display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:13.5px;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.18);text-decoration:none;}
+.ms-newpt:hover{background:#16a34a;color:#fff;}
+.ms-sec{padding:14px 16px 4px;font-size:11px;font-weight:800;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted);}
+.ms-sec:first-child{padding-top:4px;}
+.ms-nav a{padding:10px 16px;}
+.ms-collapse{display:flex;align-items:center;gap:14px;background:transparent;border:1px dashed var(--border);color:var(--muted);border-radius:10px;padding:7px 16px;margin:0 0 10px;font-size:12.5px;font-weight:700;cursor:pointer;font-family:inherit;width:100%;}
+.ms-collapse i{width:24px;text-align:center;transition:transform .2s;}
+.ms-collapse:hover{background:var(--primary-soft);color:var(--primary);}
+.ms-crumb{display:flex;align-items:center;gap:10px;font-size:13.5px;font-weight:600;color:var(--muted);margin:0 0 14px;flex-wrap:wrap;}
+.ms-crumb a{color:var(--primary);font-weight:700;}
+.ms-crumb .sep{font-size:10px;opacity:.7;}
+.ms-crumb span{color:var(--text);font-weight:800;display:inline-flex;align-items:center;gap:8px;}
+.ms-crumb span i{color:var(--primary);}
+.ms-page{color:#1e293b;overflow-x:auto;border-radius:16px;}
+[data-theme="dark"] .ms-page{background:#f4f7fb;padding:16px;border:1px solid var(--border);}
+html body.ms .ms-page > .header{border-radius:12px;margin-bottom:16px;}
+@media (min-width:993px){
+ html.ms-collapsed .ms-layout{grid-template-columns:78px minmax(0,1fr);}
+ html.ms-collapsed .ms-sidebar{padding:14px 10px 20px;}
+ html.ms-collapsed .ms-nav a{justify-content:center;padding:11px 8px;gap:0;}
+ html.ms-collapsed .ms-nav a .lbl,html.ms-collapsed .ms-sec span,html.ms-collapsed .ms-collapse .lbl,html.ms-collapsed .ms-side-foot p{display:none;}
+ html.ms-collapsed .ms-sec{padding:8px 0 2px;border-bottom:1px solid var(--border);margin-bottom:4px;}
+ html.ms-collapsed .ms-collapse{justify-content:center;padding:7px 0;}
+ html.ms-collapsed .ms-collapse i{transform:rotate(180deg);}
+ html.ms-collapsed .ms-side-foot{padding-top:12px;}
+ html.ms-collapsed .ms-side-foot i{font-size:26px;}
+}
+@media (max-width:1500px){.ms-clock{display:none;}}
+@media (max-width:1300px){.ms-newpt span{display:none;}.ms-newpt{padding:0 14px;}}
+@media (max-width:1200px){.ms-brand p{display:none;}}
+@media (max-height:900px){.ms-side-foot{display:none;}}
+@media print{
+ .ms-header,.ms-sidebar,.ms-scrim,.ms-crumb{display:none !important;}
+ .ms-layout{display:block !important;}
+ html body.ms .ms-main{padding:0 !important;}
+ .ms-page{background:#fff !important;padding:0 !important;border:0 !important;overflow:visible !important;}
+}
+"""
+
+_SHELL_CORE_JS = """
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  function two(n) { return String(n).padStart(2, '0'); }
+  function tick() {
+    var el = $('msClock'); if (!el) return;
+    var d = new Date(), h = d.getHours(), ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
+    el.textContent = two(h) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()) + ' ' + ap;
+    var s = $('msClockDate'); if (s) s.textContent = MONTHS[d.getMonth()].slice(0, 3) + ' ' + d.getDate() + ', ' + d.getFullYear();
+  }
+  tick(); setInterval(tick, 1000);
+
+  window.changeTheme = function (t) {
+    if (t === 'light') { document.documentElement.removeAttribute('data-theme'); }
+    else { document.documentElement.setAttribute('data-theme', t); }
+    try { localStorage.setItem('lab_theme', t); } catch (e) {}
+  };
+  var sel = $('themeSwitcher');
+  if (sel) { var t = 'light'; try { t = localStorage.getItem('lab_theme') || 'light'; } catch (e) {} sel.value = t; }
+
+  var userBtn = $('msUserBtn'), userMenu = $('msUserMenu');
+  if (userBtn && userMenu) {
+    userBtn.addEventListener('click', function (e) { e.stopPropagation(); userMenu.classList.toggle('open'); });
+    document.addEventListener('click', function (e) { var u = $('msUser'); if (u && !u.contains(e.target)) userMenu.classList.remove('open'); });
+  }
+  var side = $('msSidebar'), scrim = $('msScrim'), burger = $('msBurger');
+  function toggleSide(open) { if (side) side.classList.toggle('open', open); if (scrim) scrim.classList.toggle('open', open); }
+  if (burger && side) burger.addEventListener('click', function () { toggleSide(!side.classList.contains('open')); });
+  if (scrim) scrim.addEventListener('click', function () { toggleSide(false); });
+})();
+"""
+
+# Used on BOTH the dashboard and wrapped pages (idempotent, no overlap with core).
+_SHELL_EXTRA_JS = """
+(function () {
+  var btn = document.getElementById('msCollapse');
+  if (btn) btn.addEventListener('click', function () {
+    var c = document.documentElement.classList.toggle('ms-collapsed');
+    try { localStorage.setItem('lab_sidebar', c ? '1' : '0'); } catch (e) {}
+  });
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    var typing = t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable);
+    if (e.key === '/' && !typing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      var s = document.getElementById('msGlobalSearch');
+      if (s) { e.preventDefault(); s.focus(); s.select(); }
+    }
+    if (e.altKey && !e.ctrlKey && !e.metaKey) {
+      var k = (e.key || '').toLowerCase();
+      if (k === 'n') { var a = document.querySelector('.ms-newpt'); if (a) { e.preventDefault(); location.href = a.getAttribute('href'); } }
+      else if (k === 'h') { e.preventDefault(); location.href = '/dashboard'; }
+    }
+    if (e.key === 'Escape') { var m = document.getElementById('msUserMenu'); if (m) m.classList.remove('open'); }
+  });
+})();
+"""
+
+_RE_SHELL_HEAD = re.compile(r"<head[^>]*>(.*?)</head>", re.I | re.S)
+_RE_SHELL_BODY = re.compile(r"<body[^>]*>(.*)</body>", re.I | re.S)
+_RE_SHELL_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_RE_SHELL_DASH_LINK = re.compile(r"<a\b[^>]*\bhref=[\"']/dashboard[\"'][^>]*>(?:(?!</a>).)*</a>", re.I | re.S)
+
+
+def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
+    """Returns the page re-rendered inside the shared header + sidebar, or
+    None when the page should be left exactly as it is."""
+    if 'id="msSidebar"' in page_html:
+        return None
+    body_m = _RE_SHELL_BODY.search(page_html)
+    if not body_m:
+        return None
+    head_m = _RE_SHELL_HEAD.search(page_html)
+    head_inner = head_m.group(1) if head_m else ""
+    body_inner = body_m.group(1)
+
+    title_m = _RE_SHELL_TITLE.search(head_inner)
+    page_title = ""
+    if title_m:
+        page_title = html.unescape(re.sub(r"<[^>]+>", "", title_m.group(1))).strip()
+        page_title = re.sub(r"^Lab System\s*-\s*", "", page_title)
+        page_title = re.sub(r"\s*-\s*MEDISTAR MEDICAL LABORATORY.*$", "", page_title)
+
+    # Remove every "Back to Dashboard" style link - the sidebar replaces them.
+    body_inner = _RE_SHELL_DASH_LINK.sub("", body_inner)
+
+    active = _shell_active_key(path, query)
+    nav_item = _shell_nav_item(active)
+    icon = nav_item[2] if nav_item else "fa-file-lines"
+    crumb_title = html.escape(page_title or (nav_item[1] if nav_item else "Page"))
+    crumb = (
+        '<div class="ms-crumb"><a href="/dashboard"><i class="fa-solid fa-house"></i> Dashboard</a>'
+        '<i class="fa-solid fa-chevron-right sep"></i>'
+        f'<span><i class="fa-solid {icon}"></i> {crumb_title}</span></div>'
+    )
+
+    fa_link = ""
+    if "font-awesome" not in head_inner.lower():
+        fa_link = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">'
+
+    return (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        + head_inner + fa_link
+        + "<style>" + _SHELL_BASE_CSS + _SHELL_EXTRA_CSS + "</style>"
+        + _SHELL_HEAD_SCRIPT
+        + '</head><body class="ms ms-wrapped">'
+        + _shell_header_html(user)
+        + '<div class="ms-layout">' + _shell_sidebar_html(user, active)
+        + '<main class="ms-main">' + crumb + '<div class="ms-page">' + body_inner + '</div></main></div>'
+        + "<script>" + _SHELL_CORE_JS + "</script><script>" + _SHELL_EXTRA_JS + "</script>"
+        + "</body></html>"
+    )
+
+
+_SHELL_SKIP_EXACT = {"/", "/login", "/logout", "/dashboard", "/favicon.ico"}
+_SHELL_SKIP_PREFIXES = (
+    "/public-report", "/shared-report", "/static", "/docs", "/openapi.json", "/redoc",
+    "/print-report", "/report-view", "/report-download", "/report-letterhead-preview", "/api/",
+)
+
+
+@app.middleware("http")
+async def app_shell_middleware(request: Request, call_next):
+    # Added AFTER every other middleware, so it is the outermost one and sees
+    # the finished response of every page.
+    response = await call_next(request)
+    path = request.url.path
+    if request.method != "GET" or response.status_code != 200:
+        return response
+    if path in _SHELL_SKIP_EXACT or path.startswith(_SHELL_SKIP_PREFIXES):
+        return response
+    if not response.headers.get("content-type", "").startswith("text/html"):
+        return response
+    if response.headers.get("content-disposition", "").startswith("attachment"):
+        return response
+    user = getattr(request.state, "user", None)
+    if not user:
+        return response
+
+    iterator = getattr(response, "body_iterator", None)
+    if iterator is not None:
+        chunks = []
+        async for chunk in iterator:
+            chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
+        original = b"".join(chunks)
+    else:
+        original = getattr(response, "body", b"") or b""
+
+    out = original
+    try:
+        wrapped = wrap_page_in_shell(original.decode("utf-8"), user, path, request.url.query)
+        if wrapped is not None:
+            out = wrapped.encode("utf-8")
+    except Exception:
+        out = original
+
+    new_response = StarletteResponse(content=out, status_code=response.status_code)
+    new_response.raw_headers = [
+        (k, v) for (k, v) in response.raw_headers if k.lower() != b"content-length"
+    ] + [(b"content-length", str(len(out)).encode("ascii"))]
+    return new_response
 
 
 # 2. Logout Route
@@ -2431,69 +2918,13 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     .ms-qa-grid { grid-template-columns: 1fr; }
     .ms-help { flex-wrap: wrap; }
   }
-</style>
-</head>
+</style>__SHELL_HEAD_EXTRA__</head>
 <body class="ms">
 
-<header class="ms-header">
-  <div class="ms-brand">
-    <button class="ms-burger" id="msBurger" type="button" aria-label="Menu"><i class="fa-solid fa-bars"></i></button>
-    <div class="ms-logo"><i class="fa-solid fa-flask-vial"></i></div>
-    <div>
-      <h1>MEDISTAR MEDICAL LABORATORY</h1>
-      <p>Patient &amp; Laboratory Report Management System</p>
-    </div>
-  </div>
-  <div class="ms-hright">
-    <div class="ms-clock">
-      <i class="fa-regular fa-clock"></i>
-      <div><b id="msClock">--:--:--</b><span id="msClockDate">&nbsp;</span></div>
-    </div>
-    <div class="ms-theme">
-      <i class="fa-solid fa-sun"></i>
-      <select id="themeSwitcher" onchange="changeTheme(this.value)" aria-label="Theme">
-        <option value="light">Classic Blue</option>
-        <option value="dark">Dark Mode</option>
-        <option value="emerald">Emerald Green</option>
-      </select>
-    </div>
-    <div class="ms-user" id="msUser">
-      <button class="ms-user-btn" id="msUserBtn" type="button">
-        <span class="ms-avatar"><i class="fa-solid fa-circle-user"></i></span>
-        <span class="nm">__USERNAME__</span>
-        <i class="fa-solid fa-chevron-down" style="font-size: 11px;"></i>
-      </button>
-      <div class="ms-user-menu" id="msUserMenu">
-        <div class="ms-um-head"><b>__USERNAME__</b><span>__ROLE__</span></div>
-        <a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>
-        <a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>
-        <a href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
-      </div>
-    </div>
-    <a href="/logout" class="ms-logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
-  </div>
-</header>
+__SHELL_HEADER__
 
 <div class="ms-layout">
-  <aside class="ms-sidebar" id="msSidebar">
-    <nav class="ms-nav">
-      <a href="/dashboard" class="active"><i class="fa-solid fa-house"></i> Dashboard</a>
-      <a href="/add-patient"><i class="fa-solid fa-user-plus"></i> Register Patient</a>
-      <a href="/patients-dashboard"><i class="fa-solid fa-print"></i> Test Results &amp; Print</a>
-      <a href="/reports"><i class="fa-solid fa-chart-line"></i> Reports &amp; Analytics</a>
-      <a href="/manage-tests"><i class="fa-solid fa-gear"></i> Manage Tests</a>
-      <a href="/manage-doctors"><i class="fa-solid fa-user-doctor"></i> Manage Doctors</a>
-      <a href="/manage-centers"><i class="fa-solid fa-hospital"></i> Centers</a>
-      <a href="/share-reports"><i class="fa-solid fa-share-nodes"></i> Share Reports</a>
-      <a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>
-      <a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>
-    </nav>
-    <div class="ms-side-foot">
-      <i class="fa-solid fa-heart-pulse"></i>
-      <p>Better Care<br>Through Accurate Results</p>
-    </div>
-  </aside>
-  <div class="ms-scrim" id="msScrim"></div>
+  __SHELL_SIDEBAR__
 
   <main class="ms-main">
     <div class="ms-welcome">
@@ -2609,12 +3040,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         <section class="ms-panel">
           <div class="ms-qa-title"><i class="fa-solid fa-bolt"></i> Quick Actions</div>
-          <div class="ms-qa-grid">
-            <a href="/add-patient" class="ms-qa blue"><i class="fa-solid fa-user-plus ic"></i> Register Patient <i class="fa-solid fa-chevron-right ar"></i></a>
-            <a href="/patients-dashboard" class="ms-qa green"><i class="fa-solid fa-print ic"></i> Test Results &amp; Print <i class="fa-solid fa-chevron-right ar"></i></a>
-            <a href="/reports" class="ms-qa purple"><i class="fa-solid fa-chart-line ic"></i> Reports &amp; Analytics <i class="fa-solid fa-chevron-right ar"></i></a>
-            <a href="/manage-tests" class="ms-qa orange"><i class="fa-solid fa-flask ic"></i> Manage Tests <i class="fa-solid fa-chevron-right ar"></i></a>
-          </div>
+          <div class="ms-qa-grid">__QUICK_ACTIONS__</div>
         </section>
 
         <div class="ms-help">
@@ -2763,6 +3189,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   renderChart();
   var rzT; window.addEventListener('resize', function () { clearTimeout(rzT); rzT = setTimeout(renderChart, 120); });
 </script>
+__SHELL_EXTRA_JS__
 </body>
 </html>
 """
@@ -2833,6 +3260,20 @@ def dashboard(request: Request):
     except Exception:
         pending_reports = 0
 
+    today_revenue = None
+    if _shell_can(user, "reports", "can_view_reports"):
+        try:
+            cursor.execute(
+                "SELECT COALESCE(SUM(COALESCE(t.price, 0)), 0) FROM patients p "
+                "JOIN patient_assigned_tests pat ON pat.patient_id = p.id "
+                "JOIN tests t ON t.id = pat.test_id "
+                "WHERE substr(p.created_at, 1, 10) = ? AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)",
+                (today.isoformat(),),
+            )
+            today_revenue = float(cursor.fetchone()[0] or 0)
+        except Exception:
+            today_revenue = None
+
     conn.close()
 
     def span(a, b):
@@ -2856,6 +3297,8 @@ def dashboard(request: Request):
         {"label": "Today", "value": str(today_c), "sub": "patients registered today", "tone": "info", "icon": "fa-user-group"},
         {"label": "Pending Reports", "value": str(pending_reports), "sub": "patients awaiting results", "tone": "warn", "icon": "fa-hourglass-half"},
     ]
+    if today_revenue is not None:
+        status_slides.append({"label": "Today's Revenue", "value": f"Rs. {today_revenue:,.0f}", "sub": "billed today (cancelled bills excluded)", "tone": "ok", "icon": "fa-sack-dollar"})
 
     recent_rows = ""
     if recent_patients:
@@ -2874,6 +3317,11 @@ def dashboard(request: Request):
 
     replacements = {
         "__USERNAME__": html.escape(display_name),
+        "__SHELL_HEADER__": _shell_header_html(user),
+        "__SHELL_SIDEBAR__": _shell_sidebar_html(user, "dashboard"),
+        "__QUICK_ACTIONS__": _shell_quick_actions_html(user),
+        "__SHELL_HEAD_EXTRA__": "<style>" + _SHELL_EXTRA_CSS + "</style>" + _SHELL_HEAD_SCRIPT,
+        "__SHELL_EXTRA_JS__": "<script>" + _SHELL_EXTRA_JS + "</script>",
         "__ROLE__": html.escape(role_label),
         "__TOTAL_PATIENTS__": str(total_patients),
         "__PATIENT_TREND__": _dash_trend_html(month_c, prev_month_c),
