@@ -1620,74 +1620,98 @@ def root():
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(error: str = ""):
-    error_html = f"<p style='color: #e74c3c; font-size: 13px; text-align: center; margin-bottom: 15px;'>{error}</p>" if error else ""
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <title>MEDISTAR MEDICAL LABORATORY - Login</title>
-        <style>
-            body {{ 
-                font-family: Arial, sans-serif; 
-                margin: 0; 
-                min-height: 100vh; 
-                display: flex; 
-                justify-content: center; 
-                align-items: center; 
-                /* Full-screen medical background photo with a dark-blue
-                   gradient overlay layered on top of it (not a separate
-                   div - the gradient is just the first background-image
-                   layer, painted over the photo beneath it). Swap the
-                   url() below for your own asset at any time (e.g. a
-                   licensed Unsplash photo URL) - everything else in this
-                   rule stays the same. */
-                background-image: linear-gradient(135deg, rgba(14, 53, 90, 0.85), rgba(10, 30, 55, 0.90)), url('/static/bg-lab.jpg');
-                background-size: cover; 
-                background-position: center; 
-                background-repeat: no-repeat; 
-                background-attachment: fixed; 
-                background-color: #0a1e37; /* fallback tone if the image is missing/still loading */
-            }}
-            .login-card {{ 
-                background: white; 
-                padding: 30px; 
-                border-radius: 12px; 
-                box-shadow: 0 15px 35px rgba(0,0,0,0.25); 
-                width: 400px; 
-                border-top: 5px solid #0f4c81; 
-            }}
-            .login-logo {{ display: block; width: 180px; height: 180px; object-fit: contain; margin: 0 auto 12px auto; }}
-            h2 {{ color: #0f4c81; text-align: center; margin-bottom: 5px; font-size: 20px; }}
-            p.sub {{ text-align: center; color: #64748b; font-size: 12px; margin-bottom: 20px; }}
-            .form-group {{ margin-bottom: 15px; display: flex; flex-direction: column; gap: 5px; }}
-            label {{ font-size: 12px; font-weight: bold; color: #64748b; }}
-            input {{ padding: 10px; border: 1px solid #cbd5e1; border-radius: 5px; outline: none; font-size: 14px; background: #fff; color: #0f172a; }}
-            input:focus {{ border-color: #0f4c81; box-shadow: 0 0 0 3px rgba(15, 76, 129, 0.12); }}
-            .btn-login {{ background: #0f4c81; color: white; border: none; padding: 10px; border-radius: 5px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 10px; font-size: 14px; }}
-            .btn-login:hover {{ background: #0c3d6d; }}
-        </style>
-    </head>
-    <body>
-        <div class="login-card">
-            <img src="/static/logo.png" alt="Medistar Medical Laboratory Logo" class="login-logo">
-            <h2>MEDISTAR MEDICAL LABORATORY</h2>
-            <p class="sub">Sign in to your account</p>
-            {error_html}
-            <form method="POST" action="/login">
-                <div class="form-group">
-                    <label>Username</label>
-                    <input type="text" name="username" required placeholder="Enter username">
-                </div>
-                <div class="form-group">
-                    <label>Password</label>
-                    <input type="password" name="password" required placeholder="Enter password">
-                </div>
-                <button type="submit" class="btn-login">Login</button>
-            </form>
+    error_html = (
+        f'<div class="err"><i class="fa-solid fa-circle-exclamation"></i> {html.escape(error)}</div>'
+        if error else ""
+    )
+    page = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MEDISTAR MEDICAL LABORATORY - Login</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script>
+  (function () { try { var t = localStorage.getItem('lab_theme'); if (t && t !== 'light') document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
+</script>
+<style>
+  :root { --a1:#0f3b8f; --a2:#0d47a1; --accent:#0d47a1; --accent-dark:#08306b; --soft:#dce8fb; --ov1:rgba(14,53,90,.85); --ov2:rgba(10,30,55,.90); --bgc:#0a1e37; }
+  [data-theme="dark"] { --a1:#0d1840; --a2:#111c44; --accent:#38bdf8; --accent-dark:#0ea5e9; --soft:#1b2a5e; --ov1:rgba(8,14,40,.90); --ov2:rgba(5,9,28,.94); --bgc:#050a1c; }
+  [data-theme="emerald"] { --a1:#064e3b; --a2:#065f46; --accent:#065f46; --accent-dark:#044e3a; --soft:#d3f3e2; --ov1:rgba(4,60,45,.86); --ov2:rgba(3,38,30,.92); --bgc:#032a20; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px;
+         font-family:'Segoe UI',system-ui,Roboto,sans-serif;
+         background-image: linear-gradient(135deg, var(--ov1), var(--ov2)), url('/static/bg-lab.jpg');
+         background-size:cover; background-position:center; background-repeat:no-repeat; background-attachment:fixed; background-color:var(--bgc); }
+  .login-card { width:100%; max-width:420px; background:#fff; border-radius:18px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,.35); }
+  .card-top { background:linear-gradient(90deg,var(--a1),var(--a2)); padding:22px 24px 18px; text-align:center; color:#fff; }
+  .login-logo { display:block; width:130px; height:130px; object-fit:contain; margin:0 auto 10px; background:#fff; border-radius:50%; padding:10px; }
+  .card-top h2 { margin:0; font-size:19px; font-weight:800; letter-spacing:.5px; }
+  .card-top p { margin:4px 0 0; font-size:12.5px; opacity:.9; }
+  .card-body { padding:26px 28px 28px; }
+  .card-body h3 { margin:0 0 4px; color:#12296b; font-size:18px; }
+  [data-theme="emerald"] .card-body h3 { color:#064e3b; }
+  .sub { margin:0 0 18px; color:#64748b; font-size:13px; }
+  .err { background:#fee2e2; color:#b91c1c; border:1px solid #fecaca; border-radius:10px; padding:10px 12px; font-size:13px; font-weight:600; margin-bottom:14px; }
+  .field { margin-bottom:14px; }
+  .field label { display:block; font-size:12px; font-weight:700; color:#475569; margin-bottom:6px; }
+  .input-wrap { position:relative; display:flex; align-items:center; }
+  .input-wrap > i.ic { position:absolute; left:14px; color:#94a3b8; font-size:14px; }
+  .input-wrap input { width:100%; height:46px; padding:0 44px 0 40px; border:1px solid #cbd5e1; border-radius:12px; font-size:14.5px; outline:none; background:#f8fafc; color:#0f172a; font-family:inherit; }
+  .input-wrap input:focus { border-color:var(--accent); background:#fff; box-shadow:0 0 0 3px rgba(13,71,161,.14); }
+  .eye { position:absolute; right:6px; width:36px; height:36px; border:0; background:transparent; color:#94a3b8; cursor:pointer; border-radius:8px; font-size:15px; }
+  .eye:hover { color:var(--accent); background:var(--soft); }
+  .btn-login { width:100%; height:48px; margin-top:6px; border:0; border-radius:12px; cursor:pointer; font-size:15px; font-weight:800; color:#fff; font-family:inherit;
+               background:linear-gradient(90deg,var(--a1),var(--a2)); box-shadow:0 6px 16px rgba(13,71,161,.3); display:flex; align-items:center; justify-content:center; gap:8px; }
+  [data-theme="dark"] .btn-login { color:#07122e; background:linear-gradient(90deg,#38bdf8,#0ea5e9); }
+  .btn-login:hover { filter:brightness(1.08); }
+  .btn-login:disabled { opacity:.75; cursor:wait; }
+  .foot { text-align:center; margin-top:16px; font-size:11.5px; color:#94a3b8; }
+  @media (max-width:420px) { .card-body { padding:22px 18px 22px; } .login-logo { width:104px; height:104px; } }
+</style>
+</head>
+<body>
+  <div class="login-card">
+    <div class="card-top">
+      <img src="/static/logo.png" alt="Medistar Medical Laboratory Logo" class="login-logo">
+      <h2>MEDISTAR MEDICAL LABORATORY</h2>
+      <p>Patient &amp; Laboratory Report Management System</p>
+    </div>
+    <div class="card-body">
+      <h3>Welcome back</h3>
+      <p class="sub">Sign in to your account to continue</p>
+      __ERROR__
+      <form method="POST" action="/login" id="loginForm">
+        <div class="field">
+          <label for="u">Username</label>
+          <div class="input-wrap"><i class="fa-solid fa-user ic"></i>
+            <input type="text" id="u" name="username" required placeholder="Enter username" autocomplete="username" autofocus></div>
         </div>
-    </body>
-    </html>
-    """
+        <div class="field">
+          <label for="p">Password</label>
+          <div class="input-wrap"><i class="fa-solid fa-lock ic"></i>
+            <input type="password" id="p" name="password" required placeholder="Enter password" autocomplete="current-password">
+            <button type="button" class="eye" id="eye" aria-label="Show or hide password"><i class="fa-regular fa-eye"></i></button></div>
+        </div>
+        <button type="submit" class="btn-login" id="loginBtn"><i class="fa-solid fa-right-to-bracket"></i> Login</button>
+      </form>
+      <div class="foot">Better Care Through Accurate Results</div>
+    </div>
+  </div>
+<script>
+  var eye = document.getElementById('eye'), pw = document.getElementById('p');
+  eye.addEventListener('click', function () {
+    var show = pw.type === 'password'; pw.type = show ? 'text' : 'password';
+    eye.innerHTML = '<i class="fa-regular ' + (show ? 'fa-eye-slash' : 'fa-eye') + '"></i>';
+  });
+  document.getElementById('loginForm').addEventListener('submit', function () {
+    var b = document.getElementById('loginBtn'); b.disabled = true;
+    b.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Signing in...';
+  });
+</script>
+</body>
+</html>"""
+    return page.replace("__ERROR__", error_html)
 
 @app.post("/login")
 async def login_post(request: Request):
