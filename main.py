@@ -8971,6 +8971,19 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                every other test's note spacing above is untouched. */
             .fia-inline-row + .report-note, .fia-inline-row + .report-test-note, .fia-inline-row + .test-category-note, .fia-inline-row + .interpretation-note {{ margin-top: -5px; }}
 
+            /* Tables typed into a Test Category's Notes / Description box
+               (e.g. reference ranges). The page-wide reset gives bare
+               <table>/<td> no borders or padding, so they printed as
+               unreadable jammed-together text. These scoped rules give
+               them a clean bordered grid in screen view AND print view.
+               Only affects tables inside the notes block. */
+            .report-test-note table, .test-category-note table, .interpretation-note table {{ display: table !important; width: 100%; border-collapse: collapse; margin: 6px 0; table-layout: auto; border: 1px solid #000; break-inside: avoid; page-break-inside: avoid; }}
+            .report-test-note thead, .test-category-note thead {{ display: table-header-group; }}
+            .report-test-note tbody, .test-category-note tbody {{ display: table-row-group; }}
+            .report-test-note tr, .test-category-note tr {{ display: table-row; break-inside: avoid; page-break-inside: avoid; }}
+            .report-test-note th, .report-test-note td, .test-category-note th, .test-category-note td {{ display: table-cell; border: 1px solid #000; padding: 3px 6px; text-align: left; vertical-align: top; color: #000; line-height: 1.3; overflow-wrap: anywhere; }}
+            .report-test-note th, .test-category-note th {{ font-weight: bold; background: #f2f2f2; }}
+
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
             .section-divider {{ border: none; border-top: 1px solid #999; margin: 5px 0 3px 0; }}
 
