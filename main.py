@@ -7,12 +7,13 @@ import threading
 import secrets
 import hashlib
 import base64
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from typing import Optional
 from fastapi import FastAPI, Form, Request, Query, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 from contextlib import asynccontextmanager
@@ -755,6 +756,80 @@ PUBLIC_REPORT_HEADERS = {
 }
 
 
+# -------------------------------------------------------------
+# SESSION STORE + LOGIN RATE LIMIT (in-memory, zero schema change)
+# Server-side sessions keyed by a random opaque token stored in an
+# httponly cookie. No DB columns are added; existing plaintext
+# passwords are auto-hashed on first successful login (see login_post).
+# -------------------------------------------------------------
+SESSION_TTL_SECONDS = 12 * 3600  # 12 hours
+_sessions: dict = {}
+_sessions_lock = threading.Lock()
+# key: (client_ip, username_lower) -> {"count": int, "first_ts": float}
+_failed_logins: dict = {}
+
+LOGIN_RATE_LIMIT_MAX = 5
+LOGIN_RATE_LIMIT_WINDOW = 900  # 15 minutes
+
+
+def _create_session(username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _sessions_lock:
+        _sessions[token] = {"username": username, "created": now, "expires": now + SESSION_TTL_SECONDS}
+    return token
+
+
+def _get_session(token: str):
+    """Return session dict if valid, else None. Expired entries are removed."""
+    if not token:
+        return None
+    with _sessions_lock:
+        sess = _sessions.get(token)
+        if sess is None:
+            return None
+        if time.time() > sess["expires"]:
+            _sessions.pop(token, None)
+            return None
+        return sess
+
+
+def _pop_session(token: str) -> None:
+    if not token:
+        return
+    with _sessions_lock:
+        _sessions.pop(token, None)
+
+
+def _login_rate_limited(client_ip: str, username: str) -> bool:
+    """True if this (ip, username) has >= LOGIN_RATE_LIMIT_MAX failures
+    inside the current window."""
+    key = (client_ip, (username or "").strip().lower())
+    now = time.time()
+    with _sessions_lock:
+        rec = _failed_logins.get(key)
+        if rec and rec["count"] >= LOGIN_RATE_LIMIT_MAX and (now - rec["first_ts"]) < LOGIN_RATE_LIMIT_WINDOW:
+            return True
+    return False
+
+
+def _record_failed_login(client_ip: str, username: str) -> None:
+    key = (client_ip, (username or "").strip().lower())
+    now = time.time()
+    with _sessions_lock:
+        rec = _failed_logins.get(key)
+        if rec is None or (now - rec["first_ts"]) >= LOGIN_RATE_LIMIT_WINDOW:
+            _failed_logins[key] = {"count": 1, "first_ts": now}
+        else:
+            rec["count"] += 1
+
+
+def _clear_failed_login(client_ip: str, username: str) -> None:
+    key = (client_ip, (username or "").strip().lower())
+    with _sessions_lock:
+        _failed_logins.pop(key, None)
+
+
 @app.middleware("http")
 async def inject_logout_sync(request: Request, call_next):
     response = await call_next(request)
@@ -788,6 +863,188 @@ async def inject_logout_sync(request: Request, call_next):
             pass
 
     return response
+
+
+# -------------------------------------------------------------
+# AUTH MIDDLEWARE (added AFTER inject_logout_sync): server-side
+# session enforcement. Legacy username/role/permissions cookies are
+# still read by get_current_user() inside routes (untouched); this
+# middleware adds a server-verified session and sets request.state.user
+# from the DB (never from cookies).
+# CSRF: the session_token cookie is SameSite=Strict (set at login),
+# which blocks cross-site POST submissions. Per-form CSRF tokens are a
+# recommended next step but are NOT injected here, to avoid breaking
+# the 28 existing HTML pages/forms.
+# -------------------------------------------------------------
+PUBLIC_PATHS = {"/", "/login", "/logout", "/favicon.ico"}
+PUBLIC_PREFIXES = ("/public-report", "/shared-report", "/static", "/docs", "/openapi.json", "/redoc")
+
+
+@app.middleware("http")
+async def session_auth_middleware(request: Request, call_next):
+    path = request.url.path
+
+    # Logout: invalidate the server-side session token. The logout
+    # route's signature is fixed (no Request parameter), so we do it
+    # here in addition to its existing cookie clearing.
+    if path == "/logout":
+        _pop_session(request.cookies.get("session_token"))
+        return await call_next(request)
+
+    if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
+        return await call_next(request)
+
+    token = request.cookies.get("session_token")
+    sess = _get_session(token)
+    if sess is None:
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return RedirectResponse(url="/login", status_code=302)
+
+    # Valid session: look up the user from the DB (never trust cookies
+    # for role/permissions). This is a new query added by the security
+    # hardening; no existing query is modified.
+    row = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT username, role, permissions FROM users WHERE username = ?", (sess["username"],))
+        row = cursor.fetchone()
+        conn.close()
+    except Exception:
+        row = None
+
+    if row is None:
+        # User no longer exists; kill the stale session.
+        _pop_session(token)
+        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return RedirectResponse(url="/login", status_code=302)
+
+    request.state.user = {
+        "username": row["username"],
+        "role": row["role"] or "",
+        "permissions": {p for p in (row["permissions"] or "").split(",") if p},
+    }
+    return await call_next(request)
+
+
+# -------------------------------------------------------------
+# UI-UNIFICATION MIDDLEWARE: post-processes HTML responses to inject
+# a consistent design system (CSS variables + base styles), a toast
+# banner driven by URL params (msg/updated/error/saved), and replaces
+# the two known off-primary hex colors (#0f4c81, #1b2559) with the
+# canonical #0d47a1 in inline style/bgcolor attributes. Zero route
+# changes. Print/public/download pages are skipped so their exact
+# layout is preserved.
+# -------------------------------------------------------------
+_SKIP_HTML_REWRITE_PREFIXES = (
+    "/print-report", "/report-download", "/report-letterhead-preview",
+    "/public-report", "/shared-report",
+)
+
+_UNIFY_CSS = """<style>
+:root{--primary:#0d47a1;--primary-dark:#08306b;--accent:#1565c0;--bg:#f4f6fb;--card-bg:#ffffff;--text:#1a2332;--text-muted:#5a6b82;--border:#d8e0ec;}
+*{box-sizing:border-box;}
+body{font-family:system-ui,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;}
+h1,h2,h3{color:var(--primary);font-weight:600;}
+.card{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:20px;margin:12px 0;box-shadow:0 1px 3px rgba(13,71,161,.08);}
+table{border-collapse:collapse;width:100%;}
+th{background:var(--primary);color:#fff;padding:10px 12px;text-align:left;font-weight:600;}
+td{padding:8px 12px;border-bottom:1px solid var(--border);}
+input,select,textarea{font-family:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--text);}
+button,.btn{background:var(--primary);color:#fff;border:none;border-radius:6px;padding:9px 18px;font-size:14px;cursor:pointer;font-family:inherit;display:inline-block;text-decoration:none;}
+button:hover,.btn:hover{background:var(--primary-dark);}
+a.btn{text-decoration:none;color:#fff;}
+#__toast_container{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;gap:8px;align-items:center;}
+.__toast{padding:12px 22px;border-radius:8px;color:#fff;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,.18);cursor:pointer;max-width:90vw;}
+.__toast_success{background:#2e7d32;}
+.__toast_info{background:#1565c0;}
+.__toast_error{background:#c62828;}
+</style>"""
+
+_UNIFY_SCRIPT = """<div id="__toast_container"></div>
+<script>
+(function(){
+  var params=new URLSearchParams(window.location.search);
+  var msg=params.get('msg')||params.get('saved')||params.get('updated');
+  var err=params.get('error');
+  var container=document.getElementById('__toast_container');
+  function show(text,cls){
+    if(!text||!container)return;
+    var el=document.createElement('div');
+    el.className='__toast '+cls;
+    el.textContent=text;
+    el.title='Click to dismiss';
+    el.onclick=function(){el.remove();};
+    container.appendChild(el);
+    setTimeout(function(){if(el.parentNode)el.remove();},4000);
+  }
+  if(err){show(err,'__toast_error');}
+  else if(msg){show(msg,'__toast_success');}
+  document.addEventListener('DOMContentLoaded',function(){
+    var bad=['#0f4c81','#1b2559'];
+    function fix(s){
+      if(!s)return s;
+      for(var i=0;i<bad.length;i++){
+        s=s.replace(new RegExp(bad[i],'gi'),'#0d47a1');
+      }
+      return s;
+    }
+    var all=document.querySelectorAll('*');
+    for(var i=0;i<all.length;i++){
+      var el=all[i];
+      if(el.getAttribute){
+        var st=el.getAttribute('style');
+        if(st){el.setAttribute('style',fix(st));}
+        var bg=el.getAttribute('bgcolor');
+        if(bg){el.setAttribute('bgcolor',fix(bg));}
+      }
+    }
+  });
+})();
+</script>"""
+
+
+@app.middleware("http")
+async def ui_unify_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if response.status_code != 200:
+        return response
+    content_type = response.headers.get("content-type", "")
+    if not content_type.startswith("text/html"):
+        return response
+    if any(path.startswith(p) for p in _SKIP_HTML_REWRITE_PREFIXES):
+        return response
+    if response.headers.get("content-disposition", "").startswith("attachment"):
+        return response
+    body = getattr(response, "body", None)
+    if body is None:
+        return response
+    try:
+        body_text = body.decode("utf-8")
+        lower = body_text.lower()
+        # (a) inject design-system CSS right before </head>
+        idx = lower.rfind("</head>")
+        if idx != -1:
+            body_text = body_text[:idx] + _UNIFY_CSS + body_text[idx:]
+        # (b)+(c) inject toast container + hex-unify script after <body>
+        bidx = lower.find("<body")
+        insert_at = -1
+        if bidx != -1:
+            gt = lower.find(">", bidx)
+            if gt != -1:
+                insert_at = gt + 1
+        if insert_at != -1:
+            body_text = body_text[:insert_at] + _UNIFY_SCRIPT + body_text[insert_at:]
+        body_bytes = body_text.encode("utf-8")
+        response.body = body_bytes
+        response.headers["content-length"] = str(len(body_bytes))
+    except Exception:
+        pass
+    return response
+
 
 # 2. Logout Route
 @app.get("/logout")
@@ -900,15 +1157,15 @@ async def login_post(request: Request):
     username = form_data.get("username", "").strip()
     password = form_data.get("password", "").strip()
     
-    # 1. Default Admin Check
-    if username == "admin" and password == "1234":
-        resp = RedirectResponse(url="/dashboard", status_code=303)
-        resp.set_cookie(key="username", value="admin")
-        resp.set_cookie(key="role", value="owner")
-        resp.set_cookie(key="permissions", value="")  # Owner bypasses checks entirely
-        return resp
-    
-    # 2. Database Check
+    # Rate-limit check (per client IP + username) before touching the DB.
+    client_ip = request.client.host if request.client else "unknown"
+    if _login_rate_limited(client_ip, username):
+        return RedirectResponse(url="/login?error=Too many failed attempts. Try again in 15 minutes.", status_code=303)
+
+    # Database Check (hardcoded admin bypass removed for security;
+    # the seeded admin row is verified against the users table like
+    # every other account, and its plaintext password is auto-hashed
+    # on first successful login by the upgrade step below).
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -944,9 +1201,18 @@ async def login_post(request: Request):
 
             # හැමෝම Dashboard එකට යවනවා සහ Cookies සෙට් කරනවා
             resp = RedirectResponse(url="/dashboard", status_code=303)
-            resp.set_cookie(key="username", value=username)
-            resp.set_cookie(key="role", value=user_role)
-            resp.set_cookie(key="permissions", value=user_permissions)
+            # Legacy cookies (read by existing page JS): keep names/values
+            # exactly, add SameSite=Strict. Do NOT mark httponly here -
+            # the existing frontend JS reads these cookies.
+            resp.set_cookie(key="username", value=username, samesite="strict")
+            resp.set_cookie(key="role", value=user_role, samesite="strict")
+            resp.set_cookie(key="permissions", value=user_permissions, samesite="strict")
+            # Server-side session token: httponly (JS cannot read),
+            # SameSite=Strict (primary CSRF defense).
+            # TODO: set secure=True when deployed behind HTTPS.
+            session_token = _create_session(username)
+            resp.set_cookie(key="session_token", value=session_token, httponly=True, samesite="strict", secure=False, max_age=SESSION_TTL_SECONDS, path="/")
+            _clear_failed_login(client_ip, username)
             return resp
 
         conn.close()
@@ -955,6 +1221,7 @@ async def login_post(request: Request):
         pass
     
     # වැරදි නම් එරර් එකක් සමඟ නැවත ලොගින් පේජ් එකටම යැවීම
+    _record_failed_login(client_ip, username)
     msg = "Invalid Username or Password!"
     return RedirectResponse(url=f"/login?error={msg}", status_code=303)
 
