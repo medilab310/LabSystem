@@ -1223,6 +1223,7 @@ def _shell_sidebar_html(user: dict, active: str) -> str:
         '<nav class="ms-nav">' + "".join(parts) + '</nav>'
         '<div class="ms-side-foot"><i class="fa-solid fa-heart-pulse"></i>'
         '<p>Better Care<br>Through Accurate Results</p></div>'
+        '<div class="ms-lab-excellence"><i class="fa-solid fa-microscope"></i><b>Laboratory Excellence</b><span>FAST · ACCURATE · TRUSTED</span></div>'
         '</aside><div class="ms-scrim" id="msScrim"></div>'
     )
 
@@ -2900,6 +2901,49 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   [data-theme="dark"] .ms-hero-tag { color: #7dd3fc; text-shadow: 0 1px 4px rgba(0,0,0,0.5); }
   [data-theme="emerald"] .ms-hero-tag { color: #065f46; }
   @media (max-width: 900px) { .ms-hero-tag { display: none; } .ms-hero-l { max-width: 100%; } .ms-hero-inner { padding: 20px; } }
+  /* ---------- Stat sparklines + 4-col stats ---------- */
+  .ms-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .ms-stat.orange { background: linear-gradient(135deg, #fff4e5, #ffffff); }
+  .orange .ms-stat-ico { background: linear-gradient(135deg, #f59e0b, #d97706); }
+  .orange h4 { color: #d97706; }
+  [data-theme="dark"] .orange h4 { color: #fbbf24; }
+  .ms-stat-spark { margin: 8px -20px -6px; height: 30px; }
+  .ms-stat-spark svg { width: 100%; height: 30px; display: block; }
+  .ms-stat-link { display: inline-block; margin-top: 6px; font-size: 11px; font-weight: 700; color: var(--primary); }
+  .ms-stat-link i { font-size: 8px; margin-left: 3px; }
+  @media (max-width: 1100px) { .ms-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  /* ---------- Donut chart (right column) ---------- */
+  .ms-donut-box { text-align: center; }
+  .ms-donut-box svg { width: 150px; height: 150px; display: block; margin: 0 auto; }
+  .ms-donut-legend { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; text-align: left; }
+  .ms-donut-legend .dl { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--text); }
+  .ms-donut-legend .dl .dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .ms-donut-legend .dl b { margin-left: auto; font-weight: 700; color: var(--muted); }
+  /* ---------- Recent test results panel ---------- */
+  .ms-result-item { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+  .ms-result-item:last-child { border-bottom: none; }
+  .ms-result-ico { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: #fff; font-size: 13px; flex-shrink: 0; }
+  .ms-result-info { flex: 1; min-width: 0; }
+  .ms-result-info b { display: block; font-size: 12.5px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ms-result-info span { font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+  .ms-result-badge { font-size: 9.5px; font-weight: 800; padding: 3px 8px; border-radius: 10px; flex-shrink: 0; }
+  .ms-result-badge.done { background: #dcfce7; color: #16a34a; }
+  .ms-result-badge.pend { background: #fef3c7; color: #d97706; }
+  .ms-result-badge.ver { background: #dbeafe; color: #0d47a1; }
+  /* ---------- Trust footer badges ---------- */
+  .ms-trust { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 20px; background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); padding: 16px 22px; }
+  .ms-trust-item { display: flex; align-items: center; gap: 11px; }
+  .ms-trust-item i { width: 36px; height: 36px; border-radius: 50%; background: var(--primary-soft); color: var(--primary); display: grid; place-items: center; font-size: 15px; flex-shrink: 0; }
+  .ms-trust-item b { display: block; font-size: 12.5px; font-weight: 700; }
+  .ms-trust-item span { font-size: 10.5px; color: var(--muted); }
+  @media (max-width: 900px) { .ms-trust { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  /* ---------- Sidebar lab excellence card ---------- */
+  .ms-lab-excellence { margin-top: auto; background: linear-gradient(135deg, #0f3b8f, #0d47a1); color: #fff; border-radius: 14px; padding: 16px 14px; text-align: center; box-shadow: 0 6px 18px rgba(13,71,161,0.25); }
+  .ms-lab-excellence i { font-size: 30px; display: block; margin-bottom: 7px; color: #7dd3fc; }
+  .ms-lab-excellence b { font-size: 13px; font-weight: 800; display: block; letter-spacing: 0.3px; }
+  .ms-lab-excellence span { font-size: 10px; opacity: 0.85; letter-spacing: 1px; display: block; margin-top: 2px; }
+  [data-theme="emerald"] .ms-lab-excellence { background: linear-gradient(135deg, #064e3b, #065f46); }
+  [data-theme="emerald"] .ms-lab-excellence i { color: #6ee7b7; }
   .ms-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 20px; align-items: start; }
   .ms-col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 
@@ -3076,6 +3120,8 @@ __SHELL_HEADER__
               <div class="ms-num">__TOTAL_PATIENTS__</div>
               <div class="ms-stat-sub">__PATIENT_TREND__ <span>vs last month</span></div>
             </div>
+            <div class="ms-stat-spark"><svg viewBox="0 0 120 30" preserveAspectRatio="none"><defs><linearGradient id="spk1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#2563eb" stop-opacity="0.3"/><stop offset="100%" stop-color="#2563eb" stop-opacity="0.02"/></linearGradient></defs><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6 L120,30 L0,30 Z" fill="url(#spk1)"/><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <a href="/patients-dashboard" class="ms-stat-link">View Details <i class="fa-solid fa-chevron-right"></i></a>
           </div>
           <div class="ms-stat green">
             <div class="ms-stat-ico"><i class="fa-solid fa-print"></i></div>
@@ -3084,6 +3130,8 @@ __SHELL_HEADER__
               <div class="ms-num">__COMPLETED__</div>
               <div class="ms-stat-sub"><span>__COMPLETED_SUB__</span></div>
             </div>
+            <div class="ms-stat-spark"><svg viewBox="0 0 120 30" preserveAspectRatio="none"><defs><linearGradient id="spk2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#16a34a" stop-opacity="0.3"/><stop offset="100%" stop-color="#16a34a" stop-opacity="0.02"/></linearGradient></defs><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6 L120,30 L0,30 Z" fill="url(#spk2)"/><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6" fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <a href="/patients-dashboard" class="ms-stat-link">View Details <i class="fa-solid fa-chevron-right"></i></a>
           </div>
           <div class="ms-stat purple">
             <div class="ms-stat-ico"><i class="fa-solid fa-vial"></i></div>
@@ -3092,10 +3140,22 @@ __SHELL_HEADER__
               <div class="ms-num">__TESTS__</div>
               <div class="ms-stat-sub"><span>__TESTS_SUB__</span></div>
             </div>
+            <div class="ms-stat-spark"><svg viewBox="0 0 120 30" preserveAspectRatio="none"><defs><linearGradient id="spk3" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#8b5cf6" stop-opacity="0.3"/><stop offset="100%" stop-color="#8b5cf6" stop-opacity="0.02"/></linearGradient></defs><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6 L120,30 L0,30 Z" fill="url(#spk3)"/><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <a href="/manage-tests" class="ms-stat-link">View Tests <i class="fa-solid fa-chevron-right"></i></a>
+          </div>
+          <div class="ms-stat orange">
+            <div class="ms-stat-ico"><i class="fa-solid fa-clock"></i></div>
+            <div>
+              <h4>Pending Reports</h4>
+              <div class="ms-num">__PENDING__</div>
+              <div class="ms-stat-sub"><span class="ms-trend down"><i class="fa-solid fa-hourglass-half"></i> awaiting results</span></div>
+            </div>
+            <div class="ms-stat-spark"><svg viewBox="0 0 120 30" preserveAspectRatio="none"><defs><linearGradient id="spk4" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#f59e0b" stop-opacity="0.3"/><stop offset="100%" stop-color="#f59e0b" stop-opacity="0.02"/></linearGradient></defs><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6 L120,30 L0,30 Z" fill="url(#spk4)"/><path d="M0.0,19.5 L13.3,15.6 L26.7,17.4 L40.0,12.6 L53.3,15.0 L66.7,9.6 L80.0,11.4 L93.3,6.6 L106.7,8.4 L120.0,3.6" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round"/></svg></div>
+            <a href="/patients-dashboard" class="ms-stat-link">View Pending <i class="fa-solid fa-chevron-right"></i></a>
           </div>
         </div>
 
-        <section class="ms-panel">
+<section class="ms-panel">
           <div class="ms-panel-head">
             <div class="ms-panel-title">
               <i class="fa-solid fa-chart-column"></i>
@@ -3153,7 +3213,23 @@ __SHELL_HEADER__
           <i class="fa-solid fa-shield-halved ms-shield"></i>
         </section>
 
-        <section class="ms-panel">
+                <section class="ms-panel">
+          <div class="ms-panel-head">
+            <div class="ms-panel-title">
+              <i class="fa-solid fa-chart-pie"></i>
+              <div>
+                <h3>Test Category Distribution</h3>
+                <p>This month</p>
+              </div>
+            </div>
+          </div>
+          <div class="ms-donut-box">
+            <div id="msDonut"></div>
+            <div class="ms-donut-legend" id="msDonutLegend"></div>
+          </div>
+        </section>
+
+<section class="ms-panel">
           <div class="ms-cal-head">
             <div class="t"><i class="fa-regular fa-calendar-days"></i> <span id="msCalTitle">Month Year</span></div>
             <div class="ms-arrows">
@@ -3170,12 +3246,29 @@ __SHELL_HEADER__
           <div class="ms-qa-grid">__QUICK_ACTIONS__</div>
         </section>
 
+        <section class="ms-panel">
+          <div class="ms-panel-head">
+            <div class="ms-panel-title">
+              <i class="fa-solid fa-list-check"></i>
+              <h3>Recent Test Results</h3>
+            </div>
+            <a href="/patients-dashboard" class="ms-viewall">View All <i class="fa-solid fa-chevron-right" style="font-size: 10px;"></i></a>
+          </div>
+          __RECENT_RESULTS__
+        </section>
+
         <div class="ms-help">
           <i class="fa-solid fa-flask-vial"></i>
           <div><b>Need Help?</b><span>Contact your system administrator</span></div>
           <button class="ms-support" id="msSupportBtn" type="button"><i class="fa-solid fa-headset"></i> Support</button>
         </div>
       </div>
+    </div>
+    <div class="ms-trust">
+      <div class="ms-trust-item"><i class="fa-solid fa-shield-halved"></i><div><b>Secure &amp; Confidential</b><span>Your data is protected</span></div></div>
+      <div class="ms-trust-item"><i class="fa-solid fa-clock-rotate-left"></i><div><b>Fast Turnaround</b><span>Get results on time</span></div></div>
+      <div class="ms-trust-item"><i class="fa-solid fa-clipboard-check"></i><div><b>Accurate Results</b><span>Trust in every report</span></div></div>
+      <div class="ms-trust-item"><i class="fa-solid fa-headset"></i><div><b>24/7 Support</b><span>We're always here</span></div></div>
     </div>
   </main>
 </div>
@@ -3192,6 +3285,7 @@ __SHELL_HEADER__
 <script>
   var CHART_DATA = __CHART_JSON__;
   var STATUS_SLIDES = __STATUS_JSON__;
+  var DONUT_DATA = __DONUT_JSON__;
 
   /* ---------- Clock + date ---------- */
   var DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -3270,6 +3364,32 @@ __SHELL_HEADER__
   document.getElementById('msCalPrev').addEventListener('click', function () { calM--; if (calM < 0) { calM = 11; calY--; } renderCal(); });
   document.getElementById('msCalNext').addEventListener('click', function () { calM++; if (calM > 11) { calM = 0; calY++; } renderCal(); });
   renderCal();
+
+  /* ---------- Donut chart (Test Category Distribution) ---------- */
+  (function renderDonut() {
+    var box = document.getElementById('msDonut');
+    if (!box || !DONUT_DATA || !DONUT_DATA.length) { if (box) box.innerHTML = '<p style="color:var(--muted);font-size:12px;">No data yet</p>'; return; }
+    var total = 0; DONUT_DATA.forEach(function(d){ total += d.value; });
+    var colors = ['#2563eb','#10b981','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#64748b'];
+    var R = 60, C = 2 * Math.PI * R, off = 0;
+    var svg = '<svg viewBox="0 0 160 160"><circle cx="80" cy="80" r="'+R+'" fill="none" stroke="#e3eaf6" stroke-width="22"/>';
+    var legend = '';
+    DONUT_DATA.forEach(function(d, i) {
+      var frac = total ? d.value/total : 0;
+      var len = frac * C;
+      var col = colors[i % colors.length];
+      if (len > 0.5) {
+        svg += '<circle cx="80" cy="80" r="'+R+'" fill="none" stroke="'+col+'" stroke-width="22" stroke-dasharray="'+(len-1.5)+' '+C+'" stroke-dashoffset="'+(-off)+'" transform="rotate(-90 80 80)"/>';
+      }
+      off += len;
+      var pct = total ? Math.round(frac*100) : 0;
+      legend += '<div class="dl"><span class="dot" style="background:'+col+';"></span>'+d.label+'<b>'+pct+'%</b></div>';
+    });
+    svg += '<text x="80" y="76" text-anchor="middle" font-size="22" font-weight="800" fill="var(--text)">'+total+'</text>';
+    svg += '<text x="80" y="94" text-anchor="middle" font-size="10" fill="var(--muted)">Total Tests</text></svg>';
+    box.innerHTML = svg;
+    document.getElementById('msDonutLegend').innerHTML = legend;
+  })();
 
   /* ---------- Registrations chart (inline SVG, no library) ---------- */
   function renderChart() {
@@ -3401,6 +3521,52 @@ def dashboard(request: Request):
         except Exception:
             today_revenue = None
 
+    # --- Test category distribution (donut) ---
+    donut_data = []
+    try:
+        cursor.execute(
+            "SELECT COALESCE(NULLIF(t.department,''), 'Others'), COUNT(*) "
+            "FROM patient_assigned_tests pat JOIN tests t ON t.id = pat.test_id "
+            "GROUP BY COALESCE(NULLIF(t.department,''), 'Others') ORDER BY COUNT(*) DESC LIMIT 6"
+        )
+        donut_data = [{"label": str(r[0]), "value": int(r[1])} for r in cursor.fetchall()]
+    except Exception:
+        donut_data = []
+
+    # --- Recent test results ---
+    recent_results_html = ""
+    try:
+        cursor.execute(
+            "SELECT pat.id, p.title, p.name, t.name, pat.result, pat.patient_id "
+            "FROM patient_assigned_tests pat "
+            "JOIN patients p ON p.id = pat.patient_id "
+            "JOIN tests t ON t.id = pat.test_id "
+            "WHERE (p.is_cancelled IS NULL OR p.is_cancelled = 0) "
+            "ORDER BY pat.id DESC LIMIT 5"
+        )
+        rr = cursor.fetchall()
+        if rr:
+            palette = ["#2563eb","#16a34a","#f59e0b","#8b5cf6","#0891b2"]
+            for i, row in enumerate(rr):
+                _, title, name, test_name, result, pid = row
+                pname = html.escape(f"{title or ''} {name or ''}".strip())[:22]
+                tname = html.escape(str(test_name or ""))[:30]
+                if result and str(result).strip():
+                    badge = '<span class="ms-result-badge done">Completed</span>'
+                else:
+                    badge = '<span class="ms-result-badge pend">Pending</span>'
+                col = palette[i % len(palette)]
+                recent_results_html += (
+                    f'<div class="ms-result-item">'
+                    f'<div class="ms-result-ico" style="background:{col};"><i class="fa-solid fa-vial"></i></div>'
+                    f'<div class="ms-result-info"><b>{tname}</b><span>{pname} (P-{pid:05d})</span></div>'
+                    f'{badge}</div>'
+                )
+        else:
+            recent_results_html = '<p style="color:var(--muted);font-size:12px;text-align:center;padding:10px 0;">No results yet.</p>'
+    except Exception:
+        recent_results_html = '<p style="color:var(--muted);font-size:12px;text-align:center;padding:10px 0;">No results yet.</p>'
+
     conn.close()
 
     def span(a, b):
@@ -3464,6 +3630,9 @@ def dashboard(request: Request):
         "__MONTH_COUNT__": str(month_c),
         "__MONTH_TREND__": _dash_trend_html(month_c, prev_month_c),
         "__CHART_JSON__": _json.dumps(chart),
+        "__PENDING__": str(pending_reports),
+        "__DONUT_JSON__": _json.dumps(donut_data),
+        "__RECENT_RESULTS__": recent_results_html,
         "__STATUS_JSON__": _json.dumps(status_slides),
     }
     page = _DASHBOARD_TEMPLATE
