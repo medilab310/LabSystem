@@ -3461,11 +3461,15 @@ def dashboard(request: Request):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM patients")
+    cursor.execute("SELECT COUNT(*) FROM patients WHERE is_cancelled IS NULL OR is_cancelled = 0")
     total_patients = cursor.fetchone()[0]
 
     try:
-        cursor.execute("SELECT COUNT(DISTINCT patient_id) FROM patient_assigned_tests WHERE result IS NOT NULL AND result != ''")
+        cursor.execute(
+            "SELECT COUNT(DISTINCT pat.patient_id) FROM patient_assigned_tests pat "
+            "JOIN patients p ON p.id = pat.patient_id "
+            "WHERE pat.saved_at IS NOT NULL AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)"
+        )
         completed_reports = cursor.fetchone()[0]
     except Exception:
         completed_reports = 0
@@ -3503,9 +3507,9 @@ def dashboard(request: Request):
 
     try:
         cursor.execute(
-            "SELECT COUNT(DISTINCT patient_id) FROM patient_assigned_tests "
-            "WHERE (result IS NULL OR result = '') "
-            "AND patient_id IN (SELECT id FROM patients WHERE is_cancelled IS NULL OR is_cancelled = 0)"
+            "SELECT COUNT(DISTINCT pat.patient_id) FROM patient_assigned_tests pat "
+            "JOIN patients p ON p.id = pat.patient_id "
+            "WHERE pat.saved_at IS NULL AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)"
         )
         pending_reports = cursor.fetchone()[0]
     except Exception:
@@ -3541,7 +3545,7 @@ def dashboard(request: Request):
     recent_results_html = ""
     try:
         cursor.execute(
-            "SELECT pat.id, p.title, p.name, t.name, pat.result, pat.patient_id "
+            "SELECT pat.id, p.title, p.name, t.name, pat.saved_at, pat.patient_id "
             "FROM patient_assigned_tests pat "
             "JOIN patients p ON p.id = pat.patient_id "
             "JOIN tests t ON t.id = pat.test_id "
@@ -3552,10 +3556,10 @@ def dashboard(request: Request):
         if rr:
             palette = ["#2563eb","#16a34a","#f59e0b","#8b5cf6","#0891b2"]
             for i, row in enumerate(rr):
-                _, title, name, test_name, result, pid = row
+                _, title, name, test_name, saved_at, pid = row
                 pname = html.escape(f"{title or ''} {name or ''}".strip())[:22]
                 tname = html.escape(str(test_name or ""))[:30]
-                if result and str(result).strip():
+                if saved_at:
                     badge = '<span class="ms-result-badge done">Completed</span>'
                 else:
                     badge = '<span class="ms-result-badge pend">Pending</span>'
