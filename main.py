@@ -1073,6 +1073,7 @@ _SHELL_NAV = [
     ]),
     ("Setup", [
         ("tests", "Manage Tests", "fa-gear", "/manage-tests", "manage_tests", None),
+        ("packages", "Test Packages", "fa-box-open", "/manage-packages", "manage_tests", None),
         ("doctors", "Manage Doctors", "fa-user-doctor", "/manage-doctors", "manage_doctors", None),
         ("centers", "Centers", "fa-hospital", "/manage-centers", "manage_centers", None),
         ("print", "Print Settings", "fa-sliders", "/print-settings", "print_settings", None),
@@ -1090,6 +1091,7 @@ _SHELL_MATCH = [
     ("entry", ("/select-patient", "/add-test-entry")),
     ("register", ("/add-patient",)),
     ("share", ("/share-reports",)),
+    ("packages", ("/manage-packages", "/edit-package")),
     ("tests", ("/manage-tests", "/edit-test-category", "/manage-ranges", "/edit-parameter", "/load-standard-templates")),
     ("doctors", ("/manage-doctors",)),
     ("centers", ("/manage-centers",)),
@@ -2230,6 +2232,25 @@ def parse_optional_float(x: str):
 # -------------------------------------------------------------
 # DATABASE INITIALIZATION (ටේබල්ස් මැකීයාමෙන් තොරව සුරක්ෂිතව සෑදීම)
 # -------------------------------------------------------------
+def _ensure_package_tables(cursor):
+    """Test Packages = a named group of existing tests. Additive only -
+    nothing in the existing tables is touched."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS test_packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_name TEXT UNIQUE NOT NULL,
+            created_at TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS test_package_items (
+            package_id INTEGER NOT NULL,
+            test_id INTEGER NOT NULL,
+            PRIMARY KEY (package_id, test_id)
+        )
+    """)
+
+
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -2671,6 +2692,8 @@ def init_db():
         cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN result TEXT")
     if "comment" not in assigned_columns:
         cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN comment TEXT")
+
+    _ensure_package_tables(cursor)
 
     conn.commit()
     conn.close()
@@ -4485,6 +4508,13 @@ def add_patient_page(request: Request, saved_id: int = None):
     seq_row = cursor.fetchone()
     next_id = (seq_row[0] + 1) if seq_row and seq_row[0] else 1
 
+    # 5. Test Packages (never allowed to break registration)
+    try:
+        packages = _load_packages(cursor)
+    except Exception as _pk_err:
+        print("PACKAGE LOAD ERROR:", _pk_err)
+        packages = []
+
     conn.close()
 
     success_banner = ""
@@ -4516,6 +4546,28 @@ def add_patient_page(request: Request, saved_id: int = None):
             <input type="checkbox" name="test_ids" value="{t[0]}" style="width: 16px; height: 16px; accent-color: #0f4c81;"> <span>{t[1]}</span>
         </label>
     """ for t in tests])
+
+    # Packages are shown at the top of the same test box. Ticking one
+    # lists the package and all of its tests in the "Selected Tests" panel.
+    import json as _json
+    package_section = ""
+    pkg_rows = ""
+    for p in packages:
+        if not p["tests"]:
+            continue
+        payload = html.escape(_json.dumps([{"id": t[0], "name": t[1]} for t in p["tests"]]), quote=True)
+        search_blob = html.escape((p["name"] + " " + " ".join(str(t[1]) for t in p["tests"])).lower(), quote=True)
+        pkg_rows += f"""
+        <label class="test-item pkg-item" data-name="{search_blob}" data-label="{html.escape(p['name'], quote=True)}" data-pkg-tests="{payload}" style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-weight: normal; cursor: pointer; font-size: 14px;">
+            <input type="checkbox" name="package_ids" value="{p['id']}" style="width: 16px; height: 16px; accent-color: #b45309;">
+            <span>&#128230; <b>{html.escape(p['name'])}</b> <small style="color:#92400e;">({len(p['tests'])} tests)</small></span>
+        </label>"""
+    if pkg_rows:
+        package_section = (
+            '<div class="grp-head">&#128230; Packages</div>' + pkg_rows +
+            '<div class="grp-head">&#129514; Individual Tests</div>'
+        )
+    test_checkboxes = package_section + test_checkboxes
 
     return f"""
     <!DOCTYPE html>
@@ -4557,6 +4609,15 @@ def add_patient_page(request: Request, saved_id: int = None):
             .sel-item {{ display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; border-top: 1px dashed #bfdbfe; }}
             .sel-item .nm {{ flex: 1; }}
             .sel-item button {{ border: none; background: #fee2e2; color: #b91c1c; border-radius: 4px; cursor: pointer; font-weight: bold; padding: 0 7px; }}
+            .grp-head {{ font-size: 12px; font-weight: bold; color: #0f4c81; text-transform: uppercase; letter-spacing: .4px; margin: 6px 0; padding-bottom: 3px; border-bottom: 1px solid #e2e8f0; }}
+            .pkg-item {{ background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 5px 8px; }}
+            .sel-pkg {{ margin: 4px 0 2px; border: 1px solid #fcd34d; background: #fffbeb; border-radius: 6px; padding: 5px 8px; }}
+            .sel-pkg .ph {{ display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: bold; color: #92400e; }}
+            .sel-pkg .ph .nm {{ flex: 1; }}
+            .sel-pkg .ph button {{ border: none; background: #fee2e2; color: #b91c1c; border-radius: 4px; cursor: pointer; font-weight: bold; padding: 0 7px; }}
+            .sel-pkg .pt {{ font-size: 12.5px; color: #475569; padding: 2px 0 2px 22px; border-top: 1px dashed #fde68a; }}
+            .sel-pkg .pt em {{ color: #94a3b8; font-size: 11px; }}
+            .sel-sub {{ font-size: 11px; font-weight: bold; color: #64748b; text-transform: uppercase; margin: 6px 0 2px; }}
         </style>
     </head>
     <body>
@@ -4731,12 +4792,58 @@ def add_patient_page(request: Request, saved_id: int = None):
             }}
 
             // Live "selected tests" summary (stays visible even when the
-            // search box hides ticked tests).
+            // search box hides ticked tests). Ticked packages are listed
+            // together with every test inside them.
             function updateSelected() {{
-                const boxes = document.querySelectorAll('#testContainer input[name="test_ids"]:checked');
                 const list = document.getElementById("selList");
                 list.innerHTML = "";
-                boxes.forEach(cb => {{
+                const unique = new Set();
+                const pkgBoxes = document.querySelectorAll('#testContainer input[name="package_ids"]:checked');
+                const testBoxes = document.querySelectorAll('#testContainer input[name="test_ids"]:checked');
+                testBoxes.forEach(cb => unique.add(String(cb.value)));
+
+                pkgBoxes.forEach(cb => {{
+                    const lab = cb.closest(".test-item");
+                    let tests = [];
+                    try {{ tests = JSON.parse(lab.getAttribute("data-pkg-tests") || "[]"); }} catch (e) {{ tests = []; }}
+                    tests.forEach(t => unique.add(String(t.id)));
+
+                    const wrap = document.createElement("div");
+                    wrap.className = "sel-pkg";
+                    const head = document.createElement("div");
+                    head.className = "ph";
+                    const nm = document.createElement("span");
+                    nm.className = "nm";
+                    nm.textContent = "📦 " + lab.getAttribute("data-label") + " (" + tests.length + " tests)";
+                    const x = document.createElement("button");
+                    x.type = "button";
+                    x.textContent = "\u00d7";
+                    x.title = "Remove package";
+                    x.onclick = () => {{ cb.checked = false; updateSelected(); }};
+                    head.appendChild(nm); head.appendChild(x);
+                    wrap.appendChild(head);
+                    tests.forEach(t => {{
+                        const pt = document.createElement("div");
+                        pt.className = "pt";
+                        pt.textContent = "\u2022 " + t.name;
+                        const dup = document.querySelector('#testContainer input[name="test_ids"][value="' + t.id + '"]:checked');
+                        if (dup) {{
+                            const note = document.createElement("em");
+                            note.textContent = "  (also ticked individually - counted once)";
+                            pt.appendChild(note);
+                        }}
+                        wrap.appendChild(pt);
+                    }});
+                    list.appendChild(wrap);
+                }});
+
+                if (pkgBoxes.length && testBoxes.length) {{
+                    const sub = document.createElement("div");
+                    sub.className = "sel-sub";
+                    sub.textContent = "Individual tests";
+                    list.appendChild(sub);
+                }}
+                testBoxes.forEach(cb => {{
                     const lab = cb.closest(".test-item");
                     const row = document.createElement("div");
                     row.className = "sel-item";
@@ -4751,13 +4858,13 @@ def add_patient_page(request: Request, saved_id: int = None):
                     row.appendChild(nm); row.appendChild(x);
                     list.appendChild(row);
                 }});
-                if (!boxes.length) list.innerHTML = '<em style="font-size:12px; color:#64748b;">No tests selected yet</em>';
-                document.getElementById("selCount").textContent = boxes.length;
+                if (!pkgBoxes.length && !testBoxes.length) list.innerHTML = '<em style="font-size:12px; color:#64748b;">No tests selected yet</em>';
+                document.getElementById("selCount").textContent = unique.size;
             }}
             document.getElementById("testContainer").addEventListener("change", updateSelected);
 
             function confirmNoTests() {{
-                const n = document.querySelectorAll('#testContainer input[name="test_ids"]:checked').length;
+                const n = document.querySelectorAll('#testContainer input[name="test_ids"]:checked, #testContainer input[name="package_ids"]:checked').length;
                 if (n === 0) return confirm("No tests are selected. Save this patient without any tests?");
                 return true;
             }}
@@ -4824,6 +4931,29 @@ async def add_patient_post(request: Request):
         
         patient_id = cursor.lastrowid
 
+        # Ticked packages are expanded into their individual tests, so every
+        # downstream feature (results, reports, billing, barcodes) keeps
+        # working exactly as before. A test that is in two packages, or
+        # ticked individually as well, is registered only once.
+        package_ids = [int(x) for x in form_data.getlist("package_ids") if str(x).isdigit()]
+        merged_tests, seen_tests = [], set()
+        for tid in list(selected_tests):
+            if str(tid) not in seen_tests:
+                seen_tests.add(str(tid))
+                merged_tests.append(tid)
+        if package_ids:
+            ph = ",".join("?" * len(package_ids))
+            cursor.execute(
+                f"SELECT i.test_id FROM test_package_items i JOIN tests t ON t.id = i.test_id "
+                f"WHERE i.package_id IN ({ph}) ORDER BY i.package_id, i.test_id",
+                tuple(package_ids)
+            )
+            for (tid,) in cursor.fetchall():
+                if str(tid) not in seen_tests:
+                    seen_tests.add(str(tid))
+                    merged_tests.append(tid)
+        selected_tests = merged_tests
+
         if selected_tests:
             for test_id in selected_tests:
                 cursor.execute("""
@@ -4840,6 +4970,298 @@ async def add_patient_post(request: Request):
     except Exception as e:
         print("ERROR IN ADD PATIENT:", str(e))
         return f"<h3>Database Error: {str(e)}</h3><a href='/add-patient'>Go Back</a>"
+
+
+# -------------------------------------------------------------
+# TEST PACKAGES (create / edit / delete a named group of tests)
+# -------------------------------------------------------------
+def _load_packages(cursor):
+    """[{id, name, tests: [(test_id, test_name, price), ...]}, ...]"""
+    cursor.execute("SELECT id, package_name FROM test_packages ORDER BY package_name COLLATE NOCASE")
+    pkgs = [{"id": r[0], "name": r[1], "tests": []} for r in cursor.fetchall()]
+    by_id = {p["id"]: p for p in pkgs}
+    if pkgs:
+        cursor.execute("""
+            SELECT i.package_id, t.id, t.test_name, COALESCE(t.price, 0)
+            FROM test_package_items i JOIN tests t ON t.id = i.test_id
+            ORDER BY t.test_name
+        """)
+        for pid, tid, tname, price in cursor.fetchall():
+            if pid in by_id:
+                by_id[pid]["tests"].append((tid, tname, price))
+    return pkgs
+
+
+_PACKAGE_CSS = """
+    body { font-family: 'Inter','Segoe UI',system-ui,sans-serif; background: #f4f7fb; padding: 24px; }
+    .pk-wrap { max-width: 1000px; margin: auto; }
+    .pk-card-box { background:#fff; border:1px solid #d8e0ec; border-radius:14px; padding:20px 24px; margin-bottom:20px; box-shadow:0 6px 22px rgba(13,71,161,.07); }
+    .pk-card-box h2 { color:#0d47a1; margin:0 0 12px; font-size:19px; }
+    .pk-back { display:inline-block; margin-bottom:12px; color:#0d47a1; text-decoration:none; font-weight:600; font-size:13px; }
+    .pk-msg { background:#fff7e6; border:1px solid #fcd9a0; color:#92400e; padding:9px 14px; border-radius:8px; margin-bottom:14px; font-weight:600; font-size:13.5px; }
+    .pk-in { width:100%; padding:10px; border:1px solid #cbd5e1; border-radius:8px; box-sizing:border-box; font-size:14px; margin-bottom:10px; }
+    .pk-box { border:1px solid #cbd5e1; background:#fafafa; border-radius:8px; padding:8px 10px; max-height:300px; overflow-y:auto; }
+    .pk-test { display:flex; align-items:center; gap:10px; padding:5px 2px; border-bottom:1px dashed #e5e7eb; font-size:13.5px; cursor:pointer; }
+    .pk-test input { width:16px; height:16px; accent-color:#0d47a1; }
+    .pk-tn { flex:1; }
+    .pk-tp { color:#64748b; font-size:12px; }
+    .pk-count { margin:8px 0 12px; font-size:13px; color:#0d47a1; font-weight:600; }
+    .pk-save { background:#27ae60; color:#fff; border:none; padding:11px 22px; border-radius:8px; font-size:14.5px; font-weight:700; cursor:pointer; }
+    .pk-cancel { display:inline-block; margin-left:10px; color:#475569; text-decoration:none; font-size:13.5px; font-weight:600; }
+    .pk-card { border:1px solid #d8e0ec; border-radius:12px; padding:12px 16px; margin-bottom:10px; display:flex; justify-content:space-between; gap:14px; flex-wrap:wrap; align-items:center; background:#fff; }
+    .pk-card:hover { border-color:#9db8e8; box-shadow:0 4px 14px rgba(13,71,161,.10); }
+    .pk-main { flex:1 1 380px; min-width:0; }
+    .pk-main h3 { margin:0 0 6px; font-size:15px; color:#0d47a1; }
+    .pk-badge { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; border-radius:12px; padding:1px 9px; font-size:11.5px; margin-left:6px; font-weight:700; }
+    .pk-chips { display:flex; flex-wrap:wrap; gap:5px; }
+    .pk-chip { background:#e8f0fe; color:#0d47a1; border:1px solid #c7d9f8; border-radius:6px; padding:2px 8px; font-size:12px; }
+    .pk-meta { margin-top:6px; font-size:12px; color:#5a6b82; }
+    .pk-actions { display:flex; gap:6px; align-items:center; }
+    .pk-btn { display:inline-block; padding:7px 13px; border-radius:8px; font-size:12px; font-weight:600; text-decoration:none; cursor:pointer; border:1px solid transparent; font-family:inherit; }
+    .pk-edit { background:#fff7e6; color:#b45309; border-color:#fcd9a0; }
+    .pk-del { background:#fff; color:#b91c1c; border-color:#f3b4b4; }
+    .pk-del:hover { background:#fee2e2; }
+"""
+
+_PACKAGE_JS = """
+    function pkFilter() {
+        const q = document.getElementById('pkSearch').value.toLowerCase();
+        document.querySelectorAll('#pkBox .pk-test').forEach(l => {
+            l.style.display = l.getAttribute('data-name').includes(q) ? 'flex' : 'none';
+        });
+    }
+    function pkCount() {
+        document.getElementById('pkCount').textContent =
+            document.querySelectorAll('#pkBox input[name="test_ids"]:checked').length;
+    }
+    function pkCheck() {
+        if (!document.getElementById('pkName').value.trim()) { alert('Please enter a package name.'); return false; }
+        if (!document.querySelectorAll('#pkBox input[name="test_ids"]:checked').length) { alert('Please select at least one test for this package.'); return false; }
+        return true;
+    }
+    window.addEventListener('load', function () {
+        document.getElementById('pkBox').addEventListener('change', pkCount);
+        pkCount();
+    });
+"""
+
+
+def _package_form_html(action, name_value, tests, selected_ids, button_label, cancel_html=""):
+    sel = {str(x) for x in selected_ids}
+    rows = "".join(
+        f"""<label class="pk-test" data-name="{html.escape(str(t[1] or '').lower(), quote=True)}">
+            <input type="checkbox" name="test_ids" value="{t[0]}" {'checked' if str(t[0]) in sel else ''}>
+            <span class="pk-tn">{html.escape(str(t[1]))}</span>
+            <span class="pk-tp">{html.escape(str(t[3]))} &middot; Rs. {float(t[2] or 0):,.2f}</span>
+        </label>"""
+        for t in tests
+    )
+    return f"""
+    <form action="{action}" method="post" onsubmit="return pkCheck()">
+        <input type="text" name="package_name" id="pkName" class="pk-in" maxlength="120" required
+               placeholder="Package name (e.g. Full Health Checkup)" value="{html.escape(name_value or '', quote=True)}">
+        <input type="text" id="pkSearch" class="pk-in" placeholder="Search tests to add..." oninput="pkFilter()">
+        <div class="pk-box" id="pkBox">{rows or '<em>No tests found. Create tests first in Manage Tests.</em>'}</div>
+        <div class="pk-count">Selected tests: <span id="pkCount">0</span></div>
+        <button type="submit" class="pk-save">{button_label}</button>{cancel_html}
+    </form>
+    """
+
+
+def _package_redirect(msg):
+    return RedirectResponse(url="/manage-packages?msg=" + quote(msg), status_code=303)
+
+
+@app.get("/manage-packages", response_class=HTMLResponse)
+def manage_packages(request: Request, msg: str = ""):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_tests"):
+        return render_locked_page("Test Packages")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    _ensure_package_tables(cursor)
+    conn.commit()
+    cursor.execute("SELECT id, test_name, COALESCE(price, 0), COALESCE(department, '') FROM tests ORDER BY test_name")
+    tests = cursor.fetchall()
+    packages = _load_packages(cursor)
+    conn.close()
+
+    cards = ""
+    for p in packages:
+        chips = "".join(f'<span class="pk-chip">{html.escape(str(t[1]))}</span>' for t in p["tests"])
+        total = sum(float(t[2] or 0) for t in p["tests"])
+        cards += f"""
+        <div class="pk-card">
+            <div class="pk-main">
+                <h3>&#128230; {html.escape(p['name'])}<span class="pk-badge">{len(p['tests'])} tests</span></h3>
+                <div class="pk-chips">{chips or '<em style="color:#94a3b8;font-size:12px;">No tests in this package</em>'}</div>
+                <div class="pk-meta">Sum of test prices: Rs. {total:,.2f}</div>
+            </div>
+            <div class="pk-actions">
+                <a href="/edit-package/{p['id']}" class="pk-btn pk-edit">Edit</a>
+                <form action="/delete-package/{p['id']}" method="post" style="margin:0;"
+                      onsubmit="return confirm('Delete this package? Patients already registered are not affected.');">
+                    <button type="submit" class="pk-btn pk-del">Delete</button>
+                </form>
+            </div>
+        </div>"""
+    if not cards:
+        cards = '<p style="color:#64748b;font-size:13.5px;margin:0;">No packages yet. Create the first one above.</p>'
+
+    banner = f'<div class="pk-msg">{html.escape(msg)}</div>' if msg else ""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Test Packages</title>
+        <style>{_PACKAGE_CSS}</style>
+        <script>{_PACKAGE_JS}</script>
+    </head>
+    <body>
+        <div class="pk-wrap">
+            <a href="/manage-tests" class="pk-back">&larr; Manage Tests</a>
+            {banner}
+            <div class="pk-card-box">
+                <h2>Create New Test Package</h2>
+                {_package_form_html("/add-package", "", tests, [], "Save Package")}
+            </div>
+            <div class="pk-card-box">
+                <h2>Existing Packages ({len(packages)})</h2>
+                {cards}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/add-package")
+async def add_package(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_tests"):
+        return render_locked_page("Test Packages")
+    form = await request.form()
+    name = " ".join(str(form.get("package_name") or "").split())
+    test_ids = [int(x) for x in form.getlist("test_ids") if str(x).isdigit()]
+    if not name:
+        return _package_redirect("Package name is required.")
+    if not test_ids:
+        return _package_redirect("Select at least one test for the package.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    _ensure_package_tables(cursor)
+    cursor.execute("SELECT 1 FROM test_packages WHERE LOWER(package_name) = LOWER(?)", (name,))
+    if cursor.fetchone():
+        conn.close()
+        return _package_redirect(f"A package named '{name}' already exists.")
+    cursor.execute(
+        "INSERT INTO test_packages (package_name, created_at) VALUES (?, ?)",
+        (name, now_colombo().isoformat(timespec="seconds"))
+    )
+    package_id = cursor.lastrowid
+    for tid in dict.fromkeys(test_ids):
+        cursor.execute("INSERT OR IGNORE INTO test_package_items (package_id, test_id) VALUES (?, ?)", (package_id, tid))
+    conn.commit()
+    conn.close()
+    return _package_redirect(f"Package '{name}' saved with {len(set(test_ids))} tests.")
+
+
+@app.get("/edit-package/{package_id}", response_class=HTMLResponse)
+def edit_package_page(package_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_tests"):
+        return render_locked_page("Test Packages")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    _ensure_package_tables(cursor)
+    cursor.execute("SELECT package_name FROM test_packages WHERE id = ?", (package_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return _package_redirect("Package not found.")
+    cursor.execute("SELECT test_id FROM test_package_items WHERE package_id = ?", (package_id,))
+    selected = [r[0] for r in cursor.fetchall()]
+    cursor.execute("SELECT id, test_name, COALESCE(price, 0), COALESCE(department, '') FROM tests ORDER BY test_name")
+    tests = cursor.fetchall()
+    conn.close()
+
+    form_html = _package_form_html(
+        f"/edit-package/{package_id}", row[0], tests, selected, "Update Package",
+        '<a href="/manage-packages" class="pk-cancel">Cancel</a>'
+    )
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Edit Test Package</title>
+        <style>{_PACKAGE_CSS}</style>
+        <script>{_PACKAGE_JS}</script>
+    </head>
+    <body>
+        <div class="pk-wrap">
+            <a href="/manage-packages" class="pk-back">&larr; Test Packages</a>
+            <div class="pk-card-box">
+                <h2>Edit Package</h2>
+                {form_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/edit-package/{package_id}")
+async def edit_package_post(package_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_tests"):
+        return render_locked_page("Test Packages")
+    form = await request.form()
+    name = " ".join(str(form.get("package_name") or "").split())
+    test_ids = [int(x) for x in form.getlist("test_ids") if str(x).isdigit()]
+    if not name:
+        return _package_redirect("Package name is required.")
+    if not test_ids:
+        return _package_redirect("A package needs at least one test. Nothing was changed.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    _ensure_package_tables(cursor)
+    cursor.execute("SELECT 1 FROM test_packages WHERE id = ?", (package_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return _package_redirect("Package not found.")
+    cursor.execute(
+        "SELECT 1 FROM test_packages WHERE LOWER(package_name) = LOWER(?) AND id != ?", (name, package_id)
+    )
+    if cursor.fetchone():
+        conn.close()
+        return _package_redirect(f"Another package is already named '{name}'. Nothing was changed.")
+    cursor.execute("UPDATE test_packages SET package_name = ? WHERE id = ?", (name, package_id))
+    cursor.execute("DELETE FROM test_package_items WHERE package_id = ?", (package_id,))
+    for tid in dict.fromkeys(test_ids):
+        cursor.execute("INSERT OR IGNORE INTO test_package_items (package_id, test_id) VALUES (?, ?)", (package_id, tid))
+    conn.commit()
+    conn.close()
+    return _package_redirect(f"Package '{name}' updated.")
+
+
+@app.post("/delete-package/{package_id}")
+def delete_package(package_id: int, request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "manage_tests"):
+        return render_locked_page("Test Packages")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    _ensure_package_tables(cursor)
+    cursor.execute("DELETE FROM test_package_items WHERE package_id = ?", (package_id,))
+    cursor.execute("DELETE FROM test_packages WHERE id = ?", (package_id,))
+    conn.commit()
+    conn.close()
+    return _package_redirect("Package deleted.")
+
 
 from fastapi import Form
 
