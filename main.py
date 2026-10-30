@@ -2884,6 +2884,39 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .ms-datechip { background: var(--card); border: 1px solid var(--border); box-shadow: var(--shadow); border-radius: 12px; padding: 11px 18px; font-weight: 700; font-size: 13.5px; display: inline-flex; align-items: center; gap: 10px; white-space: nowrap; }
   .ms-datechip i { color: var(--primary); }
 
+  /* ---------- Lab Hero Banner (lab vibe welcome art) ---------- */
+  .ms-hero { position: relative; overflow: hidden; border-radius: 18px; padding: 20px 26px; margin-bottom: 16px; background: linear-gradient(120deg, #e8f0fe 0%, #f0f6ff 45%, #e6f4f1 100%); border: 1px solid var(--border); box-shadow: var(--shadow); display: flex; align-items: center; gap: 20px; }
+  [data-theme="dark"] .ms-hero { background: linear-gradient(120deg, #132050 0%, #16245a 45%, #10302e 100%); }
+  [data-theme="emerald"] .ms-hero { background: linear-gradient(120deg, #d7f0e3 0%, #e6f8ee 45%, #dcf3e8 100%); }
+  .ms-hero-l { position: relative; z-index: 2; flex: 1; min-width: 0; }
+  .ms-hero h2 { margin: 0; font-size: 24px; font-weight: 800; color: var(--text); }
+  .ms-hero p { margin: 4px 0 12px; color: var(--muted); font-size: 14px; }
+  .ms-hero-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .ms-hero-date { display: inline-flex; align-items: center; gap: 8px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 9px 16px; font-weight: 700; font-size: 13px; box-shadow: var(--shadow); white-space: nowrap; color: var(--text); }
+  .ms-hero-date i { color: var(--primary); }
+  .ms-hero-tag { display: inline-flex; align-items: center; gap: 8px; background: rgba(13,71,161,0.1); color: var(--primary); font-size: 12px; font-weight: 700; padding: 9px 16px; border-radius: 20px; white-space: nowrap; }
+  [data-theme="dark"] .ms-hero-tag { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  [data-theme="emerald"] .ms-hero-tag { background: rgba(6,95,70,0.12); color: #065f46; }
+  .ms-hero-art { flex: 0 0 300px; height: 110px; position: relative; z-index: 1; }
+  .ms-hero-art svg { width: 100%; height: 100%; display: block; }
+  @media (max-width: 960px) { .ms-hero-art { display: none; } }
+
+  /* ---------- Lab Items Strip (small lab-item image line) ---------- */
+  .ms-labstrip { display: grid; grid-template-columns: repeat(6, minmax(0,1fr)); gap: 12px; margin-bottom: 18px; }
+  .ms-labitem { background: var(--card); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); padding: 12px 8px 10px; display: flex; flex-direction: column; align-items: center; gap: 7px; transition: transform .15s, box-shadow .15s; }
+  .ms-labitem:hover { transform: translateY(-3px); box-shadow: 0 10px 26px rgba(13,71,161,0.12); }
+  .ms-labitem-ico { width: 46px; height: 46px; border-radius: 13px; display: grid; place-items: center; }
+  .ms-labitem-ico svg { width: 28px; height: 28px; display: block; }
+  .ms-labitem span { font-size: 11px; font-weight: 600; color: var(--muted); text-align: center; line-height: 1.25; }
+  .ms-labitem:nth-child(1) .ms-labitem-ico { background: #fee2e2; }
+  .ms-labitem:nth-child(2) .ms-labitem-ico { background: #dbeafe; }
+  .ms-labitem:nth-child(3) .ms-labitem-ico { background: #cffafe; }
+  .ms-labitem:nth-child(4) .ms-labitem-ico { background: #fef3c7; }
+  .ms-labitem:nth-child(5) .ms-labitem-ico { background: #ede9fe; }
+  .ms-labitem:nth-child(6) .ms-labitem-ico { background: #dcfce7; }
+  @media (max-width: 1100px) { .ms-labstrip { grid-template-columns: repeat(3, minmax(0,1fr)); } }
+  @media (max-width: 600px) { .ms-labstrip { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+
   .ms-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 20px; align-items: start; }
   .ms-col { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
 
@@ -3036,15 +3069,87 @@ __SHELL_HEADER__
   __SHELL_SIDEBAR__
 
   <main class="ms-main">
-    <div class="ms-welcome">
-      <div class="ms-welcome-l">
-        <div class="ms-wave">&#128075;</div>
-        <div>
-          <h2>Welcome Back, __USERNAME__!</h2>
-          <p>Here's what's happening at your laboratory today.</p>
+    <div class="ms-hero">
+      <div class="ms-hero-l">
+        <h2>Welcome Back, __USERNAME__!</h2>
+        <p>Here's what's happening at your laboratory today.</p>
+        <div class="ms-hero-meta">
+          <div class="ms-hero-date"><i class="fa-regular fa-calendar-days"></i> <span id="msDateChip">&nbsp;</span></div>
+          <div class="ms-hero-tag"><i class="fa-solid fa-flask"></i> Accurate Results &middot; Better Healthcare</div>
         </div>
       </div>
-      <div class="ms-datechip"><i class="fa-regular fa-calendar-days"></i> <span id="msDateChip">&nbsp;</span></div>
+      <div class="ms-hero-art">
+        <svg viewBox="0 0 300 110" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <circle cx="28" cy="18" r="4" fill="#93c5fd" opacity="0.45"/>
+          <circle cx="52" cy="34" r="2.5" fill="#6ee7b7" opacity="0.45"/>
+          <circle cx="272" cy="22" r="3" fill="#c4b5fd" opacity="0.45"/>
+          <circle cx="252" cy="42" r="2" fill="#93c5fd" opacity="0.4"/>
+          <rect x="18" y="78" width="74" height="8" rx="2" fill="#cbd5e1"/>
+          <rect x="24" y="72" width="62" height="6" rx="2" fill="#e2e8f0"/>
+          <rect x="28" y="30" width="10" height="44" rx="4" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+          <rect x="28" y="52" width="10" height="22" rx="4" fill="#3b82f6" opacity="0.7"/>
+          <rect x="46" y="24" width="10" height="50" rx="4" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+          <rect x="46" y="50" width="10" height="24" rx="4" fill="#10b981" opacity="0.7"/>
+          <rect x="64" y="34" width="10" height="40" rx="4" fill="#ffffff" stroke="#94a3b8" stroke-width="1.2"/>
+          <rect x="64" y="56" width="10" height="18" rx="4" fill="#8b5cf6" opacity="0.7"/>
+          <path d="M123 28h18v14l16 34v8a6 6 0 0 1-6 6h-38a6 6 0 0 1-6-6v-8l16-34V28z" fill="#ffffff" stroke="#94a3b8" stroke-width="1.4"/>
+          <path d="M113 62h38l8 18v4a4 4 0 0 1-4 4h-44a4 4 0 0 1-4-4v-4l8-18z" fill="#38bdf8" opacity="0.55"/>
+          <circle cx="128" cy="70" r="2" fill="#ffffff" opacity="0.85"/>
+          <circle cx="138" cy="76" r="1.5" fill="#ffffff" opacity="0.85"/>
+          <circle cx="132" cy="80" r="1.2" fill="#ffffff" opacity="0.85"/>
+          <g stroke="#1d4ed8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="198" y="22" width="16" height="9" rx="2" fill="#bfdbfe"/>
+            <path d="M206 31v7"/>
+            <path d="M198 38h16l5 8v6a7 7 0 0 1-7 7h-12a7 7 0 0 1-7-7v-6l5-8z" fill="#dbeafe"/>
+            <circle cx="206" cy="58" r="2.5" fill="#1d4ed8" stroke="none"/>
+            <path d="M193 78h28"/>
+            <path d="M198 72v6M216 72v6"/>
+            <path d="M219 42l10 10"/>
+            <circle cx="232" cy="55" r="4" fill="#bfdbfe"/>
+          </g>
+          <path d="M258 18c6 8-6 14 0 22s-6 14 0 22" stroke="#a78bfa" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.55"/>
+          <path d="M266 18c-6 8 6 14 0 22s6 14 0 22" stroke="#60a5fa" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.55"/>
+        </svg>
+      </div>
+    </div>
+
+    <div class="ms-labstrip">
+      <div class="ms-labitem" title="Blood Sample Tube">
+        <div class="ms-labitem-ico">
+          <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><rect x="11" y="2" width="10" height="5" rx="1.5" fill="#e11d48"/><path d="M12 7h8v15a4 4 0 0 1-8 0V7z" fill="#ffffff" stroke="#64748b" stroke-width="1.5"/><path d="M13 15h6v7a3 3 0 0 1-6 0v-7z" fill="#f87171"/></svg>
+        </div>
+        <span>Blood Sample</span>
+      </div>
+      <div class="ms-labitem" title="Microscope">
+        <div class="ms-labitem-ico">
+          <svg viewBox="0 0 32 32" fill="none" stroke="#2563eb" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="3" width="7" height="4" rx="1" fill="#bfdbfe"/><path d="M12.5 7v3"/><path d="M9 10h7l2 3v3a4 4 0 0 1-4 4h-3a4 4 0 0 1-4-4v-3l2-3z" fill="#dbeafe"/><circle cx="12.5" cy="20" r="1.4" fill="#2563eb" stroke="none"/><path d="M6 26h14"/><path d="M9 23v3M16 23v3"/><path d="M18 13l5 5"/><circle cx="24.5" cy="19.5" r="2.2" fill="#bfdbfe"/></svg>
+        </div>
+        <span>Microscopy</span>
+      </div>
+      <div class="ms-labitem" title="Centrifuge">
+        <div class="ms-labitem-ico">
+          <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><circle cx="16" cy="16" r="12" fill="#f0f9ff" stroke="#0891b2" stroke-width="1.7"/><circle cx="16" cy="16" r="2.5" fill="#0891b2"/><path d="M16 13.5 L22 8 M16 18.5 L10 24" stroke="#0891b2" stroke-width="2.2" stroke-linecap="round"/><circle cx="22.5" cy="7.5" r="2" fill="#67e8f9"/><circle cx="9.5" cy="24.5" r="2" fill="#67e8f9"/></svg>
+        </div>
+        <span>Centrifuge</span>
+      </div>
+      <div class="ms-labitem" title="Pipette / Dropper">
+        <div class="ms-labitem-ico">
+          <svg viewBox="0 0 32 32" fill="none" stroke="#d97706" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M13 4h6v5l-3 3-3-3V4z" fill="#fde68a"/><path d="M14.5 12v8c0 1 .8 2 1.5 2s1.5-1 1.5-2v-8" fill="#fef3c7"/><path d="M16 22v3"/><circle cx="16" cy="27" r="1.8" fill="#f59e0b" stroke="none"/></svg>
+        </div>
+        <span>Pipette</span>
+      </div>
+      <div class="ms-labitem" title="Reagent Bottle">
+        <div class="ms-labitem-ico">
+          <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><rect x="12" y="3" width="8" height="4" rx="1" fill="#7c3aed"/><path d="M13 7h6v3l3 4v11a3 3 0 0 1-3 3h-6a3 3 0 0 1-3-3V14l3-4V7z" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.5"/><rect x="12" y="17" width="8" height="5" rx="1" fill="#ffffff" stroke="#a78bfa" stroke-width="1"/></svg>
+        </div>
+        <span>Reagents</span>
+      </div>
+      <div class="ms-labitem" title="Petri Dish / Culture">
+        <div class="ms-labitem-ico">
+          <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><ellipse cx="16" cy="10" rx="11" ry="4" fill="#cffafe" stroke="#0891b2" stroke-width="1.5"/><path d="M5 10v10c0 2.2 4.9 4 11 4s11-1.8 11-4V10" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/><circle cx="12" cy="15" r="1.5" fill="#06b6d4"/><circle cx="18" cy="17" r="1.2" fill="#06b6d4"/><circle cx="20" cy="13" r="1" fill="#22d3ee"/></svg>
+        </div>
+        <span>Culture</span>
+      </div>
     </div>
 
     <div class="ms-grid">
