@@ -2249,6 +2249,17 @@ def _ensure_package_tables(cursor):
             PRIMARY KEY (package_id, test_id)
         )
     """)
+    # package_price = fixed price charged for the whole package
+    # (NULL = simply add up the normal test prices). Additive migration only.
+    cursor.execute("PRAGMA table_info(test_packages)")
+    if "package_price" not in [r[1] for r in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE test_packages ADD COLUMN package_price REAL")
+    # price_override = price actually charged for this one assigned test.
+    # NULL = normal list price. Tests that came from a package carry their share
+    # of the package price here, so every bill / revenue total adds up correctly.
+    cursor.execute("PRAGMA table_info(patient_assigned_tests)")
+    if "price_override" not in [r[1] for r in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN price_override REAL")
 
 
 def init_db():
@@ -3362,7 +3373,7 @@ def dashboard(request: Request):
     if _shell_can(user, "reports", "can_view_reports"):
         try:
             cursor.execute(
-                "SELECT COALESCE(SUM(COALESCE(t.price, 0)), 0) FROM patients p "
+                "SELECT COALESCE(SUM(COALESCE(pat.price_override, t.price, 0)), 0) FROM patients p "
                 "JOIN patient_assigned_tests pat ON pat.patient_id = p.id "
                 "JOIN tests t ON t.id = pat.test_id "
                 "WHERE substr(p.created_at, 1, 10) = ? AND (p.is_cancelled IS NULL OR p.is_cancelled = 0)",
@@ -3999,7 +4010,7 @@ def _render_cancel_bills_tab(conn, cursor, search, msg):
             SELECT p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
                    COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
                    COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
-                   SUM(COALESCE(t.price, 0)) as amount
+                   SUM(COALESCE(pat.price_override, t.price, 0)) as amount
             FROM patients p
             LEFT JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             LEFT JOIN tests t ON t.id = pat.test_id
@@ -4560,7 +4571,7 @@ def add_patient_page(request: Request, saved_id: int = None):
         pkg_rows += f"""
         <label class="test-item pkg-item" data-name="{search_blob}" data-label="{html.escape(p['name'], quote=True)}" data-pkg-tests="{payload}" style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-weight: normal; cursor: pointer; font-size: 14px;">
             <input type="checkbox" name="package_ids" value="{p['id']}" style="width: 16px; height: 16px; accent-color: #b45309;">
-            <span>&#128230; <b>{html.escape(p['name'])}</b> <small style="color:#92400e;">({len(p['tests'])} tests)</small></span>
+            <span>&#128230; <b>{html.escape(p['name'])}</b> <small style="color:#92400e;">({len(p['tests'])} tests{(' &middot; Rs. ' + format(float(p['price']), ',.2f')) if p.get('price') is not None else ''})</small></span>
         </label>"""
     if pkg_rows:
         package_section = (
@@ -4941,25 +4952,50 @@ async def add_patient_post(request: Request):
             if str(tid) not in seen_tests:
                 seen_tests.add(str(tid))
                 merged_tests.append(tid)
+        # test_id -> price actually charged (only for tests that came from a
+        # package that has its own package price; others keep the list price).
+        price_override_map = {}
         if package_ids:
-            ph = ",".join("?" * len(package_ids))
-            cursor.execute(
-                f"SELECT i.test_id FROM test_package_items i JOIN tests t ON t.id = i.test_id "
-                f"WHERE i.package_id IN ({ph}) ORDER BY i.package_id, i.test_id",
-                tuple(package_ids)
-            )
-            for (tid,) in cursor.fetchall():
-                if str(tid) not in seen_tests:
-                    seen_tests.add(str(tid))
-                    merged_tests.append(tid)
+            for pk_id in package_ids:
+                cursor.execute("SELECT package_price FROM test_packages WHERE id = ?", (pk_id,))
+                pk_row = cursor.fetchone()
+                pk_price = pk_row[0] if pk_row else None
+                cursor.execute(
+                    "SELECT i.test_id, COALESCE(t.price, 0) FROM test_package_items i "
+                    "JOIN tests t ON t.id = i.test_id WHERE i.package_id = ? ORDER BY i.test_id",
+                    (pk_id,)
+                )
+                new_items = []
+                for tid, list_price in cursor.fetchall():
+                    if str(tid) not in seen_tests:
+                        seen_tests.add(str(tid))
+                        merged_tests.append(tid)
+                        new_items.append((tid, float(list_price or 0)))
+                if pk_price is not None and new_items:
+                    # Spread the package price over its tests in proportion to
+                    # their list prices (equal split if all list prices are 0);
+                    # the last test takes the rounding remainder so the shares
+                    # always add up to exactly the package price.
+                    pk_price = round(float(pk_price), 2)
+                    list_sum = sum(p for _, p in new_items)
+                    given = 0.0
+                    for idx, (tid, lp) in enumerate(new_items):
+                        if idx == len(new_items) - 1:
+                            share = round(pk_price - given, 2)
+                        elif list_sum > 0:
+                            share = round(pk_price * lp / list_sum, 2)
+                        else:
+                            share = round(pk_price / len(new_items), 2)
+                        given += share
+                        price_override_map[tid] = share
         selected_tests = merged_tests
 
         if selected_tests:
             for test_id in selected_tests:
                 cursor.execute("""
-                    INSERT INTO patient_assigned_tests (patient_id, test_id, assigned_date)
-                    VALUES (?, ?, datetime('now'))
-                """, (patient_id, test_id))
+                    INSERT INTO patient_assigned_tests (patient_id, test_id, assigned_date, price_override)
+                    VALUES (?, ?, datetime('now'), ?)
+                """, (patient_id, test_id, price_override_map.get(test_id)))
 
         conn.commit()
         conn.close()
@@ -4977,8 +5013,8 @@ async def add_patient_post(request: Request):
 # -------------------------------------------------------------
 def _load_packages(cursor):
     """[{id, name, tests: [(test_id, test_name, price), ...]}, ...]"""
-    cursor.execute("SELECT id, package_name FROM test_packages ORDER BY package_name COLLATE NOCASE")
-    pkgs = [{"id": r[0], "name": r[1], "tests": []} for r in cursor.fetchall()]
+    cursor.execute("SELECT id, package_name, package_price FROM test_packages ORDER BY package_name COLLATE NOCASE")
+    pkgs = [{"id": r[0], "name": r[1], "price": r[2], "tests": []} for r in cursor.fetchall()]
     by_id = {p["id"]: p for p in pkgs}
     if pkgs:
         cursor.execute("""
@@ -5031,8 +5067,11 @@ _PACKAGE_JS = """
         });
     }
     function pkCount() {
-        document.getElementById('pkCount').textContent =
-            document.querySelectorAll('#pkBox input[name="test_ids"]:checked').length;
+        const checked = document.querySelectorAll('#pkBox input[name="test_ids"]:checked');
+        document.getElementById('pkCount').textContent = checked.length;
+        let sum = 0;
+        checked.forEach(c => { sum += parseFloat(c.closest('label').getAttribute('data-price')) || 0; });
+        document.getElementById('pkSum').textContent = sum.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
     }
     function pkCheck() {
         if (!document.getElementById('pkName').value.trim()) { alert('Please enter a package name.'); return false; }
@@ -5046,10 +5085,10 @@ _PACKAGE_JS = """
 """
 
 
-def _package_form_html(action, name_value, tests, selected_ids, button_label, cancel_html=""):
+def _package_form_html(action, name_value, tests, selected_ids, button_label, cancel_html="", price_value=None):
     sel = {str(x) for x in selected_ids}
     rows = "".join(
-        f"""<label class="pk-test" data-name="{html.escape(str(t[1] or '').lower(), quote=True)}">
+        f"""<label class="pk-test" data-price="{float(t[2] or 0)}" data-name="{html.escape(str(t[1] or '').lower(), quote=True)}">
             <input type="checkbox" name="test_ids" value="{t[0]}" {'checked' if str(t[0]) in sel else ''}>
             <span class="pk-tn">{html.escape(str(t[1]))}</span>
             <span class="pk-tp">{html.escape(str(t[3]))} &middot; Rs. {float(t[2] or 0):,.2f}</span>
@@ -5062,7 +5101,13 @@ def _package_form_html(action, name_value, tests, selected_ids, button_label, ca
                placeholder="Package name (e.g. Full Health Checkup)" value="{html.escape(name_value or '', quote=True)}">
         <input type="text" id="pkSearch" class="pk-in" placeholder="Search tests to add..." oninput="pkFilter()">
         <div class="pk-box" id="pkBox">{rows or '<em>No tests found. Create tests first in Manage Tests.</em>'}</div>
-        <div class="pk-count">Selected tests: <span id="pkCount">0</span></div>
+        <div class="pk-count">Selected tests: <span id="pkCount">0</span>
+            &nbsp;&middot;&nbsp; Sum of normal test prices: Rs. <span id="pkSum">0.00</span></div>
+        <label style="display:block;font-size:13px;font-weight:700;color:#0d47a1;margin-bottom:4px;">Package Price (Rs.)</label>
+        <input type="number" step="0.01" min="0" name="package_price" id="pkPrice" class="pk-in" style="max-width:260px;"
+               placeholder="Leave empty to use the normal test prices"
+               value="{'' if price_value is None else format(float(price_value), 'g')}">
+        <div style="font-size:12px;color:#64748b;margin:-4px 0 12px;">This is the price charged when this package is ticked at registration. It replaces the individual test prices from the main price list.</div>
         <button type="submit" class="pk-save">{button_label}</button>{cancel_html}
     </form>
     """
@@ -5096,7 +5141,7 @@ def manage_packages(request: Request, msg: str = ""):
             <div class="pk-main">
                 <h3>&#128230; {html.escape(p['name'])}<span class="pk-badge">{len(p['tests'])} tests</span></h3>
                 <div class="pk-chips">{chips or '<em style="color:#94a3b8;font-size:12px;">No tests in this package</em>'}</div>
-                <div class="pk-meta">Sum of test prices: Rs. {total:,.2f}</div>
+                <div class="pk-meta">{('Package price: <b>Rs. ' + format(float(p['price']), ',.2f') + '</b> &nbsp;(normal test prices add up to Rs. ' + format(total, ',.2f') + ')') if p.get('price') is not None else 'No package price set &ndash; normal test prices apply: Rs. ' + format(total, ',.2f')}</div>
             </div>
             <div class="pk-actions">
                 <a href="/edit-package/{p['id']}" class="pk-btn pk-edit">Edit</a>
@@ -5148,6 +5193,13 @@ async def add_package(request: Request):
         return _package_redirect("Package name is required.")
     if not test_ids:
         return _package_redirect("Select at least one test for the package.")
+    try:
+        _pp = str(form.get("package_price") or "").strip()
+        package_price = round(float(_pp), 2) if _pp != "" else None
+        if package_price is not None and package_price < 0:
+            raise ValueError
+    except ValueError:
+        return _package_redirect("Package price must be a valid positive number. Nothing was saved.")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -5157,8 +5209,8 @@ async def add_package(request: Request):
         conn.close()
         return _package_redirect(f"A package named '{name}' already exists.")
     cursor.execute(
-        "INSERT INTO test_packages (package_name, created_at) VALUES (?, ?)",
-        (name, now_colombo().isoformat(timespec="seconds"))
+        "INSERT INTO test_packages (package_name, created_at, package_price) VALUES (?, ?, ?)",
+        (name, now_colombo().isoformat(timespec="seconds"), package_price)
     )
     package_id = cursor.lastrowid
     for tid in dict.fromkeys(test_ids):
@@ -5177,7 +5229,7 @@ def edit_package_page(package_id: int, request: Request):
     conn = get_db_connection()
     cursor = conn.cursor()
     _ensure_package_tables(cursor)
-    cursor.execute("SELECT package_name FROM test_packages WHERE id = ?", (package_id,))
+    cursor.execute("SELECT package_name, package_price FROM test_packages WHERE id = ?", (package_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -5190,7 +5242,7 @@ def edit_package_page(package_id: int, request: Request):
 
     form_html = _package_form_html(
         f"/edit-package/{package_id}", row[0], tests, selected, "Update Package",
-        '<a href="/manage-packages" class="pk-cancel">Cancel</a>'
+        '<a href="/manage-packages" class="pk-cancel">Cancel</a>', row[1]
     )
     return f"""
     <!DOCTYPE html>
@@ -5225,6 +5277,13 @@ async def edit_package_post(package_id: int, request: Request):
         return _package_redirect("Package name is required.")
     if not test_ids:
         return _package_redirect("A package needs at least one test. Nothing was changed.")
+    try:
+        _pp = str(form.get("package_price") or "").strip()
+        package_price = round(float(_pp), 2) if _pp != "" else None
+        if package_price is not None and package_price < 0:
+            raise ValueError
+    except ValueError:
+        return _package_redirect("Package price must be a valid positive number. Nothing was saved.")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -5239,7 +5298,7 @@ async def edit_package_post(package_id: int, request: Request):
     if cursor.fetchone():
         conn.close()
         return _package_redirect(f"Another package is already named '{name}'. Nothing was changed.")
-    cursor.execute("UPDATE test_packages SET package_name = ? WHERE id = ?", (name, package_id))
+    cursor.execute("UPDATE test_packages SET package_name = ?, package_price = ? WHERE id = ?", (name, package_price, package_id))
     cursor.execute("DELETE FROM test_package_items WHERE package_id = ?", (package_id,))
     for tid in dict.fromkeys(test_ids):
         cursor.execute("INSERT OR IGNORE INTO test_package_items (package_id, test_id) VALUES (?, ?)", (package_id, tid))
@@ -10989,7 +11048,7 @@ def sales_analytics_page(
                    p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
                    COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
                    GROUP_CONCAT(COALESCE(NULLIF(t.test_code, ''), t.test_name), ', ') as tests_performed,
-                   SUM(COALESCE(t.price, 0)) as amount
+                   SUM(COALESCE(pat.price_override, t.price, 0)) as amount
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             JOIN tests t ON t.id = pat.test_id
@@ -11012,7 +11071,7 @@ def sales_analytics_page(
         cursor.execute(f"""
             SELECT p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
                    COUNT(DISTINCT p.id) as patient_count,
-                   SUM(COALESCE(t.price, 0)) as revenue,
+                   SUM(COALESCE(pat.price_override, t.price, 0)) as revenue,
                    COALESCE(d.commission_rate, 0) as commission_rate
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
@@ -11033,7 +11092,7 @@ def sales_analytics_page(
             SELECT COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
                    COUNT(DISTINCT p.id) as patient_count,
                    COUNT(pat.id) as tests_dispatched,
-                   SUM(COALESCE(t.price, 0)) as billing
+                   SUM(COALESCE(pat.price_override, t.price, 0)) as billing
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             JOIN tests t ON t.id = pat.test_id
@@ -11056,7 +11115,7 @@ def sales_analytics_page(
         cursor.execute(f"""
             SELECT t.id as test_id, t.test_name, COALESCE(t.test_code, '') as test_code,
                    COALESCE(t.price, 0) as unit_price,
-                   COUNT(pat.id) as cnt, SUM(COALESCE(t.price, 0)) as amount
+                   COUNT(pat.id) as cnt, SUM(COALESCE(pat.price_override, t.price, 0)) as amount
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             JOIN tests t ON t.id = pat.test_id
@@ -11126,7 +11185,7 @@ def sales_analytics_page(
             SELECT p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
                    p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
                    COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name,
-                   SUM(COALESCE(t.price, 0)) as amount
+                   SUM(COALESCE(pat.price_override, t.price, 0)) as amount
             FROM patients p
             LEFT JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             LEFT JOIN tests t ON t.id = pat.test_id
