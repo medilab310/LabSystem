@@ -2911,6 +2911,10 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .ms-stat-spark svg { width: 100%; height: 30px; display: block; }
   .ms-stat-link { display: inline-block; margin-top: 6px; font-size: 11px; font-weight: 700; color: var(--primary); }
   .ms-stat-link i { font-size: 8px; margin-left: 3px; }
+  .ms-stat { flex-wrap: wrap; }
+  .ms-stat > div:nth-child(2) { flex: 1; min-width: 0; }
+  .ms-stat-spark { flex-basis: 100%; }
+  .ms-stat-link { flex-basis: 100%; }
   @media (max-width: 1100px) { .ms-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   /* ---------- Donut chart (right column) ---------- */
   .ms-donut-box { text-align: center; }
@@ -2957,7 +2961,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .ms-viewall:hover { filter: brightness(0.96); }
 
   /* ---------- Stat cards ---------- */
-  .ms-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+  .ms-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
   .ms-stat { border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); padding: 20px; display: flex; gap: 16px; align-items: flex-start; }
   .ms-stat.blue { background: var(--tint-blue); }
   .ms-stat.green { background: var(--tint-green); }
