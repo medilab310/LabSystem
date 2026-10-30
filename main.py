@@ -1299,10 +1299,10 @@ html body.ms{margin:0 !important;padding:0 !important;display:block !important;b
 .ms-layout{display:grid;grid-template-columns:260px minmax(0,1fr);min-height:calc(100vh - 84px);}
 .ms-sidebar{background:var(--sidebar-bg);border-right:1px solid var(--border);padding:14px 14px 20px;display:flex;flex-direction:column;position:sticky;top:0;height:calc(100vh - 84px);overflow-y:auto;}
 .ms-nav{display:flex;flex-direction:column;gap:4px;}
-.ms-nav a{display:flex;align-items:center;gap:16px;padding:11px 16px;border-radius:12px;color:var(--text);font-size:15px;font-weight:600;transition:background .15s,transform .15s;}
-.ms-nav a i{width:24px;text-align:center;font-size:19px;color:var(--primary);opacity:.8;}
+.ms-nav a{display:flex;align-items:center;gap:13px;padding:10px 14px;border-radius:10px;color:var(--text);font-family:'Inter','Poppins','Segoe UI',system-ui,sans-serif;font-size:13.5px;font-weight:500;letter-spacing:.1px;transition:background .15s,transform .15s;}
+.ms-nav a i{width:22px;text-align:center;font-size:16px;color:var(--primary);opacity:.8;}
 .ms-nav a:hover{background:var(--primary-soft);}
-.ms-nav a.active{background:var(--primary-soft);font-weight:700;}
+.ms-nav a.active{background:var(--primary-soft);font-weight:600;}
 .ms-nav a.active i{opacity:1;}
 .ms-side-foot{margin-top:auto;text-align:center;padding:24px 8px 6px;color:var(--muted);}
 .ms-side-foot i{font-size:38px;color:#38a3e8;display:block;margin-bottom:8px;}
@@ -1375,9 +1375,9 @@ html body.ms{overflow-x:hidden;}
 .ms-search kbd{font-family:inherit;font-size:11px;font-weight:700;background:rgba(255,255,255,.22);border-radius:6px;padding:2px 7px;color:#fff;}
 .ms-newpt{background:#22c55e;color:#fff;border-radius:26px;height:44px;padding:0 18px;display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:13.5px;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,.18);text-decoration:none;}
 .ms-newpt:hover{background:#16a34a;color:#fff;}
-.ms-sec{padding:14px 16px 4px;font-size:11px;font-weight:800;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted);}
+.ms-sec{padding:14px 16px 4px;font-family:'Inter','Poppins','Segoe UI',system-ui,sans-serif;font-size:10.5px;font-weight:700;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted);}
 .ms-sec:first-child{padding-top:4px;}
-.ms-nav a{padding:10px 16px;}
+.ms-nav a{padding:9px 14px;}
 .ms-collapse{display:flex;align-items:center;gap:14px;background:transparent;border:1px dashed var(--border);color:var(--muted);border-radius:10px;padding:7px 16px;margin:0 0 10px;font-size:12.5px;font-weight:700;cursor:pointer;font-family:inherit;width:100%;}
 .ms-collapse i{width:24px;text-align:center;transition:transform .2s;}
 .ms-collapse:hover{background:var(--primary-soft);color:var(--primary);}
@@ -1523,7 +1523,7 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
-        + head_inner + fa_link
+        + head_inner + fa_link + '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">'
         + "<style>" + _SHELL_BASE_CSS + _SHELL_EXTRA_CSS + "</style>"
         + _SHELL_HEAD_SCRIPT
         + '</head><body class="ms ms-wrapped">'
@@ -2831,10 +2831,10 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .ms-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100vh - 84px); }
   .ms-sidebar { background: var(--sidebar-bg); border-right: 1px solid var(--border); padding: 18px 14px 20px; display: flex; flex-direction: column; position: sticky; top: 0; height: calc(100vh - 84px); overflow-y: auto; }
   .ms-nav { display: flex; flex-direction: column; gap: 6px; }
-  .ms-nav a { display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-radius: 12px; color: var(--text); font-size: 15px; font-weight: 600; transition: background 0.15s, transform 0.15s; }
-  .ms-nav a i { width: 24px; text-align: center; font-size: 19px; color: var(--primary); opacity: 0.8; }
+  .ms-nav a { display: flex; align-items: center; gap: 13px; padding: 10px 14px; border-radius: 10px; color: var(--text); font-family: 'Inter','Poppins','Segoe UI',system-ui,sans-serif; font-size: 13.5px; font-weight: 500; letter-spacing: 0.1px; transition: background 0.15s, transform 0.15s; }
+  .ms-nav a i { width: 22px; text-align: center; font-size: 16px; color: var(--primary); opacity: 0.8; }
   .ms-nav a:hover { background: var(--primary-soft); }
-  .ms-nav a.active { background: var(--primary-soft); font-weight: 700; }
+  .ms-nav a.active { background: var(--primary-soft); font-weight: 600; }
   .ms-nav a.active i { opacity: 1; }
   .ms-side-foot { margin-top: auto; text-align: center; padding: 30px 8px 6px; color: var(--muted); }
   .ms-side-foot i { font-size: 38px; color: #38a3e8; display: block; margin-bottom: 8px; }
@@ -2993,7 +2993,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     .ms-qa-grid { grid-template-columns: 1fr; }
     .ms-help { flex-wrap: wrap; }
   }
-</style>__SHELL_HEAD_EXTRA__</head>
+</style><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">__SHELL_HEAD_EXTRA__</head>
 <body class="ms">
 
 __SHELL_HEADER__
@@ -5331,18 +5331,23 @@ def manage_tests(request: Request, dept: str = ""):
     for test_id, test_name, price, department, specimen, test_code in tests:
         param_count = param_counts.get(test_id, 0)
 
-        code_badge = f"<span style='background:#0f4c81; color:white; padding:3px 8px; border-radius:4px; font-size:12px; margin-right:8px;'>{test_code}</span>" if test_code else ""
+        code_badge = f"<span class='tc-code'>{html.escape(str(test_code))}</span>" if test_code else ""
 
         test_list_html += f"""
-        <div class="test-card" style="background:#fff; border:1px solid #e0e0e0; padding:18px 20px; margin-bottom:15px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 5px rgba(0,0,0,0.02);">
-            <div>
-                <h3 style="margin:0 0 5px 0; color:#0f4c81; font-size:18px; display:flex; align-items:center;">{code_badge}{test_name}</h3>
-                <span style="color:#666; font-size:13px; font-weight:600;">Parameters: {param_count} | Price: Rs.{price} | Dept: {department or 'N/A'} | Specimen: {specimen or 'N/A'}</span>
+        <div class="test-card tc">
+            <div class="tc-main">
+                <h3 class="tc-title">{code_badge}<span class="tc-name">{html.escape(str(test_name))}</span></h3>
+                <div class="tc-meta">
+                    <span><i class="fa-solid fa-list-check"></i> {param_count} parameters</span>
+                    <span><i class="fa-solid fa-tag"></i> Rs. {price}</span>
+                    <span><i class="fa-solid fa-building"></i> {html.escape(str(department or 'N/A'))}</span>
+                    <span><i class="fa-solid fa-vial"></i> {html.escape(str(specimen or 'N/A'))}</span>
+                </div>
             </div>
-            <div>
-                <a href="/edit-test-category/{test_id}" style="background:#f39c12; color:white; padding:10px 15px; text-decoration:none; border-radius:6px; font-size:13px; font-weight:bold; margin-right:5px;">Edit Info</a>
-                <a href="/manage-tests/{test_id}" style="background:#0f4c81; color:white; padding:10px 18px; text-decoration:none; border-radius:6px; font-size:13px; font-weight:bold; margin-right:5px;">Manage Parameters</a>
-                <button type="button" onclick="openDeleteCategoryModal({test_id}, {repr(test_name)})" style="background:#b91c1c; color:white; border:none; padding:10px 15px; border-radius:6px; font-size:13px; font-weight:bold; cursor:pointer;">Delete</button>
+            <div class="tc-actions">
+                <a href="/edit-test-category/{test_id}" class="tc-btn tc-edit"><i class="fa-solid fa-pen"></i> Edit Info</a>
+                <a href="/manage-tests/{test_id}" class="tc-btn tc-params"><i class="fa-solid fa-sliders"></i> Parameters</a>
+                <button type="button" onclick="openDeleteCategoryModal({test_id}, {repr(test_name)})" class="tc-btn tc-del"><i class="fa-solid fa-trash"></i> Delete</button>
             </div>
         </div>
         """
@@ -5350,10 +5355,9 @@ def manage_tests(request: Request, dept: str = ""):
     conn.close()
 
     # Department filter tabs HTML
-    dept_tabs = f"<a href='/manage-tests' style='padding:6px 14px; background: {'#0f4c81' if not dept else '#e2e8f0'}; color: {'white' if not dept else '#333'}; border-radius:20px; text-decoration:none; font-size:13px; font-weight:bold;'>All Departments</a>"
+    dept_tabs = f"<a href='/manage-tests' class='dept-chip{' active' if not dept else ''}'>All Departments</a>"
     for d in depts:
-        is_active = (dept == d)
-        dept_tabs += f"<a href='/manage-tests?dept={d}' style='padding:6px 14px; background: {'#0f4c81' if is_active else '#e2e8f0'}; color: {'white' if is_active else '#333'}; border-radius:20px; text-decoration:none; font-size:13px; font-weight:bold;'>{d}</a>"
+        dept_tabs += f"<a href='/manage-tests?dept={html.escape(str(d), quote=True)}' class='dept-chip{' active' if dept == d else ''}'>{html.escape(str(d))}</a>"
 
     return f"""
     <!DOCTYPE html>
@@ -5361,15 +5365,35 @@ def manage_tests(request: Request, dept: str = ""):
     <head>
         <title>Manage Test Categories</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 40px; }}
-            .container {{ max-width: 950px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
-            h2 {{ color: #0f4c81; margin-top: 0; }}
-            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0f4c81; text-decoration: none; font-weight: bold; }}
+            body {{ font-family: 'Inter','Segoe UI',system-ui,sans-serif; background: #f4f7fb; padding: 24px; }}
+            .container {{ max-width: 1100px; margin: auto; background: #fff; padding: 24px 26px; border-radius: 14px; border: 1px solid #d8e0ec; box-shadow: 0 6px 22px rgba(13,71,161,.08); }}
+            h2 {{ color: #0d47a1; margin: 0 0 14px; font-size: 20px; font-weight: 700; }}
+            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0d47a1; text-decoration: none; font-weight: 600; font-size: 13px; }}
+
+            /* Test category cards (theme matched, compact) */
+            .tc {{ background:#fff; border:1px solid #d8e0ec; border-radius:12px; padding:12px 16px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; gap:14px; flex-wrap:wrap; transition: box-shadow .15s, border-color .15s; }}
+            .tc:hover {{ border-color:#9db8e8; box-shadow:0 4px 14px rgba(13,71,161,.10); }}
+            .tc-main {{ min-width:0; flex:1 1 360px; }}
+            .tc-title {{ margin:0 0 5px; font-size:14.5px; font-weight:600; color:#0d47a1; display:flex; align-items:center; gap:8px; }}
+            .tc-code {{ background:#e8f0fe; color:#0d47a1; border:1px solid #c7d9f8; padding:2px 8px; border-radius:6px; font-size:11px; font-weight:700; letter-spacing:.3px; }}
+            .tc-meta {{ display:flex; flex-wrap:wrap; gap:4px 16px; font-size:12px; color:#5a6b82; font-weight:500; }}
+            .tc-meta i {{ color:#0d47a1; opacity:.65; margin-right:5px; font-size:11px; }}
+            .tc-actions {{ display:flex; gap:6px; flex-wrap:wrap; }}
+            .tc-btn {{ display:inline-flex; align-items:center; gap:6px; padding:7px 12px; border-radius:8px; font-size:12px; font-weight:600; text-decoration:none; border:1px solid transparent; cursor:pointer; font-family:inherit; line-height:1.2; }}
+            .tc-edit {{ background:#fff7e6; color:#b45309; border-color:#fcd9a0; }}
+            .tc-edit:hover {{ background:#ffedcc; }}
+            .tc-params {{ background:#0d47a1; color:#fff; }}
+            .tc-params:hover {{ background:#08306b; }}
+            .tc-del {{ background:#fff; color:#b91c1c; border-color:#f3b4b4; }}
+            .tc-del:hover {{ background:#fee2e2; }}
+            .dept-chip {{ padding:5px 13px; background:#eef2f8; color:#334155; border-radius:20px; text-decoration:none; font-size:12px; font-weight:600; border:1px solid #d8e0ec; }}
+            .dept-chip:hover {{ background:#e1e9f6; }}
+            .dept-chip.active {{ background:#0d47a1; color:#fff; border-color:#0d47a1; }}
             .top-actions {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }}
             .template-btn {{ background: #27ae60; color: white; padding: 10px 16px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 13px; }}
-            .add-test-box {{ background: #eaf3fb; padding: 20px; border-radius: 8px; margin-bottom: 25px; display: flex; flex-direction: column; gap: 10px; }}
+            .add-test-box {{ background: #f1f6fd; border: 1px solid #d8e6fa; padding: 18px; border-radius: 12px; margin-bottom: 25px; display: flex; flex-direction: column; gap: 10px; }}
             .search-bar {{ margin-bottom: 20px; }}
-            .search-bar input {{ width: 100%; padding: 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 15px; box-sizing: border-box; }}
+            .search-bar input {{ width: 100%; padding: 10px 14px; border: 1px solid #d8e0ec; border-radius: 10px; font-size: 13.5px; box-sizing: border-box; background:#f8fafc; }}
             .row-inputs {{ display: flex; gap: 10px; flex-wrap: wrap; }}
             .row-inputs input, .row-inputs select {{ flex: 1; min-width: 150px; padding: 10px; border: 1px solid #ccc; border-radius: 6px; }}
             textarea {{ width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; resize: vertical; min-height: 80px; font-family: Arial, sans-serif; }}
@@ -5465,7 +5489,6 @@ def manage_tests(request: Request, dept: str = ""):
                         <button type="button" onclick="insertTag('<b>', '</b>')"><b>B</b></button>
                         <button type="button" onclick="insertTag('<i>', '</i>')"><i>I</i></button>
                         <button type="button" onclick="insertTag('<u>', '</u>')"><u>U</u></button>
-                        <button type="button" onclick="insertTag('<span style=\'font-size:14px;\'>', '</span>')">Larger Text</button>
                         <button type="button" onclick="insertTag('<hr style=\'border:0; border-top:1px solid #ccc; margin:10px 0;\'>', '')">Insert Line</button>
                         <button type="button" onclick="insertTag('<div style=\'border:1px solid #0f4c81; padding:8px; border-radius:4px; margin:5px 0;\'>', '</div>')">Box Border</button>
                         <button type="button" onclick="insertTag('<br>', '')">New Line</button>
@@ -7157,13 +7180,13 @@ def test_entry_page(patient_id: int, test_id: int):
     
     # Input field attributes: If already saved (has_results), make them disabled (Locked)
     if has_results:
-        input_attr = 'disabled style="flex: 3; padding: 3px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; background: #f8fafc; color: #64748b; cursor: not-allowed;"'
+        input_attr = 'disabled style="width:100%; box-sizing:border-box; padding: 7px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 15px; background: #f8fafc; color: #64748b; cursor: not-allowed;"'
     else:
-        input_attr = 'style="flex: 3; padding: 3px 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; outline: none; transition: border-color 0.2s;"'
+        input_attr = 'style="width:100%; box-sizing:border-box; padding: 7px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 15px; outline: none; transition: border-color 0.2s;"'
 
     if params:
         param_form_html += """
-        <div style="display:grid; grid-template-columns: minmax(170px,2fr) minmax(110px,2.4fr) 58px 80px minmax(110px,1.6fr); gap:6px; padding-bottom:5px; margin-bottom:6px; border-bottom:2px solid #e2e8f0; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.3px;">
+        <div style="display:grid; grid-template-columns: minmax(200px,2fr) minmax(260px,3.4fr) 62px 90px minmax(140px,1.6fr); gap:10px; padding-bottom:5px; margin-bottom:6px; border-bottom:2px solid #e2e8f0; font-size:11px; font-weight:700; color:#64748b; text-transform:uppercase; letter-spacing:0.3px;">
             <span>Parameter</span>
             <span>Result</span>
             <span style="text-align:center;">Bold</span>
@@ -7220,7 +7243,7 @@ def test_entry_page(patient_id: int, test_id: int):
             final_val = p_val.strip() if str(p_val).strip() != "" else default_val
 
             if is_calculated:
-                calc_attr = 'readonly style="flex: 3; padding: 3px 8px; border: 1px solid #93c5fd; border-radius: 6px; font-size: 14px; background: #eff6ff; color: #1d4ed8; font-weight: 700;"'
+                calc_attr = 'readonly style="width:100%; box-sizing:border-box; padding: 7px 12px; border: 1px solid #93c5fd; border-radius: 6px; font-size: 15px; background: #eff6ff; color: #1d4ed8; font-weight: 700;"'
                 badge = '<span style="background:#dbeafe;color:#1d4ed8;padding:3px 7px;border-radius:10px;font-size:10px;font-weight:700;margin-left:6px;">AUTO</span>'
             else:
                 calc_attr = input_attr
@@ -7248,7 +7271,7 @@ def test_entry_page(patient_id: int, test_id: int):
                 )
 
             param_form_html += f"""
-            <div style="display:grid; grid-template-columns: minmax(170px,2fr) minmax(110px,2.4fr) 58px 80px minmax(110px,1.6fr); margin-bottom: 2px; align-items:center; gap:6px;">
+            <div style="display:grid; grid-template-columns: minmax(200px,2fr) minmax(260px,3.4fr) 62px 90px minmax(140px,1.6fr); margin-bottom: 4px; align-items:center; gap:10px;">
                 <label style="font-weight:600;color:#334155;font-size:14px;">{html.escape(str(p_name_val))}{badge}</label>
                 <input type="text" name="param_{test_id}_{p_id_param}" value="{html.escape(final_val)}" placeholder="{'Auto calculated' if is_calculated else 'Enter result...'}" class="param-input" onkeydown="handleParamKeyNav(event, this)" {calc_attr}>
                 {bold_html}
@@ -7321,25 +7344,25 @@ def test_entry_page(patient_id: int, test_id: int):
     doctor_field_html, center_field_html = build_doctor_center_fields(
         cursor, p_doctor, p_center_display,
         "patient_doctor", "patient_doctor_manual", "patient_center",
-        input_style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box;"
+        input_style="width:100%; padding:4px 8px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px; box-sizing:border-box;"
     )
     conn.close()
 
     patient_edit_html = f"""
-    <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:15px 18px; margin-bottom:20px;">
-        <div style="font-size:12.5px; font-weight:700; color:#0f4c81; margin-bottom:10px; text-transform:uppercase; letter-spacing:0.4px;">
+    <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:8px 12px; margin-bottom:10px; max-width:980px;">
+        <div style="font-size:11.5px; font-weight:700; color:#0f4c81; margin-bottom:6px; text-transform:uppercase; letter-spacing:0.4px;">
             <i class="fa-solid fa-user-pen"></i> Patient Details
         </div>
         <form action="/update-patient-info/{patient_id}" method="post">
             <input type="hidden" name="test_id" value="{test_id}">
-            <div style="display:flex; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
-                <div style="flex:2; min-width:180px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Patient Name</label>
-                    <input type="text" name="patient_name" value="{p_name}" required style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box;">
+            <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:8px;">
+                <div style="flex:2; min-width:170px;">
+                    <label style="display:block; font-size:11px; font-weight:600; color:#475569; margin-bottom:2px;">Patient Name</label>
+                    <input type="text" name="patient_name" value="{p_name}" required style="width:100%; padding:4px 8px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px; box-sizing:border-box;">
                 </div>
                 <div style="flex:1; min-width:100px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Title</label>
-                    <select name="patient_title" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                    <label style="display:block; font-size:11px; font-weight:600; color:#475569; margin-bottom:2px;">Title</label>
+                    <select name="patient_title" style="width:100%; padding:4px 8px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px;">
                         <option value="Mr." {"selected" if p_title == "Mr." else ""}>Mr.</option>
                         <option value="Mrs." {"selected" if p_title == "Mrs." else ""}>Mrs.</option>
                         <option value="Ms." {"selected" if p_title == "Ms." else ""}>Ms.</option>
@@ -7351,30 +7374,30 @@ def test_entry_page(patient_id: int, test_id: int):
                     </select>
                 </div>
                 <div style="flex:1; min-width:110px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Gender</label>
-                    <select name="patient_gender" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                    <label style="display:block; font-size:11px; font-weight:600; color:#475569; margin-bottom:2px;">Gender</label>
+                    <select name="patient_gender" style="width:100%; padding:4px 8px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px;">
                         <option value="Male" {"selected" if p_gender == "Male" else ""}>Male</option>
                         <option value="Female" {"selected" if p_gender == "Female" else ""}>Female</option>
                     </select>
                 </div>
                 <div style="flex:1.4; min-width:210px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Age (Years / Months / Days) &mdash; currently: <b>{html.escape(p_age_display)}</b></label>
+                    <label style="display:block; font-size:11px; font-weight:600; color:#475569; margin-bottom:2px;">Age (Years / Months / Days) &mdash; currently: <b>{html.escape(p_age_display)}</b></label>
                     <div style="display:flex; gap:6px;">
-                        <input type="number" name="patient_age_years" min="0" value="{p_age_years}" title="Years" placeholder="Y" style="width:100%; padding:8px 6px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box; text-align:center;">
-                        <input type="number" name="patient_age_months" min="0" max="11" value="{p_age_months}" title="Months" placeholder="M" style="width:100%; padding:8px 6px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box; text-align:center;">
-                        <input type="number" name="patient_age_days" min="0" max="30" value="{p_age_days}" title="Days" placeholder="D" style="width:100%; padding:8px 6px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; box-sizing:border-box; text-align:center;">
+                        <input type="number" name="patient_age_years" min="0" value="{p_age_years}" title="Years" placeholder="Y" style="width:100%; padding:4px 4px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px; box-sizing:border-box; text-align:center;">
+                        <input type="number" name="patient_age_months" min="0" max="11" value="{p_age_months}" title="Months" placeholder="M" style="width:100%; padding:4px 4px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px; box-sizing:border-box; text-align:center;">
+                        <input type="number" name="patient_age_days" min="0" max="30" value="{p_age_days}" title="Days" placeholder="D" style="width:100%; padding:4px 4px; border:1px solid #cbd5e1; border-radius:5px; font-size:12.5px; box-sizing:border-box; text-align:center;">
                     </div>
                 </div>
                 <div style="flex:1; min-width:150px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Doctor</label>
+                    <label style="display:block; font-size:11px; font-weight:600; color:#475569; margin-bottom:2px;">Doctor</label>
                     {doctor_field_html}
                 </div>
                 <div style="flex:1; min-width:150px;">
-                    <label style="display:block; font-size:12px; font-weight:600; color:#475569; margin-bottom:4px;">Center</label>
+                    <label style="display:block; font-size:11px; font-weight:600; color:#475569; margin-bottom:2px;">Center</label>
                     {center_field_html}
                 </div>
             </div>
-            <button type="submit" style="background:#0f4c81; color:white; border:none; padding:8px 18px; border-radius:6px; font-weight:600; font-size:13px; cursor:pointer;">
+            <button type="submit" style="background:#0f4c81; color:white; border:none; padding:5px 14px; border-radius:5px; font-weight:600; font-size:12px; cursor:pointer;">
                 <i class="fa-solid fa-floppy-disk"></i> Update Patient Details
             </button>
         </form>
@@ -7388,13 +7411,14 @@ def test_entry_page(patient_id: int, test_id: int):
         <title>Enter Results - {t_name}</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f8fafc; color: #1e293b; padding: 30px; }}
-            .container {{ max-width: 800px; margin: auto; background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05), 0 8px 10px -6px rgba(0,0,0,0.05); }}
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f8fafc; color: #1e293b; padding: 18px; }}
+            .container {{ max-width: 1240px; margin: auto; background: white; padding: 22px 28px; border-radius: 12px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.05), 0 8px 10px -6px rgba(0,0,0,0.05); }}
             h2 {{ color: #0f172a; margin-top: 0; font-size: 22px; font-weight: 700; border-bottom: 2px solid #f1f5f9; padding-bottom: 12px; }}
             .back-link {{ display: inline-flex; align-items: center; gap: 6px; color: #3b82f6; text-decoration: none; font-weight: 600; font-size: 13px; transition: color 0.2s; }}
             .back-link:hover {{ color: #1d4ed8; }}
             
             /* Compact, Centered & Modern Smart Buttons */
+            .param-input:focus {{ border-color: #3b82f6 !important; box-shadow: 0 0 0 3px rgba(59,130,246,.15); }}
             .btn-save {{ background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; border: none; padding: 12px 28px; font-size: 14px; border-radius: 6px; cursor: pointer; font-weight: 600; display: inline-block; min-width: 240px; box-shadow: 0 4px 6px -1px rgba(16, 185, 129, 0.2); transition: all 0.2s ease; }}
             .btn-save:hover {{ background: linear-gradient(135deg, #059669 0%, #047857 100%); transform: translateY(-1px); box-shadow: 0 6px 8px -1px rgba(16, 185, 129, 0.3); }}
             
@@ -10140,6 +10164,13 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                awkward blank gap before the notes/guidelines text below.
                This tightens the gap specifically in that case only -
                every other test's note spacing above is untouched. */
+            /* Every element inside the category note (p, span, td, th, li,
+               pasted <font size> / inline font-size...) uses ONE font family and
+               the size chosen in Print Settings. The generic
+               ".report-page *" rule above otherwise resets every child to the
+               base size, which made notes print with mixed sizes. */
+            .report-page .report-test-note, .report-page .report-test-note * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-category-note-font) !important; line-height: 1.4; }}
+            .report-page .report-test-note sub, .report-page .report-test-note sup {{ font-size: 0.75em !important; }}
             .fia-inline-row + .report-note, .fia-inline-row + .report-test-note, .fia-inline-row + .test-category-note, .fia-inline-row + .interpretation-note {{ margin-top: -5px; }}
 
             /* Tables typed into a Test Category's Notes / Description box
