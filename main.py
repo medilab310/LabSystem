@@ -7984,9 +7984,10 @@ def test_entry_page(patient_id: int, test_id: int):
 
         abst_toggle_html = f"""
         <div style="background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; padding:12px 16px; margin-bottom:16px;">
-            <label style="display:flex; align-items:center; gap:10px; cursor:{"not-allowed" if has_results else "pointer"}; font-size:13.5px; font-weight:600; color:#9a3412;">
-                <input type="checkbox" name="hide_abst" value="1"{" checked" if current_hide_abst else ""}{" disabled" if has_results else ""} style="width:17px; height:17px; margin:0;">
+            <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:13.5px; font-weight:600; color:#9a3412;">
+                <input type="checkbox" name="hide_abst" value="1"{" checked" if current_hide_abst else ""} onchange="var b=this.parentElement.querySelector('.abst-saved'); fetch('/set-abst-visibility/{patient_id}/{test_id}',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'hide='+(this.checked?1:0)}}).then(function(r){{b.textContent=r.ok?'\u2714 Saved':'Could not save';b.style.display='inline';}}).catch(function(){{b.textContent='Could not save';b.style.display='inline';}});" style="width:17px; height:17px; margin:0;">
                 <span><i class="fa-solid fa-flask-vial"></i> Hide ABST Section (No Growth / Not Applicable)</span>
+                <span class="abst-saved" style="display:none; margin-left:auto; color:#15803d; font-size:12px;"></span>
             </label>
             <div style="font-size:11.5px; color:#b45309; margin-top:6px; padding-left:27px;">
                 When ticked, the antibiotic susceptibility grid is omitted from the printed report, keeping &ldquo;No Growth&rdquo; reports clean.
@@ -7996,9 +7997,14 @@ def test_entry_page(patient_id: int, test_id: int):
 
     # Save button OR Locked Warning Message
     if has_results:
-        save_action_html = """
+        save_action_html = f"""
         <div class="locked-banner">
             🔒 This test result is saved & locked. To edit, click the Reset button below.
+        </div>
+        <div style="text-align:center; margin-top:14px;">
+            <a href="/whatsapp-share/{patient_id}/{test_id}" target="_blank" class="no-print" style="display:inline-flex; align-items:center; gap:8px; background:#25D366; color:#fff; padding:11px 24px; border-radius:8px; font-weight:700; font-size:14px; text-decoration:none;">
+                <i class="fa-brands fa-whatsapp" style="font-size:18px;"></i> Send Report via WhatsApp
+            </a>
         </div>
         """
     else:
@@ -8550,6 +8556,34 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 </form>
                 """ if has_results else ""
 
+                # ---- WhatsApp button (only once results are saved) ----
+                wa_btn_html = f"""
+                                <a href="/whatsapp-share/{p_id}/{t_id}" target="_blank" title="Send this report to the patient on WhatsApp" style="background: #25D366; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; text-decoration: none; display: flex; align-items: center; gap: 5px;">
+                                    <i class="fa-brands fa-whatsapp"></i> WhatsApp
+                                </a>""" if has_results else ""
+
+                # ---- Culture / ABST: "Hide ABST" toggle on this screen too ----
+                abst_block_html = ""
+                _tn_low = str(t_name or "").lower()
+                if any(k in _tn_low for k in ("culture", "sensitivity", "abst", "c/s", "c & s")):
+                    _cur_hide = 0
+                    try:
+                        cursor.execute("SELECT COALESCE(hide_abst, 0) AS hide_abst FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?", (patient_id, t_id))
+                        _hr = cursor.fetchone()
+                        if _hr:
+                            _cur_hide = int(_hr["hide_abst"] or 0)
+                    except Exception:
+                        _cur_hide = 0
+                    abst_block_html = f"""
+                        <input type="hidden" name="abst_toggle_present" value="1">
+                        <div style="background:#fff7ed; border:1px solid #fed7aa; border-radius:8px; padding:10px 14px; margin-bottom:10px;">
+                            <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:13px; font-weight:600; color:#9a3412;">
+                                <input type="checkbox" name="hide_abst" value="1"{" checked" if _cur_hide else ""} onchange="var b=this.parentElement.querySelector('.abst-saved'); fetch('/set-abst-visibility/{p_id}/{t_id}',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'hide='+(this.checked?1:0)}}).then(function(r){{b.textContent=r.ok?'\u2714 Saved':'Could not save';b.style.display='inline';}}).catch(function(){{b.textContent='Could not save';b.style.display='inline';}});" style="width:16px; height:16px; margin:0;">
+                                <span><i class="fa-solid fa-flask-vial"></i> Hide ABST Section (No Growth / Not Applicable)</span>
+                                <span class="abst-saved" style="display:none; margin-left:auto; color:#15803d; font-size:12px;"></span>
+                            </label>
+                        </div>"""
+
                 categories_html += f"""
                 <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.03);">
                     <form action="/save-test-results" method="post" style="margin: 0;">
@@ -8570,9 +8604,10 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                                 
                                 <a href="/print-report/{p_id}/{t_id}" target="_blank" style="background: #0284c7; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; text-decoration: none; display: flex; align-items: center; gap: 5px;">
                                     <i class="fa-solid fa-print"></i> Print
-                                </a>
+                                </a>{wa_btn_html}
                             </div>
                         </div>
+                {abst_block_html}
                 """
                 
                 if params:
@@ -9067,6 +9102,14 @@ async def save_test_results(request: Request):
                         ON CONFLICT(patient_id, test_id, parameter_id) DO UPDATE SET result_value = excluded.result_value, is_bold = excluded.is_bold
                     """, (patient_id, test_id, param_id, value, is_bold_flag))
 
+        # Persist the "Hide ABST" toggle (only sent by culture/sensitivity test forms).
+        if form_data.get("abst_toggle_present"):
+            try:
+                cursor.execute("UPDATE patient_assigned_tests SET hide_abst = ? WHERE patient_id = ? AND test_id = ?",
+                               (1 if form_data.get("hide_abst") else 0, patient_id, int(form_data.get("test_id"))))
+            except Exception:
+                pass
+
         # Calculate all derived parameters after the manual inputs are saved.
         # If this request contains several tests, calculate each affected test.
         affected_test_ids = set()
@@ -9093,6 +9136,89 @@ async def save_test_results(request: Request):
     except Exception as e:
         return HTMLResponse(content=f"<h3>Error saving: {str(e)}</h3>", status_code=500)
     
+# -------------------------------------------------------------
+# ABST visibility (instant toggle) + one-click WhatsApp report share
+# Additive routes only - no existing function is changed by these.
+# -------------------------------------------------------------
+@app.post("/set-abst-visibility/{patient_id}/{test_id}")
+async def set_abst_visibility(patient_id: int, test_id: int, request: Request):
+    """Saves the 'Hide ABST' flag immediately (works even when the test is locked)."""
+    if not user_can(get_current_user(request), "can_edit_results"):
+        return HTMLResponse("forbidden", status_code=403)
+    form_data = await request.form()
+    flag = 1 if str(form_data.get("hide", "0")) == "1" else 0
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN hide_abst INTEGER DEFAULT 0")
+            conn.commit()
+        except Exception:
+            pass
+        cursor.execute("UPDATE patient_assigned_tests SET hide_abst = ? WHERE patient_id = ? AND test_id = ?",
+                       (flag, patient_id, test_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return HTMLResponse("ok")
+
+
+def _wa_phone_digits(raw_phone: str) -> str:
+    """Sri Lankan style number -> international digits for wa.me ('' if unusable)."""
+    digits = re.sub(r"\D", "", str(raw_phone or ""))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("94") and len(digits) == 11:
+        return digits
+    if digits.startswith("0") and len(digits) == 10:
+        return "94" + digits[1:]
+    if len(digits) == 9:
+        return "94" + digits
+    return digits if len(digits) >= 10 else ""
+
+
+@app.get("/whatsapp-share/{patient_id}/{test_id}")
+def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
+    """Opens WhatsApp with a ready message + secure link to this report.
+    The link is the public report page, which always shows the lab letterhead."""
+    token = _get_or_create_report_qr_token(patient_id, test_id)
+    if not token:
+        return HTMLResponse("<h3 style='font-family:Arial'>Could not create the report link. Make sure this test is assigned to the patient.</h3>", status_code=404)
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return HTMLResponse("<h3 style='font-family:Arial'>Patient not found.</h3>", status_code=404)
+    p = dict(row)
+    p_name = str(p.get("name") or p.get("patient_name") or p.get("full_name") or "").strip()
+    p_title = str(p.get("title") or p.get("salutation") or "").strip()
+    p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    report_url = f"{proto}://{host}/public-report/{token}"
+
+    greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
+    message = (
+        f"Hello {greet},\n"
+        f"Your test report from Medistar Medical Laboratory is now ready.\n"
+        f"You can view and download your report using this secure link:\n"
+        f"\U0001F517 {report_url}\n\n"
+        f"Thank you!"
+    )
+    number = _wa_phone_digits(p_phone)
+    if number:
+        wa_url = f"https://wa.me/{number}?text={quote(message)}"
+    else:
+        wa_url = f"https://api.whatsapp.com/send?text={quote(message)}"
+    return RedirectResponse(url=wa_url, status_code=303)
+
+
 # -------------------------------------------------------------
 # PRINT REPORT ROUTE (Redirects to Report View)
 # -------------------------------------------------------------
