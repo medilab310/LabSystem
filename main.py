@@ -3,17 +3,19 @@ import libsql
 import os
 import re
 import html
+from html.parser import HTMLParser
 import threading
 import secrets
 import hashlib
 import base64
+import hmac
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from typing import Optional
 from fastapi import FastAPI, Form, Request, Query, Response
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 from contextlib import asynccontextmanager
@@ -330,10 +332,126 @@ async def lifespan(app: FastAPI):
     seed_standard_tests_and_parameters()
     yield
 
+# --- Server-side session store + login rate limiting (additive) ---
+# SESSIONS maps an HttpOnly session_token cookie value to the verified
+# identity. The legacy username/role/permissions cookies remain set for
+# backwards compatibility with existing JS, but protected routes now
+# require a server-side session that JavaScript cannot forge.
+SESSIONS = {}
+_SESSIONS_LOCK = threading.Lock()
+SESSION_TTL_SECONDS = 12 * 3600  # opportunistically pruned after 12h
+_SESSION_SWEEP_COUNTER = 0
+
+# FAILED_LOGINS keyed by (client_ip, username) -> [first_failure_ts, count]
+FAILED_LOGINS = {}
+_FAILED_LOGINS_LOCK = threading.Lock()
+RATE_LIMIT_MAX_FAILURES = 5
+RATE_LIMIT_WINDOW_SECONDS = 15 * 60
+
+# Paths that never require a server-side session: login/logout, public QR
+# reports, shared reports, static assets, and the letterhead/logo/signature
+# images referenced by report HTML. Anything reachable from the login page
+# or a public/shared report link stays open.
+PUBLIC_PATH_PREFIXES = (
+    "/login",
+    "/logout",
+    "/public-report/",
+    "/shared-report/",
+    "/static/",
+    "/letterhead.png",
+    "/logo.png",
+    "/signature.png",
+    "/bg-lab.png",
+    "/favicon.ico",
+)
+
+# Printable report HTML must render byte-identical for PDF/print correctness,
+# so the UI design-system CSS + toast banner are never injected on these.
+UI_INJECTION_SKIP_PREFIXES = (
+    "/public-report/",
+    "/shared-report/",
+    "/print-report/",
+    "/report-download/",
+    "/report-view/",
+    "/report-letterhead-preview/",
+)
+
+
+def _is_public_path(path: str) -> bool:
+    if path == "/":
+        return True
+    return path.startswith(PUBLIC_PATH_PREFIXES)
+
+
+def _prune_expired_sessions_locked() -> None:
+    """Caller must hold _SESSIONS_LOCK. Sweeps the store every 25 lookups."""
+    global _SESSION_SWEEP_COUNTER
+    _SESSION_SWEEP_COUNTER += 1
+    if _SESSION_SWEEP_COUNTER % 25 != 0:
+        return
+    now = time.time()
+    expired = [
+        t for t, e in SESSIONS.items()
+        if now - e.get("created_at", 0) > SESSION_TTL_SECONDS
+    ]
+    for t in expired:
+        SESSIONS.pop(t, None)
+
+
+def _get_session(token):
+    """Return the session dict for a token, or None if missing/expired."""
+    if not token:
+        return None
+    with _SESSIONS_LOCK:
+        _prune_expired_sessions_locked()
+        entry = SESSIONS.get(token)
+        if entry is None:
+            return None
+        if time.time() - entry.get("created_at", 0) > SESSION_TTL_SECONDS:
+            SESSIONS.pop(token, None)
+            return None
+        return entry
+
+
 app = FastAPI(lifespan=lifespan)
 
 # Static files folder configuration
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# -------------------------------------------------------------
+# Root-level image assets. letterhead.png, logo.png, and signature.png
+# live directly alongside main.py (not inside /static), so they need
+# their own explicit routes rather than relying on the StaticFiles
+# mount below. FileResponse 404s cleanly if a file is ever missing,
+# instead of crashing the app - same defensive pattern used elsewhere
+# in this file for optional assets.
+def _root_image_response(filename: str):
+    path = os.path.join(BASE_DIR, filename)
+    if not os.path.isfile(path):
+        return HTMLResponse(f"<h3>{filename} not found on server.</h3>", status_code=404)
+    return FileResponse(path)
+
+
+@app.get("/letterhead.png")
+def serve_letterhead_png():
+    return _root_image_response("letterhead.png")
+
+
+@app.get("/logo.png")
+def serve_logo_png():
+    return _root_image_response("logo.png")
+
+
+@app.get("/signature.png")
+def serve_signature_png():
+    return _root_image_response("signature.png")
+
+
+@app.get("/bg-lab.png")
+def serve_bg_lab_png():
+    return _root_image_response("bg-lab.png")
+
+
 # Guarded: Vercel's deployment root is read-only, so os.makedirs() can
 # raise there. We swallow that, and only mount /static if a directory
 # actually ends up existing (e.g. bundled in the repo already) - this
@@ -384,76 +502,12 @@ PERMISSIONS = {
     "manage_users":  "Manage Users",
     "share_reports": "Share Reports",
     "print_settings":"Print Layout Settings",
+    "can_cancel_bills": "Cancel Bills",
+    "can_view_reports":  "View Reports",
+    "can_edit_results":  "Edit Results",
+    "can_edit_patients": "Edit Patient Details",
+    "can_manage_users":  "Manage Users (Granular)",
 }
-
-# -------------------------------------------------------------
-# GRANULAR PERMISSION FLAGS (dedicated integer columns on `users`)
-# -------------------------------------------------------------
-# These are stored as real INTEGER columns rather than inside the
-# comma-separated `permissions` text column above, and - critically -
-# they are always read back FROM THE DATABASE at check time, never from
-# a cookie. See the note on get_user_flags() below for why that matters.
-#
-# Shape: column_name -> (checkbox label, default value for new users)
-GRANULAR_PERMISSIONS = {
-    "can_cancel_bills":  ("🚫 Special Permission: Allow Bill Cancellation", 0),
-    "can_view_reports":  ("📊 View Sales Analytics & Financial Summaries", 0),
-    "can_edit_results":  ("🧪 Enter / Modify Test Results", 1),
-    "can_edit_patients": ("👤 Update Patient Profile Details", 1),
-    "can_manage_users":  ("👥 Access User Management", 0),
-}
-
-# The primary super-admin account. This username is hidden from every
-# user-management listing and can never be edited or deleted through the
-# UI, but always retains unrestricted access when logged in.
-SUPER_ADMIN_USERNAME = "admin"
-
-
-def is_super_admin(user: dict) -> bool:
-    """True for the built-in primary admin account only."""
-    return (user or {}).get("username", "").strip().lower() == SUPER_ADMIN_USERNAME
-
-
-# -------------------------------------------------------------
-# PASSWORD HASHING (stdlib-only PBKDF2-HMAC-SHA256, no passlib/bcrypt
-# dependency required) + legacy-plaintext auto-migration on login.
-# -------------------------------------------------------------
-_PBKDF2_ITERATIONS = 260000
-
-
-def hash_password(password: str) -> str:
-    """Self-describing hash string so a future algorithm change stays
-    backward compatible: 'pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>'."""
-    salt = secrets.token_bytes(16)
-    derived = hashlib.pbkdf2_hmac("sha256", (password or "").encode("utf-8"), salt, _PBKDF2_ITERATIONS)
-    return f"pbkdf2_sha256${_PBKDF2_ITERATIONS}${salt.hex()}${derived.hex()}"
-
-
-def is_hashed_password(stored: str) -> bool:
-    return isinstance(stored, str) and stored.startswith("pbkdf2_sha256$")
-
-
-def verify_password(stored: str, provided: str) -> bool:
-    """Verifies `provided` against `stored`, whether `stored` is already
-    one of our pbkdf2_sha256$... hashes or (for not-yet-migrated legacy
-    rows) a plain-text password. Never raises on malformed stored values -
-    just fails closed. Uses a constant-time comparison for the actual
-    hash/plaintext check to avoid timing side channels."""
-    if not stored or provided is None:
-        return False
-    if is_hashed_password(stored):
-        try:
-            _, iterations_str, salt_hex, hash_hex = stored.split("$", 3)
-            iterations = int(iterations_str)
-            salt = bytes.fromhex(salt_hex)
-            expected = bytes.fromhex(hash_hex)
-        except (ValueError, TypeError):
-            return False
-        derived = hashlib.pbkdf2_hmac("sha256", provided.encode("utf-8"), salt, iterations)
-        return secrets.compare_digest(derived, expected)
-    # Legacy plaintext row - direct comparison. The caller (login_post)
-    # re-hashes and saves the upgraded value on a successful match.
-    return secrets.compare_digest(stored, provided)
 
 # -------------------------------------------------------------
 # PRINT LAYOUT SETTINGS (dashboard-configurable report styling)
@@ -476,14 +530,11 @@ DEFAULT_PRINT_SETTINGS = {
     "fia_margin_left_px": 0,
     "fia_margin_right_px": 0,
     "category_note_font_size": 10,
-    # Signature image fine-tuning (admin-adjustable from Print Settings).
-    # Negative margins are intentionally allowed so the gap between the
-    # signature image and the name/details below it can be tightened.
-    "sig_margin_top_px": -45,
-    "sig_margin_bottom_px": -32,
-    "sig_margin_left_px": 10,
+    "sig_margin_top_px": 0,
+    "sig_margin_bottom_px": -30,
+    "sig_margin_left_px": 0,
     "sig_margin_right_px": 0,
-    "sig_img_height_px": 135,
+    "sig_img_height_px": 60,
 }
 
 
@@ -532,11 +583,85 @@ def _clamp(value, lo, hi, default):
 # is (or isn't) stored in their `permissions` column.
 FULL_ACCESS_ROLES = {"owner", "admin"}
 
+# The bootstrap/primary administrator account. This account is hidden from
+# the user-management table and cannot be edited or deleted through the UI,
+# so an operator can never lock everyone out of the system by removing it.
+PROTECTED_ADMIN_USERNAME = "admin"
+
+# -------------------------------------------------------------
+# PASSWORD HASHING (PBKDF2-HMAC-SHA256)
+# -------------------------------------------------------------
+# Stored format:  pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>
+# Any stored value NOT matching that prefix is treated as a legacy
+# plaintext password: it still authenticates (so nobody is locked out by
+# the upgrade), and is transparently re-written as a hash on the next
+# successful login. See migrate_legacy_password_if_needed().
+PBKDF2_ALGORITHM = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 240_000
+
+
+def hash_password(password: str, *, salt: bytes = None, iterations: int = PBKDF2_ITERATIONS) -> str:
+    """Derive a salted PBKDF2-HMAC-SHA256 hash for storage."""
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, iterations)
+    return f"{PBKDF2_ALGORITHM}${iterations}${salt.hex()}${derived.hex()}"
+
+
+def is_password_hashed(stored: str) -> bool:
+    return str(stored or "").startswith(PBKDF2_ALGORITHM + "$")
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Constant-time verification. Accepts both hashed values and legacy
+    plaintext, so existing accounts keep working until migrated."""
+    stored_str = str(stored or "")
+    if not stored_str:
+        return False
+
+    if not is_password_hashed(stored_str):
+        # Legacy plaintext row - compare in constant time anyway.
+        return hmac.compare_digest(str(password or ""), stored_str)
+
+    try:
+        _algo, iter_str, salt_hex, hash_hex = stored_str.split("$", 3)
+        iterations = int(iter_str)
+        salt = bytes.fromhex(salt_hex)
+    except (ValueError, TypeError):
+        return False
+
+    candidate = hashlib.pbkdf2_hmac("sha256", str(password or "").encode("utf-8"), salt, iterations)
+    try:
+        return hmac.compare_digest(candidate.hex(), hash_hex)
+    except (TypeError, ValueError):
+        return False
+
+
+def migrate_legacy_password_if_needed(cursor, user_id, password: str, stored: str) -> bool:
+    """Upgrade a verified legacy plaintext password to PBKDF2 in place.
+    Returns True when a migration was written. Best-effort: a failure here
+    must never block an otherwise-valid login."""
+    if is_password_hashed(stored):
+        return False
+    try:
+        cursor.execute(
+            "UPDATE users SET password = ? WHERE id = ?",
+            (hash_password(password), user_id)
+        )
+        return True
+    except Exception:
+        return False
+
 
 def get_current_user(request: Request):
     """Reads the username/role/permissions cookies set at login and returns
     a small dict describing the logged-in user. Never raises - callers get
-    a safe "no access" shape if cookies are missing/malformed."""
+    a safe "no access" shape if cookies are missing/malformed.
+
+    NOTE: cookies are client-supplied and therefore untrusted for
+    authorization decisions. Use user_can() for anything that grants
+    access; this helper is for display/context only.
+    """
     username = request.cookies.get("username", "")
     role = (request.cookies.get("role", "") or "").strip()
     perms_raw = request.cookies.get("permissions", "") or ""
@@ -544,85 +669,75 @@ def get_current_user(request: Request):
     return {"username": username, "role": role, "permissions": permissions}
 
 
+def user_can(request: Request, permission_key: str) -> bool:
+    """Authoritative permission check, verified against the DATABASE.
+
+    The role/permissions cookies are set at login and are fully editable by
+    the client - anyone could previously grant themselves any permission by
+    changing a cookie value. This resolves the username cookie to the real
+    users row on every call and reads role/permissions from there, so the
+    cookie can only ever identify *who* is asking, never *what they may do*.
+
+    Fails closed: unknown user, missing row, or any DB error -> False.
+    """
+    username = (request.cookies.get("username", "") or "").strip()
+    if not username:
+        return False
+
+    # The bootstrap admin login has no users row; it is full-access by
+    # definition and is the one account that cannot be revoked.
+    if username == PROTECTED_ADMIN_USERNAME:
+        return True
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT role, permissions FROM users WHERE username = ? LIMIT 1", (username,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+
+        try:
+            db_role = (row["role"] or "").strip().lower()
+        except Exception:
+            db_role = ""
+        if db_role in FULL_ACCESS_ROLES:
+            return True
+
+        try:
+            perms_raw = row["permissions"] or ""
+        except Exception:
+            perms_raw = ""
+        return permission_key in {p for p in str(perms_raw).split(",") if p}
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def user_has_access(user: dict, permission_key: str) -> bool:
     """Owner/Admin roles always have full access. Everyone else needs the
-    specific permission key present in their granted permissions."""
+    specific permission key present in their granted permissions.
+
+    Legacy cookie-based helper, kept so existing call sites keep working.
+    Prefer user_can(request, key) for new checks.
+
+    FIX: the built-in super admin always passes, regardless of what role is
+    stored in the DB or cookie. Without this, if the admin row's role column
+    is missing/NULL (common on databases created before the role UPDATE was
+    added), every cookie-based permission check fails with Access Denied.
+    """
+    if (user.get("username") or "").strip().lower() == PROTECTED_ADMIN_USERNAME:
+        return True
     role_lower = (user.get("role") or "").strip().lower()
     if role_lower in FULL_ACCESS_ROLES:
         return True
     return permission_key in user.get("permissions", set())
-
-
-def get_user_flags(username: str) -> dict:
-    """
-    Reads the granular permission columns for `username` straight from the
-    database.
-
-    Deliberately NOT cookie-based. get_current_user() above reads role and
-    permissions from cookies, which the browser owns and a user can edit
-    freely - anyone could set role=owner and bypass every check. For a
-    high-consequence permission like bill cancellation that is not good
-    enough, so these flags are always re-read from the users table at the
-    moment of the check. The cookie is only used to say *which* user to
-    look up, never what they are allowed to do.
-
-    Returns the defaults from GRANULAR_PERMISSIONS if the user row or
-    column is missing, so an older database degrades safely instead of
-    raising.
-    """
-    flags = {col: default for col, (_label, default) in GRANULAR_PERMISSIONS.items()}
-    username = (username or "").strip()
-    if not username:
-        return {col: 0 for col in GRANULAR_PERMISSIONS}
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE username = ? LIMIT 1", (username,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            row_keys = row.keys()
-            for col in GRANULAR_PERMISSIONS:
-                if col in row_keys and row[col] is not None:
-                    flags[col] = int(row[col] or 0)
-    except Exception:
-        pass
-    return flags
-
-
-def user_can(user: dict, flag_column: str) -> bool:
-    """
-    Granular permission check for a single `users.<flag_column>` column.
-
-    Order of precedence:
-      1. The primary super admin always passes.
-      2. Owner/Admin roles always pass (consistent with user_has_access).
-      3. Otherwise the flag must be 1 in the database.
-    """
-    if is_super_admin(user):
-        return True
-    if (user.get("role") or "").strip().lower() in FULL_ACCESS_ROLES:
-        return True
-    return bool(get_user_flags(user.get("username", "")).get(flag_column, 0))
-
-
-def user_can_or_legacy(user: dict, flag_column: str, permission_key: str) -> bool:
-    """
-    Passes if EITHER the new granular flag is set OR the user already holds
-    the equivalent legacy permission key.
-
-    This matters on deploy: the new columns are added with DEFAULT 0, so
-    every pre-existing user starts with can_view_reports = 0 and
-    can_manage_users = 0. Gating those screens on the flag alone would
-    instantly lock out staff who legitimately have access today. The OR
-    keeps them working until an admin ticks the new boxes, while still
-    letting the flag grant access on its own.
-
-    Bill cancellation deliberately does NOT use this - it is checked with
-    user_can() alone, because tightening that specific action is the point
-    of the feature.
-    """
-    return user_can(user, flag_column) or user_has_access(user, permission_key)
 
 
 def render_locked_page(feature_label: str) -> HTMLResponse:
@@ -743,9 +858,10 @@ LOGOUT_SYNC_SCRIPT = """
 </script>
 """
 
-# Public (no-login) QR report pages. They must never run the staff
-# logout-sync script and must never emit a Set-Cookie header.
-PUBLIC_REPORT_PATH_PREFIXES = ("/public-report/",)
+# Public (no-login) report endpoints. These must never run the staff
+# logout-sync script (it bounces visitors without a staff cookie to /login),
+# and must never emit a Set-Cookie header.
+PUBLIC_REPORT_PATH_PREFIXES = ("/public-report/", "/shared-report/")
 
 PUBLIC_REPORT_HEADERS = {
     "Cache-Control": "no-store, max-age=0",
@@ -755,79 +871,84 @@ PUBLIC_REPORT_HEADERS = {
     "X-Content-Type-Options": "nosniff",
 }
 
-
-# -------------------------------------------------------------
-# SESSION STORE + LOGIN RATE LIMIT (in-memory, zero schema change)
-# Server-side sessions keyed by a random opaque token stored in an
-# httponly cookie. No DB columns are added; existing plaintext
-# passwords are auto-hashed on first successful login (see login_post).
-# -------------------------------------------------------------
-SESSION_TTL_SECONDS = 12 * 3600  # 12 hours
-_sessions: dict = {}
-_sessions_lock = threading.Lock()
-# key: (client_ip, username_lower) -> {"count": int, "first_ts": float}
-_failed_logins: dict = {}
-
-LOGIN_RATE_LIMIT_MAX = 5
-LOGIN_RATE_LIMIT_WINDOW = 900  # 15 minutes
-
-
-def _create_session(username: str) -> str:
-    token = secrets.token_urlsafe(32)
-    now = time.time()
-    with _sessions_lock:
-        _sessions[token] = {"username": username, "created": now, "expires": now + SESSION_TTL_SECONDS}
-    return token
-
-
-def _get_session(token: str):
-    """Return session dict if valid, else None. Expired entries are removed."""
-    if not token:
-        return None
-    with _sessions_lock:
-        sess = _sessions.get(token)
-        if sess is None:
-            return None
-        if time.time() > sess["expires"]:
-            _sessions.pop(token, None)
-            return None
-        return sess
+# Shared UI design system (additive). Injected into app-chrome HTML pages
+# only (never into printable/public reports). Element-level selectors with
+# no !important, so existing inline styles continue to win.
+UI_DESIGN_SYSTEM_CSS = """
+<style>
+:root {
+  --primary: #0d47a1;
+  --primary-light: #1976d2;
+  --primary-dark: #08306b;
+  --accent: #00acc1;
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --text: #1f2937;
+  --border: #e2e8f0;
+  --radius: 10px;
+  --shadow: 0 2px 8px rgba(13, 71, 161, 0.10);
+  --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body { font-family: var(--font-stack); background: var(--bg); color: var(--text); margin: 0; }
+button, input, select, textarea { font-family: inherit; font-size: inherit; }
+input[type="text"], input[type="password"], input[type="number"], input[type="date"],
+input[type="tel"], input[type="email"], select, textarea { border-radius: var(--radius); }
+button, input[type="submit"], input[type="button"] { border-radius: var(--radius); cursor: pointer; }
+table { border-collapse: collapse; }
+a { color: var(--primary); }
+.app-toast { position: relative; padding: 12px 44px 12px 16px; margin: 0; border-radius: var(--radius);
+  font-weight: 500; box-shadow: var(--shadow); }
+.app-toast--success { background: #e8f5e9; color: #1b5e20; border: 1px solid #a5d6a7; }
+.app-toast--error { background: #ffebee; color: #b71c1c; border: 1px solid #ef9a9a; }
+.app-toast-close { position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  cursor: pointer; font-size: 18px; line-height: 1; }
+</style>
+""".strip()
 
 
-def _pop_session(token: str) -> None:
-    if not token:
-        return
-    with _sessions_lock:
-        _sessions.pop(token, None)
+def _inject_ui_design_system(body_text: str, request: Request) -> str:
+    """Inject the shared CSS into <head> and a toast banner (from ?msg=,
+    ?updated=, ?error=) right after <body>. Best-effort: if no <head>/<body>
+    tag is present, that injection is skipped. Caller skips printable
+    report paths and redirects before calling this."""
+    if re.search(r"<head[^>]*>", body_text, re.IGNORECASE):
+        body_text = re.sub(
+            r"<head[^>]*>",
+            lambda m: m.group(0) + UI_DESIGN_SYSTEM_CSS,
+            body_text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
 
+    toast_text = None
+    toast_type = None
+    _err = request.query_params.get("error")
+    _msg = request.query_params.get("msg") or request.query_params.get("updated")
+    if _err:
+        toast_text = _err
+        toast_type = "error"
+    elif _msg:
+        toast_text = _msg
+        toast_type = "success"
 
-def _login_rate_limited(client_ip: str, username: str) -> bool:
-    """True if this (ip, username) has >= LOGIN_RATE_LIMIT_MAX failures
-    inside the current window."""
-    key = (client_ip, (username or "").strip().lower())
-    now = time.time()
-    with _sessions_lock:
-        rec = _failed_logins.get(key)
-        if rec and rec["count"] >= LOGIN_RATE_LIMIT_MAX and (now - rec["first_ts"]) < LOGIN_RATE_LIMIT_WINDOW:
-            return True
-    return False
-
-
-def _record_failed_login(client_ip: str, username: str) -> None:
-    key = (client_ip, (username or "").strip().lower())
-    now = time.time()
-    with _sessions_lock:
-        rec = _failed_logins.get(key)
-        if rec is None or (now - rec["first_ts"]) >= LOGIN_RATE_LIMIT_WINDOW:
-            _failed_logins[key] = {"count": 1, "first_ts": now}
-        else:
-            rec["count"] += 1
-
-
-def _clear_failed_login(client_ip: str, username: str) -> None:
-    key = (client_ip, (username or "").strip().lower())
-    with _sessions_lock:
-        _failed_logins.pop(key, None)
+    if toast_text and re.search(r"<body[^>]*>", body_text, re.IGNORECASE):
+        safe = html.escape(toast_text)
+        banner = (
+            f'<div class="app-toast app-toast--{toast_type}" onclick="this.remove()">'
+            f"{safe}"
+            f'<span class="app-toast-close" onclick="this.parentElement.remove()">&times;</span>'
+            f"</div>"
+        )
+        body_text = re.sub(
+            r"<body[^>]*>",
+            lambda m: m.group(0) + banner,
+            body_text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    return body_text
 
 
 @app.middleware("http")
@@ -835,7 +956,7 @@ async def inject_logout_sync(request: Request, call_next):
     response = await call_next(request)
 
     if request.url.path.startswith(PUBLIC_REPORT_PATH_PREFIXES):
-        # A public report response can NEVER create a session.
+        # Defense in depth: a public report response can NEVER create a session.
         response.raw_headers[:] = [
             (k, v) for (k, v) in response.raw_headers if k.lower() != b"set-cookie"
         ]
@@ -849,6 +970,13 @@ async def inject_logout_sync(request: Request, call_next):
     if body is not None and "text/html" in content_type:
         try:
             body_text = body.decode("utf-8")
+            # Additive UI unification: inject design-system CSS + toast
+            # banner on app-chrome pages only. Redirects, streaming/PDF
+            # responses (body is None), and printable/public reports are
+            # skipped so their rendered output is unchanged.
+            _is_redirect = 300 <= getattr(response, "status_code", 0) < 400
+            if not _is_redirect and not request.url.path.startswith(UI_INJECTION_SKIP_PREFIXES):
+                body_text = _inject_ui_design_system(body_text, request)
             marker = "</body>"
             if marker in body_text.lower():
                 idx = body_text.lower().rfind(marker)
@@ -865,198 +993,79 @@ async def inject_logout_sync(request: Request, call_next):
     return response
 
 
-# -------------------------------------------------------------
-# AUTH MIDDLEWARE (added AFTER inject_logout_sync): server-side
-# session enforcement. Legacy username/role/permissions cookies are
-# still read by get_current_user() inside routes (untouched); this
-# middleware adds a server-verified session and sets request.state.user
-# from the DB (never from cookies).
-# CSRF: the session_token cookie is SameSite=Strict (set at login),
-# which blocks cross-site POST submissions. Per-form CSRF tokens are a
-# recommended next step but are NOT injected here, to avoid breaking
-# the 28 existing HTML pages/forms.
-# -------------------------------------------------------------
-PUBLIC_PATHS = {"/", "/login", "/logout", "/favicon.ico"}
-PUBLIC_PREFIXES = ("/public-report", "/shared-report", "/static", "/docs", "/openapi.json", "/redoc")
-
-
 @app.middleware("http")
-async def session_auth_middleware(request: Request, call_next):
-    path = request.url.path
-
-    # Logout: invalidate the server-side session token. The logout
-    # route's signature is fixed (no Request parameter), so we do it
-    # here in addition to its existing cookie clearing.
-    if path == "/logout":
-        _pop_session(request.cookies.get("session_token"))
+async def require_server_session(request: Request, call_next):
+    # Decorated AFTER inject_logout_sync, so Starlette runs this INNERMOST
+    # (first on request, last on response). A 303/401 here short-circuits
+    # the body-injection middleware above. OPTIONS and public paths pass
+    # through without a session.
+    if request.method == "OPTIONS":
         return await call_next(request)
 
-    if path in PUBLIC_PATHS or any(path.startswith(p) for p in PUBLIC_PREFIXES):
+    if _is_public_path(request.url.path):
         return await call_next(request)
 
-    token = request.cookies.get("session_token")
-    sess = _get_session(token)
-    if sess is None:
-        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
-            return JSONResponse(status_code=401, content={"error": "unauthorized"})
-        return RedirectResponse(url="/login", status_code=302)
+    session = _get_session(request.cookies.get("session_token"))
+    if session is None:
+        accept = request.headers.get("accept", "")
+        if request.url.path.startswith("/api/") or "application/json" in accept:
+            return StarletteResponse(
+                content=b'{"detail":"Authentication required"}',
+                status_code=401,
+                media_type="application/json",
+            )
+        return RedirectResponse(url="/login", status_code=303)
 
-    # Valid session: look up the user from the DB (never trust cookies
-    # for role/permissions). This is a new query added by the security
-    # hardening; no existing query is modified.
-    row = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE username = ?", (sess["username"],))
-        row = cursor.fetchone()
-        conn.close()
-    except Exception:
-        row = None
-
-    if row is None:
-        # User no longer exists; kill the stale session.
-        _pop_session(token)
-        if request.method in ("POST", "PUT", "DELETE", "PATCH"):
-            return JSONResponse(status_code=401, content={"error": "unauthorized"})
-        return RedirectResponse(url="/login", status_code=302)
-
-    request.state.user = {
-        "username": row["username"],
-        "role": row["role"] or "",
-        "permissions": {p for p in (row["permissions"] or "").split(",") if p},
-        "flags": {c: int(row[c] or 0) for c in GRANULAR_PERMISSIONS if c in row.keys() and row[c] is not None},
-    }
     return await call_next(request)
 
 
-# -------------------------------------------------------------
-# UI-UNIFICATION MIDDLEWARE: post-processes HTML responses to inject
-# a consistent design system (CSS variables + base styles), a toast
-# banner driven by URL params (msg/updated/error/saved), and replaces
-# the two known off-primary hex colors (#0f4c81, #1b2559) with the
-# canonical #0d47a1 in inline style/bgcolor attributes. Zero route
-# changes. Print/public/download pages are skipped so their exact
-# layout is preserved.
-# -------------------------------------------------------------
-_SKIP_HTML_REWRITE_PREFIXES = (
-    "/print-report", "/report-download", "/report-letterhead-preview",
-    "/public-report", "/shared-report",
-)
-
-_UNIFY_CSS = """<style>
-:root{--primary:#0d47a1;--primary-dark:#08306b;--accent:#1565c0;--bg:#f4f6fb;--card-bg:#ffffff;--text:#1a2332;--text-muted:#5a6b82;--border:#d8e0ec;}
-*{box-sizing:border-box;}
-body{font-family:system-ui,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);margin:0;}
-h1,h2,h3{color:var(--primary);font-weight:600;}
-.card{background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:20px;margin:12px 0;box-shadow:0 1px 3px rgba(13,71,161,.08);}
-table{border-collapse:collapse;width:100%;}
-th{background:var(--primary);color:#fff;padding:10px 12px;text-align:left;font-weight:600;}
-td{padding:8px 12px;border-bottom:1px solid var(--border);}
-input,select,textarea{font-family:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--text);}
-button,.btn{background:var(--primary);color:#fff;border:none;border-radius:6px;padding:9px 18px;font-size:14px;cursor:pointer;font-family:inherit;display:inline-block;text-decoration:none;}
-button:hover,.btn:hover{background:var(--primary-dark);}
-a.btn{text-decoration:none;color:#fff;}
-#__toast_container{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;gap:8px;align-items:center;}
-.__toast{padding:12px 22px;border-radius:8px;color:#fff;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,.18);cursor:pointer;max-width:90vw;}
-.__toast_success{background:#2e7d32;}
-.__toast_info{background:#1565c0;}
-.__toast_error{background:#c62828;}
-</style>"""
-
-_UNIFY_SCRIPT = """<div id="__toast_container"></div>
-<script>
-(function(){
-  var params=new URLSearchParams(window.location.search);
-  var msg=params.get('msg')||params.get('saved')||params.get('updated');
-  var err=params.get('error');
-  var container=document.getElementById('__toast_container');
-  function show(text,cls){
-    if(!text||!container)return;
-    var el=document.createElement('div');
-    el.className='__toast '+cls;
-    el.textContent=text;
-    el.title='Click to dismiss';
-    el.onclick=function(){el.remove();};
-    container.appendChild(el);
-    setTimeout(function(){if(el.parentNode)el.remove();},4000);
-  }
-  if(err){show(err,'__toast_error');}
-  else if(msg){show(msg,'__toast_success');}
-  document.addEventListener('DOMContentLoaded',function(){
-    var bad=['#0f4c81','#1b2559'];
-    function fix(s){
-      if(!s)return s;
-      for(var i=0;i<bad.length;i++){
-        s=s.replace(new RegExp(bad[i],'gi'),'#0d47a1');
-      }
-      return s;
-    }
-    var all=document.querySelectorAll('*');
-    for(var i=0;i<all.length;i++){
-      var el=all[i];
-      if(el.getAttribute){
-        var st=el.getAttribute('style');
-        if(st){el.setAttribute('style',fix(st));}
-        var bg=el.getAttribute('bgcolor');
-        if(bg){el.setAttribute('bgcolor',fix(bg));}
-      }
-    }
-  });
-})();
-</script>"""
+# =============================================================
+# APP SHELL (ported from the lab 1 update): shared header + grouped
+# left sidebar for every authenticated page. Uses THIS lab's own
+# session / permission system - nothing in login or permissions changed.
+# =============================================================
+def is_super_admin(user: dict) -> bool:
+    """True for the built-in primary admin account only."""
+    return (user or {}).get("username", "").strip().lower() == PROTECTED_ADMIN_USERNAME
 
 
-@app.middleware("http")
-async def ui_unify_middleware(request: Request, call_next):
-    response = await call_next(request)
-    path = request.url.path
-    if response.status_code != 200:
-        return response
-    content_type = response.headers.get("content-type", "")
-    if not content_type.startswith("text/html"):
-        return response
-    if any(path.startswith(p) for p in _SKIP_HTML_REWRITE_PREFIXES):
-        return response
-    if response.headers.get("content-disposition", "").startswith("attachment"):
-        return response
-    body = getattr(response, "body", None)
-    if body is None:
-        return response
+def _shell_user_from_request(request: Request):
+    """Builds the user dict the shell needs from the SERVER-SIDE session and
+    the users table (never from client cookies). Returns None when there is
+    no valid session."""
     try:
-        body_text = body.decode("utf-8")
-        lower = body_text.lower()
-        # (a) inject design-system CSS right before </head>
-        idx = lower.rfind("</head>")
-        if idx != -1:
-            body_text = body_text[:idx] + _UNIFY_CSS + body_text[idx:]
-        # (b)+(c) inject toast container + hex-unify script after <body>
-        bidx = lower.find("<body")
-        insert_at = -1
-        if bidx != -1:
-            gt = lower.find(">", bidx)
-            if gt != -1:
-                insert_at = gt + 1
-        if insert_at != -1:
-            body_text = body_text[:insert_at] + _UNIFY_SCRIPT + body_text[insert_at:]
-        body_bytes = body_text.encode("utf-8")
-        response.body = body_bytes
-        response.headers["content-length"] = str(len(body_bytes))
+        sess = _get_session(request.cookies.get("session_token"))
+        if not sess:
+            return None
+        username = (sess.get("username") or "").strip()
+        role, perms = "", set()
+        if username.strip().lower() == PROTECTED_ADMIN_USERNAME:
+            role = "owner"
+        else:
+            conn = None
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT role, permissions FROM users WHERE username = ? LIMIT 1", (username,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                role = (row["role"] or "").strip()
+                perms = {p for p in str(row["permissions"] or "").split(",") if p}
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        # In this build the granular flags (can_view_reports, can_cancel_bills,
+        # ...) live inside the permissions list, so they double as the flags.
+        return {"username": username, "role": role, "permissions": perms,
+                "flags": {p: 1 for p in perms}}
     except Exception:
-        pass
-    return response
+        return None
 
 
-# -------------------------------------------------------------
-# APP SHELL: one shared header + grouped left sidebar for EVERY page
-# -------------------------------------------------------------
-# The dashboard owns its own full layout (see _DASHBOARD_TEMPLATE) but
-# builds its header/sidebar from the same functions below. Every other
-# authenticated HTML page is wrapped by `app_shell_middleware` so that
-# all 30+ legacy pages get the same look, the same left sidebar, and no
-# more "Back to Dashboard" buttons - without rewriting each route.
-
-# (key, label, icon, href, legacy_permission_key, granular_flag_column)
 _SHELL_NAV = [
     ("Main", [
         ("dashboard", "Dashboard", "fa-house", "/dashboard", None, None),
@@ -1083,7 +1092,6 @@ _SHELL_NAV = [
     ]),
 ]
 
-# Which sidebar item is "active" for which URL path (first match wins).
 _SHELL_MATCH = [
     ("sales", ("/reports/sales-analytics",)),
     ("reports", ("/reports",)),
@@ -1100,154 +1108,6 @@ _SHELL_MATCH = [
     ("dashboard", ("/dashboard",)),
 ]
 
-
-def _shell_can(user: dict, perm, flag) -> bool:
-    """Used ONLY to decide which sidebar links to show. Real access control
-    still happens inside every route - hiding a link is never security."""
-    if perm is None and flag is None:
-        return True
-    if is_super_admin(user):
-        return True
-    if (user.get("role") or "").strip().lower() in FULL_ACCESS_ROLES:
-        return True
-    if perm and perm in (user.get("permissions") or set()):
-        return True
-    if flag and (user.get("flags") or {}).get(flag):
-        return True
-    return False
-
-
-def _shell_active_key(path: str, query: str) -> str:
-    q = query or ""
-    if path == "/patients-dashboard" and "tab=cancel_bills" in q:
-        return "cancel"
-    if path == "/reports" and "report_type=pricelist" in q:
-        return "pricelist"
-    for key, prefixes in _SHELL_MATCH:
-        for p in prefixes:
-            if path == p or path.startswith(p + "/"):
-                return key
-    return ""
-
-
-def _shell_nav_item(key: str):
-    for _sec, items in _SHELL_NAV:
-        for it in items:
-            if it[0] == key:
-                return it
-    return None
-
-
-def _shell_header_html(user: dict) -> str:
-    raw = (user.get("username") or "").strip() or "User"
-    name = html.escape(raw[:1].upper() + raw[1:])
-    role = html.escape((user.get("role") or "").strip() or "User")
-
-    new_btn = ""
-    if _shell_can(user, "add_patient", None):
-        new_btn = ('<a href="/add-patient" class="ms-newpt" title="Register a new patient (Alt+N)">'
-                   '<i class="fa-solid fa-user-plus"></i><span>New Patient</span></a>')
-
-    menu_links = ""
-    if _shell_can(user, "manage_users", "can_manage_users"):
-        menu_links += '<a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>'
-    if _shell_can(user, "print_settings", None):
-        menu_links += '<a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>'
-    menu_links += '<a href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>'
-
-    return f"""<header class="ms-header">
-  <div class="ms-brand">
-    <button class="ms-burger" id="msBurger" type="button" aria-label="Menu"><i class="fa-solid fa-bars"></i></button>
-    <a href="/dashboard" class="ms-brandlink">
-      <div class="ms-logo"><i class="fa-solid fa-flask-vial"></i></div>
-      <div class="ms-brandtxt"><h1>MEDISTAR MEDICAL LABORATORY</h1><p>Patient &amp; Laboratory Report Management System</p></div>
-    </a>
-  </div>
-  <div class="ms-hright">
-    <form class="ms-search" action="/patients-dashboard" method="get" role="search">
-      <i class="fa-solid fa-magnifying-glass"></i>
-      <input type="text" name="search" id="msGlobalSearch" placeholder="Search patient name or ref no..." autocomplete="off">
-      <kbd>/</kbd>
-    </form>
-    <div class="ms-clock">
-      <i class="fa-regular fa-clock"></i>
-      <div><b id="msClock">--:--:--</b><span id="msClockDate">&nbsp;</span></div>
-    </div>
-    {new_btn}
-    <div class="ms-theme">
-      <i class="fa-solid fa-sun"></i>
-      <select id="themeSwitcher" onchange="changeTheme(this.value)" aria-label="Theme">
-        <option value="light">Classic Blue</option>
-        <option value="dark">Dark Mode</option>
-        <option value="emerald">Emerald Green</option>
-      </select>
-    </div>
-    <div class="ms-user" id="msUser">
-      <button class="ms-user-btn" id="msUserBtn" type="button">
-        <span class="ms-avatar"><i class="fa-solid fa-circle-user"></i></span>
-        <span class="nm">{name}</span>
-        <i class="fa-solid fa-chevron-down" style="font-size: 11px;"></i>
-      </button>
-      <div class="ms-user-menu" id="msUserMenu">
-        <div class="ms-um-head"><b>{name}</b><span>{role}</span></div>
-        {menu_links}
-      </div>
-    </div>
-    <a href="/logout" class="ms-logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
-  </div>
-</header>"""
-
-
-def _shell_sidebar_html(user: dict, active: str) -> str:
-    parts = []
-    for sec, items in _SHELL_NAV:
-        links = []
-        for key, label, icon, href, perm, flag in items:
-            if not _shell_can(user, perm, flag):
-                continue
-            cls = ' class="active"' if key == active else ""
-            esc = html.escape(label)
-            links.append(f'<a href="{href}"{cls} title="{esc}"><i class="fa-solid {icon}"></i><span class="lbl">{esc}</span></a>')
-        if links:
-            parts.append(f'<div class="ms-sec"><span>{sec}</span></div>' + "".join(links))
-    return (
-        '<aside class="ms-sidebar" id="msSidebar">'
-        '<div class="ms-mobile-only ms-m-tools">'
-        '<form action="/patients-dashboard" method="get"><i class="fa-solid fa-magnifying-glass"></i>'
-        '<input type="text" name="search" placeholder="Search patient..." autocomplete="off"></form>'
-        '<select class="ms-theme-m" onchange="changeTheme(this.value)" aria-label="Theme">'
-        '<option value="light">Classic Blue</option><option value="dark">Dark Mode</option><option value="emerald">Emerald Green</option></select>'
-        '</div>'
-        '<button class="ms-collapse" id="msCollapse" type="button" title="Collapse / expand menu">'
-        '<i class="fa-solid fa-angles-left"></i><span class="lbl">Collapse menu</span></button>'
-        '<nav class="ms-nav">' + "".join(parts) + '</nav>'
-        '<div class="ms-side-foot"><i class="fa-solid fa-heart-pulse"></i>'
-        '<p>Better Care<br>Through Accurate Results</p></div>'
-        '<div class="ms-lab-excellence"><i class="fa-solid fa-microscope"></i><b>Laboratory Excellence</b><span>FAST · ACCURATE · TRUSTED</span></div>'
-        '</aside><div class="ms-scrim" id="msScrim"></div>'
-    )
-
-
-def _shell_quick_actions_html(user: dict) -> str:
-    items = [
-        ("blue", "fa-user-plus", "Register Patient", "/add-patient", "add_patient", None),
-        ("green", "fa-print", "Test Results & Print", "/patients-dashboard", None, None),
-        ("purple", "fa-chart-line", "Reports & Analytics", "/reports", "reports", "can_view_reports"),
-        ("orange", "fa-flask", "Manage Tests", "/manage-tests", "manage_tests", None),
-        ("green", "fa-sack-dollar", "Sales & Finance", "/reports/sales-analytics", "reports", "can_view_reports"),
-        ("blue", "fa-share-nodes", "Share Reports", "/share-reports", "share_reports", None),
-        ("orange", "fa-tags", "Test Price List", "/reports?report_type=pricelist", "reports", "can_view_reports"),
-        ("purple", "fa-ban", "Cancel Bills", "/patients-dashboard?tab=cancel_bills", None, "can_cancel_bills"),
-    ]
-    out = []
-    for color, icon, label, href, perm, flag in items:
-        if not _shell_can(user, perm, flag):
-            continue
-        out.append(f'<a href="{href}" class="ms-qa {color}"><i class="fa-solid {icon} ic"></i> {html.escape(label)} '
-                   f'<i class="fa-solid fa-chevron-right ar"></i></a>')
-    return "".join(out)
-
-
 _SHELL_HEAD_SCRIPT = """<script>
 (function () {
   try {
@@ -1258,8 +1118,6 @@ _SHELL_HEAD_SCRIPT = """<script>
 })();
 </script>"""
 
-# Theme variables + header + sidebar styles for WRAPPED pages (the dashboard
-# template already carries its own copy of these).
 _SHELL_BASE_CSS = """
 :root{--bg:#eef3fb;--header-bg:linear-gradient(90deg,#0f3b8f 0%,#0d47a1 100%);--sidebar-bg:#f4f7fd;--card:#ffffff;--text:#12296b;--muted:#6b7a99;--border:#e3eaf6;--primary:#0d47a1;--primary-soft:#dce8fb;--shadow:0 6px 22px rgba(13,71,161,.07);}
 [data-theme="dark"]{--bg:#0b1437;--header-bg:linear-gradient(90deg,#0d1840,#111c44);--sidebar-bg:#0f1a40;--card:#111c44;--text:#ffffff;--muted:#8f9bba;--border:#1e2b5c;--primary:#38bdf8;--primary-soft:#1b2a5e;--shadow:0 6px 22px rgba(0,0,0,.35);}
@@ -1329,8 +1187,6 @@ html body.ms{margin:0 !important;padding:0 !important;display:block !important;b
 }
 """
 
-# Extra rules shared by the dashboard AND wrapped pages: global search,
-# New Patient button, sidebar section labels, collapse, breadcrumb, page panel.
 _SHELL_EXTRA_CSS = """
 .ms-brandlink{display:flex;align-items:center;gap:14px;color:#fff;min-width:0;text-decoration:none;}
 .ms-brandtxt{min-width:0;}
@@ -1448,7 +1304,6 @@ _SHELL_CORE_JS = """
 })();
 """
 
-# Used on BOTH the dashboard and wrapped pages (idempotent, no overlap with core).
 _SHELL_EXTRA_JS = """
 (function () {
   var tm = document.querySelector('.ms-theme-m');
@@ -1482,9 +1337,165 @@ _SHELL_EXTRA_JS = """
 """
 
 _RE_SHELL_HEAD = re.compile(r"<head[^>]*>(.*?)</head>", re.I | re.S)
+
 _RE_SHELL_BODY = re.compile(r"<body[^>]*>(.*)</body>", re.I | re.S)
+
 _RE_SHELL_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
 _RE_SHELL_DASH_LINK = re.compile(r"<a\b[^>]*\bhref=[\"']/dashboard[\"'][^>]*>(?:(?!</a>).)*</a>", re.I | re.S)
+
+_SHELL_SKIP_EXACT = {"/", "/login", "/logout", "/dashboard", "/favicon.ico"}
+
+_SHELL_SKIP_PREFIXES = (
+    "/public-report", "/shared-report", "/static", "/docs", "/openapi.json", "/redoc",
+    "/print-report", "/report-view", "/report-download", "/report-letterhead-preview", "/api/",
+)
+
+def _shell_can(user: dict, perm, flag) -> bool:
+    """Used ONLY to decide which sidebar links to show. Real access control
+    still happens inside every route - hiding a link is never security."""
+    if perm is None and flag is None:
+        return True
+    if is_super_admin(user):
+        return True
+    if (user.get("role") or "").strip().lower() in FULL_ACCESS_ROLES:
+        return True
+    if perm and perm in (user.get("permissions") or set()):
+        return True
+    if flag and (user.get("flags") or {}).get(flag):
+        return True
+    return False
+
+
+def _shell_active_key(path: str, query: str) -> str:
+    q = query or ""
+    if path == "/patients-dashboard" and "tab=cancel_bills" in q:
+        return "cancel"
+    if path == "/reports" and "report_type=pricelist" in q:
+        return "pricelist"
+    for key, prefixes in _SHELL_MATCH:
+        for p in prefixes:
+            if path == p or path.startswith(p + "/"):
+                return key
+    return ""
+
+
+def _shell_nav_item(key: str):
+    for _sec, items in _SHELL_NAV:
+        for it in items:
+            if it[0] == key:
+                return it
+    return None
+
+
+def _shell_header_html(user: dict) -> str:
+    raw = (user.get("username") or "").strip() or "User"
+    name = html.escape(raw[:1].upper() + raw[1:])
+    role = html.escape((user.get("role") or "").strip() or "User")
+
+    new_btn = ""
+    if _shell_can(user, "add_patient", None):
+        new_btn = ('<a href="/add-patient" class="ms-newpt" title="Register a new patient (Alt+N)">'
+                   '<i class="fa-solid fa-user-plus"></i><span>New Patient</span></a>')
+
+    menu_links = ""
+    if _shell_can(user, "manage_users", "can_manage_users"):
+        menu_links += '<a href="/manage-users"><i class="fa-solid fa-user-gear"></i> Manage Users</a>'
+    if _shell_can(user, "print_settings", None):
+        menu_links += '<a href="/print-settings"><i class="fa-solid fa-sliders"></i> Print Settings</a>'
+    menu_links += '<a href="/logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>'
+
+    return f"""<header class="ms-header">
+  <div class="ms-brand">
+    <button class="ms-burger" id="msBurger" type="button" aria-label="Menu"><i class="fa-solid fa-bars"></i></button>
+    <a href="/dashboard" class="ms-brandlink">
+      <div class="ms-logo"><i class="fa-solid fa-flask-vial"></i></div>
+      <div class="ms-brandtxt"><h1>PRIME MEDICAL LABORATORY</h1><p>Patient &amp; Laboratory Report Management System</p></div>
+    </a>
+  </div>
+  <div class="ms-hright">
+    <form class="ms-search" action="/patients-dashboard" method="get" role="search">
+      <i class="fa-solid fa-magnifying-glass"></i>
+      <input type="text" name="search" id="msGlobalSearch" placeholder="Search patient name or ref no..." autocomplete="off">
+      <kbd>/</kbd>
+    </form>
+    <div class="ms-clock">
+      <i class="fa-regular fa-clock"></i>
+      <div><b id="msClock">--:--:--</b><span id="msClockDate">&nbsp;</span></div>
+    </div>
+    {new_btn}
+    <div class="ms-theme">
+      <i class="fa-solid fa-sun"></i>
+      <select id="themeSwitcher" onchange="changeTheme(this.value)" aria-label="Theme">
+        <option value="light">Classic Blue</option>
+        <option value="dark">Dark Mode</option>
+        <option value="emerald">Emerald Green</option>
+      </select>
+    </div>
+    <div class="ms-user" id="msUser">
+      <button class="ms-user-btn" id="msUserBtn" type="button">
+        <span class="ms-avatar"><i class="fa-solid fa-circle-user"></i></span>
+        <span class="nm">{name}</span>
+        <i class="fa-solid fa-chevron-down" style="font-size: 11px;"></i>
+      </button>
+      <div class="ms-user-menu" id="msUserMenu">
+        <div class="ms-um-head"><b>{name}</b><span>{role}</span></div>
+        {menu_links}
+      </div>
+    </div>
+    <a href="/logout" class="ms-logout"><i class="fa-solid fa-right-from-bracket"></i> Logout</a>
+  </div>
+</header>"""
+
+
+def _shell_sidebar_html(user: dict, active: str) -> str:
+    parts = []
+    for sec, items in _SHELL_NAV:
+        links = []
+        for key, label, icon, href, perm, flag in items:
+            if not _shell_can(user, perm, flag):
+                continue
+            cls = ' class="active"' if key == active else ""
+            esc = html.escape(label)
+            links.append(f'<a href="{href}"{cls} title="{esc}"><i class="fa-solid {icon}"></i><span class="lbl">{esc}</span></a>')
+        if links:
+            parts.append(f'<div class="ms-sec"><span>{sec}</span></div>' + "".join(links))
+    return (
+        '<aside class="ms-sidebar" id="msSidebar">'
+        '<div class="ms-mobile-only ms-m-tools">'
+        '<form action="/patients-dashboard" method="get"><i class="fa-solid fa-magnifying-glass"></i>'
+        '<input type="text" name="search" placeholder="Search patient..." autocomplete="off"></form>'
+        '<select class="ms-theme-m" onchange="changeTheme(this.value)" aria-label="Theme">'
+        '<option value="light">Classic Blue</option><option value="dark">Dark Mode</option><option value="emerald">Emerald Green</option></select>'
+        '</div>'
+        '<button class="ms-collapse" id="msCollapse" type="button" title="Collapse / expand menu">'
+        '<i class="fa-solid fa-angles-left"></i><span class="lbl">Collapse menu</span></button>'
+        '<nav class="ms-nav">' + "".join(parts) + '</nav>'
+        '<div class="ms-side-foot"><i class="fa-solid fa-heart-pulse"></i>'
+        '<p>Better Care<br>Through Accurate Results</p></div>'
+        '<div class="ms-lab-excellence"><i class="fa-solid fa-microscope"></i><b>Laboratory Excellence</b><span>FAST · ACCURATE · TRUSTED</span></div>'
+        '</aside><div class="ms-scrim" id="msScrim"></div>'
+    )
+
+
+def _shell_quick_actions_html(user: dict) -> str:
+    items = [
+        ("blue", "fa-user-plus", "Register Patient", "/add-patient", "add_patient", None),
+        ("green", "fa-print", "Test Results & Print", "/patients-dashboard", None, None),
+        ("purple", "fa-chart-line", "Reports & Analytics", "/reports", "reports", "can_view_reports"),
+        ("orange", "fa-flask", "Manage Tests", "/manage-tests", "manage_tests", None),
+        ("green", "fa-sack-dollar", "Sales & Finance", "/reports/sales-analytics", "reports", "can_view_reports"),
+        ("blue", "fa-share-nodes", "Share Reports", "/share-reports", "share_reports", None),
+        ("orange", "fa-tags", "Test Price List", "/reports?report_type=pricelist", "reports", "can_view_reports"),
+        ("purple", "fa-ban", "Cancel Bills", "/patients-dashboard?tab=cancel_bills", None, "can_cancel_bills"),
+    ]
+    out = []
+    for color, icon, label, href, perm, flag in items:
+        if not _shell_can(user, perm, flag):
+            continue
+        out.append(f'<a href="{href}" class="ms-qa {color}"><i class="fa-solid {icon} ic"></i> {html.escape(label)} '
+                   f'<i class="fa-solid fa-chevron-right ar"></i></a>')
+    return "".join(out)
 
 
 def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
@@ -1504,7 +1515,7 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     if title_m:
         page_title = html.unescape(re.sub(r"<[^>]+>", "", title_m.group(1))).strip()
         page_title = re.sub(r"^Lab System\s*-\s*", "", page_title)
-        page_title = re.sub(r"\s*-\s*MEDISTAR MEDICAL LABORATORY.*$", "", page_title)
+        page_title = re.sub(r"\s*-\s*PRIME MEDICAL LABORATORY.*$", "", page_title)
 
     # Remove every "Back to Dashboard" style link - the sidebar replaces them.
     body_inner = _RE_SHELL_DASH_LINK.sub("", body_inner)
@@ -1538,13 +1549,6 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     )
 
 
-_SHELL_SKIP_EXACT = {"/", "/login", "/logout", "/dashboard", "/favicon.ico"}
-_SHELL_SKIP_PREFIXES = (
-    "/public-report", "/shared-report", "/static", "/docs", "/openapi.json", "/redoc",
-    "/print-report", "/report-view", "/report-download", "/report-letterhead-preview", "/api/",
-)
-
-
 @app.middleware("http")
 async def app_shell_middleware(request: Request, call_next):
     # Added AFTER every other middleware, so it is the outermost one and sees
@@ -1559,7 +1563,7 @@ async def app_shell_middleware(request: Request, call_next):
         return response
     if response.headers.get("content-disposition", "").startswith("attachment"):
         return response
-    user = getattr(request.state, "user", None)
+    user = _shell_user_from_request(request)
     if not user:
         return response
 
@@ -1587,11 +1591,17 @@ async def app_shell_middleware(request: Request, call_next):
     return new_response
 
 
+
 # 2. Logout Route
 @app.get("/logout")
-def logout():
+def logout(request: Request):
     # The logout page removes the shared auth cookies and writes a
     # localStorage event.  Other tabs receive the event immediately.
+    # Additive: also invalidate the server-side session.
+    _logout_token = request.cookies.get("session_token")
+    if _logout_token:
+        with _SESSIONS_LOCK:
+            SESSIONS.pop(_logout_token, None)
     response = HTMLResponse(
         content="""
         <!DOCTYPE html>
@@ -1612,6 +1622,7 @@ def logout():
     response.delete_cookie("username")
     response.delete_cookie("role")
     response.delete_cookie("permissions")
+    response.delete_cookie("session_token")
     return response
 
 # -------------------------------------------------------------
@@ -1632,7 +1643,7 @@ def login_page(error: str = ""):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MEDISTAR MEDICAL LABORATORY - Login</title>
+<title>PRIME MEDICAL LABORATORY - Login</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <script>
   (function () { try { var t = localStorage.getItem('lab_theme'); if (t && t !== 'light') document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
@@ -1644,7 +1655,7 @@ def login_page(error: str = ""):
   * { box-sizing: border-box; }
   body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; padding:20px;
          font-family:'Segoe UI',system-ui,Roboto,sans-serif;
-         background-image: linear-gradient(135deg, var(--ov1), var(--ov2)), url('/static/bg-lab.jpg');
+         background-image: linear-gradient(135deg, var(--ov1), var(--ov2)), url('/bg-lab.png');
          background-size:cover; background-position:center; background-repeat:no-repeat; background-attachment:fixed; background-color:var(--bgc); }
   .login-card { width:100%; max-width:420px; background:#fff; border-radius:18px; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,.35); }
   .card-top { background:linear-gradient(90deg,var(--a1),var(--a2)); padding:22px 24px 18px; text-align:center; color:#fff; }
@@ -1676,8 +1687,8 @@ def login_page(error: str = ""):
 <body>
   <div class="login-card">
     <div class="card-top">
-      <img src="/static/logo.png" alt="Medistar Medical Laboratory Logo" class="login-logo">
-      <h2>MEDISTAR MEDICAL LABORATORY</h2>
+      <img src="/logo.png" alt="Prime Medical Laboratory Logo" class="login-logo">
+      <h2>PRIME MEDICAL LABORATORY</h2>
       <p>Patient &amp; Laboratory Report Management System</p>
     </div>
     <div class="card-body">
@@ -1721,16 +1732,21 @@ async def login_post(request: Request):
     form_data = await request.form()
     username = form_data.get("username", "").strip()
     password = form_data.get("password", "").strip()
-    
-    # Rate-limit check (per client IP + username) before touching the DB.
-    client_ip = request.client.host if request.client else "unknown"
-    if _login_rate_limited(client_ip, username):
-        return RedirectResponse(url="/login?error=Too many failed attempts. Try again in 15 minutes.", status_code=303)
 
-    # Database Check (hardcoded admin bypass removed for security;
-    # the seeded admin row is verified against the users table like
-    # every other account, and its plaintext password is auto-hashed
-    # on first successful login by the upgrade step below).
+    # Additive login rate limiting: block (client_ip, username) after 5
+    # failures within a 15-minute window.
+    client_ip = request.client.host if request.client else "unknown"
+    rl_key = (client_ip, username)
+    with _FAILED_LOGINS_LOCK:
+        _rl_entry = FAILED_LOGINS.get(rl_key)
+        if _rl_entry is not None:
+            _rl_first_ts, _rl_count = _rl_entry
+            if (time.time() - _rl_first_ts < RATE_LIMIT_WINDOW_SECONDS
+                    and _rl_count >= RATE_LIMIT_MAX_FAILURES):
+                _rl_msg = "Too many failed login attempts. Please try again in 15 minutes."
+                return RedirectResponse(url=f"/login?error={quote(_rl_msg)}", status_code=303)
+
+    # 2. Database Check
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1745,48 +1761,83 @@ async def login_post(request: Request):
             )
         """)
         
+        # Fetch by username ONLY, then verify the password in Python. The
+        # old query compared the password directly in SQL, which only works
+        # for plaintext storage and cannot support salted hashes.
         cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
         user = cursor.fetchone()
 
-        if user and verify_password(user["password"], password):
-            # Legacy-plaintext auto-migration: if the stored value wasn't
-            # already one of our pbkdf2_sha256$... hashes, upgrade it now
-            # that we've just verified the plaintext password was correct.
-            # One-time, silent, on the very next successful login for that
-            # account - nothing else about the row changes.
-            if not is_hashed_password(user["password"]):
-                cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), user["id"]))
-                conn.commit()
+        stored_password = ""
+        if user:
+            try:
+                stored_password = user["password"] or ""
+            except Exception:
+                stored_password = ""
 
-            # Role එකක් නැත්නම් default 'MLT' විදිහට ගන්නවා
-            user_role = user["role"] if "role" in user.keys() and user["role"] else "MLT"
-            user_permissions = user["permissions"] if "permissions" in user.keys() and user["permissions"] else ""
-            
+        if user and verify_password(password, stored_password):
+            # Transparently upgrade legacy plaintext rows to PBKDF2 now that
+            # we've proven the password is correct.
+            try:
+                if not is_password_hashed(stored_password):
+                    if migrate_legacy_password_if_needed(cursor, user["id"], password, stored_password):
+                        conn.commit()
+            except Exception:
+                pass
             conn.close()
 
+            # Role එකක් නැත්නම් default 'MLT' විදිහට ගන්නවා
+            # The built-in super admin always gets owner role, even if the
+            # users row's role column is NULL/missing (databases created before
+            # the role-setting UPDATE existed). Without this, admin logs in
+            # with role=MLT and every permission check returns Access Denied.
+            if username.strip().lower() == PROTECTED_ADMIN_USERNAME:
+                user_role = "owner"
+                user_permissions = ""
+            else:
+                user_role = user["role"] if "role" in user.keys() and user["role"] else "MLT"
+                user_permissions = user["permissions"] if "permissions" in user.keys() and user["permissions"] else ""
+            
             # හැමෝම Dashboard එකට යවනවා සහ Cookies සෙට් කරනවා
             resp = RedirectResponse(url="/dashboard", status_code=303)
-            # Legacy cookies (read by existing page JS): keep names/values
-            # exactly, add SameSite=Strict. Do NOT mark httponly here -
-            # the existing frontend JS reads these cookies.
-            resp.set_cookie(key="username", value=username, samesite="strict")
-            resp.set_cookie(key="role", value=user_role, samesite="strict")
-            resp.set_cookie(key="permissions", value=user_permissions, samesite="strict")
-            # Server-side session token: httponly (JS cannot read),
-            # SameSite=Strict (primary CSRF defense).
-            # TODO: set secure=True when deployed behind HTTPS.
-            session_token = _create_session(username)
-            resp.set_cookie(key="session_token", value=session_token, httponly=True, samesite="strict", secure=False, max_age=SESSION_TTL_SECONDS, path="/")
-            _clear_failed_login(client_ip, username)
+            resp.set_cookie(key="username", value=username)
+            resp.set_cookie(key="role", value=user_role)
+            resp.set_cookie(key="permissions", value=user_permissions)
+            # Additive: clear rate-limit state and create a server-side
+            # session. The three legacy cookies above are kept byte-identical
+            # for backwards compatibility with existing JS.
+            with _FAILED_LOGINS_LOCK:
+                FAILED_LOGINS.pop(rl_key, None)
+            _session_token = secrets.token_urlsafe(32)
+            with _SESSIONS_LOCK:
+                SESSIONS[_session_token] = {
+                    "username": username,
+                    "role": user_role,
+                    "permissions": user_permissions,
+                    "created_at": time.time(),
+                }
+            resp.set_cookie(
+                key="session_token",
+                value=_session_token,
+                httponly=True,
+                samesite="strict",
+                secure=False,  # set secure=True under HTTPS
+            )
             return resp
 
         conn.close()
-            
     except Exception as e:
         pass
     
+    # Additive: record this failed login for rate limiting.
+    with _FAILED_LOGINS_LOCK:
+        _rl_entry = FAILED_LOGINS.get(rl_key)
+        _now = time.time()
+        if _rl_entry is None or (_now - _rl_entry[0] > RATE_LIMIT_WINDOW_SECONDS):
+            FAILED_LOGINS[rl_key] = [_now, 1]
+        else:
+            _rl_entry[1] += 1
+
     # වැරදි නම් එරර් එකක් සමඟ නැවත ලොගින් පේජ් එකටම යැවීම
-    _record_failed_login(client_ip, username)
     msg = "Invalid Username or Password!"
     return RedirectResponse(url=f"/login?error={msg}", status_code=303)
 
@@ -1795,6 +1846,10 @@ async def login_post(request: Request):
 # -------------------------------------------------------------
 @app.post("/add-user")
 async def add_user(request: Request):
+    # Authorization verified against the database, not the cookie.
+    if not (user_can(request, "manage_users") or user_can(request, "can_manage_users")):
+        return render_locked_page("Manage Users")
+
     form_data = await request.form()
     username = form_data.get("username", "").strip()
     password = form_data.get("password", "").strip()
@@ -1802,26 +1857,17 @@ async def add_user(request: Request):
     selected_permissions = form_data.getlist("permissions")
     permissions_str = ",".join(p for p in selected_permissions if p in PERMISSIONS)
 
-    # Never allow a second account to be created under the reserved
-    # super-admin username - that row is hidden from this UI and must stay
-    # the single built-in account.
-    if username.strip().lower() == SUPER_ADMIN_USERNAME:
-        return RedirectResponse(url="/manage-users", status_code=303)
+    # The protected admin username is reserved and can never be re-created
+    # or shadowed by a normal user row.
+    if username.strip().lower() == PROTECTED_ADMIN_USERNAME:
+        return RedirectResponse(url="/manage-users?error=reserved_username", status_code=303)
 
     if username and password and role:
-        # Column names come from the GRANULAR_PERMISSIONS constant (never
-        # from the request), and every value is bound as a ? parameter.
-        flag_cols = list(GRANULAR_PERMISSIONS.keys())
-        flag_values = [1 if form_data.get(col) else 0 for col in flag_cols]
-        col_sql = ", ".join(flag_cols)
-        placeholders = ", ".join("?" for _ in flag_cols)
-
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            f"INSERT INTO users (username, password, role, permissions, {col_sql}) "
-            f"VALUES (?, ?, ?, ?, {placeholders})",
-            tuple([username, hash_password(password), role, permissions_str] + flag_values)
+            "INSERT INTO users (username, password, role, permissions) VALUES (?, ?, ?, ?)",
+            (username, hash_password(password), role, permissions_str)
         )
         conn.commit()
         conn.close()
@@ -1831,8 +1877,7 @@ async def add_user(request: Request):
 
 @app.get("/edit-user/{user_id}", response_class=HTMLResponse)
 def edit_user_page(user_id: int, request: Request):
-    current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
+    if not (user_can(request, "manage_users") or user_can(request, "can_manage_users")):
         return render_locked_page("Manage Users")
 
     conn = get_db_connection()
@@ -1843,11 +1888,16 @@ def edit_user_page(user_id: int, request: Request):
     if not u:
         return HTMLResponse("<h3>User not found.</h3><a href='/manage-users'>Back</a>", status_code=404)
 
-    # The primary super admin is hidden from User Management, so its edit
-    # page is closed too - otherwise the account would still be reachable
-    # by guessing its row id in the URL.
-    if str(u["username"]).strip().lower() == SUPER_ADMIN_USERNAME:
-        return HTMLResponse("<h3>User not found.</h3><a href='/manage-users'>Back</a>", status_code=404)
+    # The primary admin account is immutable through the UI.
+    try:
+        _target_username = (u["username"] or "").strip().lower()
+    except Exception:
+        _target_username = ""
+    if _target_username == PROTECTED_ADMIN_USERNAME:
+        return HTMLResponse(
+            "<h3>The primary administrator account cannot be edited.</h3><a href='/manage-users'>Back</a>",
+            status_code=403
+        )
 
     u_role = (u["role"] if "role" in u.keys() and u["role"] else "MLT")
     u_perms = set((u["permissions"] if "permissions" in u.keys() and u["permissions"] else "").split(","))
@@ -1858,17 +1908,6 @@ def edit_user_page(user_id: int, request: Request):
         checkboxes_html += f"""
         <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600;">
             <input type="checkbox" name="permissions" value="{perm_key}" {checked}> {html.escape(perm_label)}
-        </label>
-        """
-
-    u_keys = u.keys()
-    granular_checkboxes = ""
-    for _col, (_label, _default) in GRANULAR_PERMISSIONS.items():
-        _current = int(u[_col] or 0) if _col in u_keys and u[_col] is not None else _default
-        _highlight = "background:#fff5f5; border:1px solid #fed7d7; padding:8px 10px; border-radius:8px;" if _col == "can_cancel_bills" else ""
-        granular_checkboxes += f"""
-        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600; {_highlight}">
-            <input type="checkbox" name="{_col}" value="1" {"checked" if _current else ""}> {html.escape(_label)}
         </label>
         """
 
@@ -1908,16 +1947,8 @@ def edit_user_page(user_id: int, request: Request):
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Reset Password (leave blank to keep current password)</label>
-                        <input type="password" name="new_password" class="form-control" placeholder="New password" autocomplete="new-password">
-                    </div>
-                    <div class="form-group">
                         <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
                         {checkboxes_html}
-                    </div>
-                    <div class="form-group">
-                        <label>Granular Access Controls</label>
-                        {granular_checkboxes}
                     </div>
                     <button type="submit" class="submit-btn"><i class="fa-solid fa-check"></i> Save Changes</button>
                     <a href="/manage-users" style="margin-left:12px;">Cancel</a>
@@ -1931,50 +1962,54 @@ def edit_user_page(user_id: int, request: Request):
 
 @app.post("/edit-user/{user_id}")
 async def edit_user_post(user_id: int, request: Request):
-    current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
+    if not (user_can(request, "manage_users") or user_can(request, "can_manage_users")):
         return render_locked_page("Manage Users")
 
     form_data = await request.form()
     role = form_data.get("role", "").strip()
-    new_password = (form_data.get("new_password", "") or "").strip()
     selected_permissions = form_data.getlist("permissions")
     permissions_str = ",".join(p for p in selected_permissions if p in PERMISSIONS)
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Refuse to modify the hidden super-admin row even if its id is posted
-    # directly - the UI never exposes it, so any such request is forged.
+    # Re-check the target server-side: the user_id comes straight from the
+    # URL, so the protected-admin guard must run here too, not only on the
+    # GET page that renders the form.
     cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
     target = cursor.fetchone()
-    if not target or str(target["username"]).strip().lower() == SUPER_ADMIN_USERNAME:
+    if not target:
         conn.close()
-        return RedirectResponse(url="/manage-users", status_code=303)
+        return HTMLResponse("<h3>User not found.</h3><a href='/manage-users'>Back</a>", status_code=404)
 
-    # Column names are constants from GRANULAR_PERMISSIONS; all values bound as ?.
-    flag_cols = list(GRANULAR_PERMISSIONS.keys())
-    flag_values = [1 if form_data.get(col) else 0 for col in flag_cols]
-    flag_set_sql = ", ".join(f"{col} = ?" for col in flag_cols)
+    try:
+        target_username = (target["username"] or "").strip().lower()
+    except Exception:
+        target_username = ""
+    if target_username == PROTECTED_ADMIN_USERNAME:
+        conn.close()
+        return HTMLResponse(
+            "<h3>The primary administrator account cannot be modified.</h3><a href='/manage-users'>Back</a>",
+            status_code=403
+        )
 
-    if new_password:
-        cursor.execute(
-            f"UPDATE users SET role = ?, permissions = ?, password = ?, {flag_set_sql} WHERE id = ?",
-            tuple([role, permissions_str, hash_password(new_password)] + flag_values + [user_id])
-        )
-    else:
-        cursor.execute(
-            f"UPDATE users SET role = ?, permissions = ?, {flag_set_sql} WHERE id = ?",
-            tuple([role, permissions_str] + flag_values + [user_id])
-        )
+    cursor.execute("UPDATE users SET role = ?, permissions = ? WHERE id = ?", (role, permissions_str, user_id))
     conn.commit()
     conn.close()
     return RedirectResponse(url="/manage-users", status_code=303)
 
+
 @app.get("/delete-user/{user_id}")
 def delete_user(user_id: int, request: Request):
-    current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
+    """Delete a user account.
+
+    Previously this route had NO authorization check of any kind - any
+    visitor who knew the URL could delete any account, including the
+    administrator, locking everyone out of the system. It now requires a
+    database-verified manage-users permission and refuses to delete either
+    the protected admin account or the caller's own account.
+    """
+    if not (user_can(request, "manage_users") or user_can(request, "can_manage_users")):
         return render_locked_page("Manage Users")
 
     conn = get_db_connection()
@@ -1984,38 +2019,40 @@ def delete_user(user_id: int, request: Request):
     target = cursor.fetchone()
     if not target:
         conn.close()
-        return RedirectResponse(url="/manage-users", status_code=303)
+        return RedirectResponse(url="/manage-users?error=user_not_found", status_code=303)
 
-    target_username = str(target["username"] or "").strip()
+    try:
+        target_username = (target["username"] or "").strip()
+    except Exception:
+        target_username = ""
 
-    # The primary super admin can never be deleted through the UI.
-    if target_username.lower() == SUPER_ADMIN_USERNAME:
+    # 1. Never delete the primary administrator.
+    if target_username.strip().lower() == PROTECTED_ADMIN_USERNAME:
         conn.close()
-        return RedirectResponse(url="/manage-users", status_code=303)
+        return RedirectResponse(url="/manage-users?error=cannot_delete_admin", status_code=303)
 
-    # Self-deletion guard: a logged-in user can't delete their own active
-    # account (which would otherwise leave their session pointing at a
-    # user row that no longer exists).
-    if target_username.lower() == (current_user.get("username") or "").strip().lower():
+    # 2. Never let a user delete the account they are logged in as.
+    current_username = (request.cookies.get("username", "") or "").strip()
+    if current_username and target_username.strip().lower() == current_username.strip().lower():
         conn.close()
-        return RedirectResponse(url="/manage-users?error=self_delete", status_code=303)
+        return RedirectResponse(url="/manage-users?error=cannot_delete_self", status_code=303)
 
-    cursor.execute("DELETE FROM users WHERE id = ? AND username != ?", (user_id, SUPER_ADMIN_USERNAME))
+    cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
-    return RedirectResponse(url="/manage-users", status_code=303)
+    return RedirectResponse(url="/manage-users?msg=user_deleted", status_code=303)
 
 # -----------------------------
 # HELPER FUNCTIONS
+# -----------------------------
 def parse_age_components(age_raw: str):
     """Parse a free-text age string into (years, months, days, ok).
 
     Infant/child safe. The previous inline parser used an *optional* year
     suffix, so a bare number followed by a month/day unit was also swallowed
     by the year pattern - "5 D" parsed as 5 YEARS and 5 days, "8 months" as
-    8 years and 8 months, "15 days" as 15 years. That silently corrupted
-    infant records and broke every age-aware reference range for paediatric
-    patients using the legacy free-text age path.
+    8 years and 8 months. That silently corrupted infant records and broke
+    every age-aware reference range for paediatric patients.
 
     The fix: each unit is matched with an explicit, mandatory suffix, and a
     bare number (no unit at all) is the ONLY case treated as years.
@@ -2048,7 +2085,7 @@ def parse_age_components(age_raw: str):
         age_months = max(0, min(11, int(m_match.group(1))))
     if d_match:
         matched_any = True
-        age_days = max(0, min(30, int(d_match.group(1))))
+        age_days = max(0, min(31, int(d_match.group(1))))
 
     if not matched_any:
         # No unit anywhere - a bare number means years.
@@ -2060,8 +2097,43 @@ def parse_age_components(age_raw: str):
     return age_years, age_months, age_days, True
 
 
+def format_age_components(age_years, age_months, age_days) -> str:
+    """Render normalized age columns back into the compact editable form
+    used by the Result Entry screen (e.g. "0Y 3M 5D", "25 Y")."""
+    y = int(age_years or 0)
+    m = int(age_months or 0)
+    d = int(age_days or 0)
+    if m or d:
+        parts = [f"{y}Y"]
+        if m:
+            parts.append(f"{m}M")
+        if d:
+            parts.append(f"{d}D")
+        return " ".join(parts)
+    return f"{y} Y" if y else ""
 
-# -----------------------------
+
+CULTURE_TEST_MARKERS = ("culture", "abst", "sensitivity", "c/s", "c & s")
+ABST_SECTION_MARKERS = ("abst", "antibiotic", "sensitivity", "sensitivities", "susceptibility")
+
+
+def test_is_culture(test_name) -> bool:
+    """True when a test looks like a culture / antibiotic-sensitivity test,
+    which is where the optional ABST block applies."""
+    name = str(test_name or "").lower()
+    return any(marker in name for marker in CULTURE_TEST_MARKERS)
+
+
+def is_abst_section_marker(param_name) -> bool:
+    """True when a parameter row acts as the ABST section heading. Every
+    parameter from this row onward is considered part of the antibiotic
+    sensitivity block and is suppressed when 'Hide ABST' is ticked."""
+    name = str(param_name or "").strip().lower()
+    if not name:
+        return False
+    return any(marker in name for marker in ABST_SECTION_MARKERS)
+
+
 def clean_display_range(ref_range, unit):
     if not ref_range:
         return ""
@@ -2233,36 +2305,6 @@ def parse_optional_float(x: str):
 # -------------------------------------------------------------
 # DATABASE INITIALIZATION (ටේබල්ස් මැකීයාමෙන් තොරව සුරක්ෂිතව සෑදීම)
 # -------------------------------------------------------------
-def _ensure_package_tables(cursor):
-    """Test Packages = a named group of existing tests. Additive only -
-    nothing in the existing tables is touched."""
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS test_packages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            package_name TEXT UNIQUE NOT NULL,
-            created_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS test_package_items (
-            package_id INTEGER NOT NULL,
-            test_id INTEGER NOT NULL,
-            PRIMARY KEY (package_id, test_id)
-        )
-    """)
-    # package_price = fixed price charged for the whole package
-    # (NULL = simply add up the normal test prices). Additive migration only.
-    cursor.execute("PRAGMA table_info(test_packages)")
-    if "package_price" not in [r[1] for r in cursor.fetchall()]:
-        cursor.execute("ALTER TABLE test_packages ADD COLUMN package_price REAL")
-    # price_override = price actually charged for this one assigned test.
-    # NULL = normal list price. Tests that came from a package carry their share
-    # of the package price here, so every bill / revenue total adds up correctly.
-    cursor.execute("PRAGMA table_info(patient_assigned_tests)")
-    if "price_override" not in [r[1] for r in cursor.fetchall()]:
-        cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN price_override REAL")
-
-
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -2299,16 +2341,41 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN permissions TEXT DEFAULT ''")
     except Exception:
         pass
-
-    # Granular permission flags. Each column is added independently so one
-    # already-existing column can never abort the others (libsql raises on
-    # a duplicate column, which would short-circuit a shared try block).
-    for _col, (_label, _default) in GRANULAR_PERMISSIONS.items():
-        try:
-            cursor.execute(f"ALTER TABLE users ADD COLUMN {_col} INTEGER DEFAULT {int(_default)}")
-        except Exception:
-            pass
     conn.commit()
+
+    # One-time backfill of the granular operational permissions.
+    #
+    # The newer keys (can_view_reports / can_edit_results /
+    # can_edit_patients) are now enforced on the result-entry, report and
+    # patient-edit routes. Existing staff accounts were created before those
+    # keys existed, so without this backfill every current MLT would be
+    # locked out of their normal day-to-day work the moment this version is
+    # deployed. Sensitive keys (can_cancel_bills, can_manage_users) are
+    # deliberately NOT granted here - an admin must assign those explicitly.
+    #
+    # Guarded by a marker column so it runs exactly once and never re-grants
+    # a permission an admin has since revoked.
+    try:
+        _user_cols = {row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()}
+        if "perms_backfilled" not in _user_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN perms_backfilled INTEGER DEFAULT 0")
+            conn.commit()
+
+        _baseline = ["can_view_reports", "can_edit_results", "can_edit_patients"]
+        cursor.execute("SELECT id, COALESCE(permissions, '') AS perms, COALESCE(role, '') AS role FROM users WHERE COALESCE(perms_backfilled, 0) = 0")
+        for _u in cursor.fetchall():
+            _existing = {p for p in str(_u["perms"] or "").split(",") if p}
+            # Owners/admins bypass permission checks entirely, so there is
+            # nothing useful to grant them.
+            if str(_u["role"] or "").strip().lower() not in FULL_ACCESS_ROLES:
+                _existing.update(_baseline)
+            cursor.execute(
+                "UPDATE users SET permissions = ?, perms_backfilled = 1 WHERE id = ?",
+                (",".join(sorted(_existing)), _u["id"])
+            )
+        conn.commit()
+    except Exception:
+        pass
 
     # 3. Patients Table
     cursor.execute("""
@@ -2529,22 +2596,18 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
-
-    # Signature image fine-tuning columns. Additive only - existing rows
-    # take the DEFAULT, so current reports render exactly as before until
-    # an admin changes a value.
     try:
-        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_top_px INTEGER DEFAULT -45")
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_top_px INTEGER DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_bottom_px INTEGER DEFAULT -32")
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_bottom_px INTEGER DEFAULT -30")
         conn.commit()
     except sqlite3.OperationalError:
         pass
     try:
-        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_left_px INTEGER DEFAULT 10")
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_margin_left_px INTEGER DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -2554,7 +2617,7 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_img_height_px INTEGER DEFAULT 135")
+        cursor.execute("ALTER TABLE system_print_settings ADD COLUMN sig_img_height_px INTEGER DEFAULT 60")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -2631,19 +2694,6 @@ def init_db():
     # Default admin user (username: admin, password: 1234)
     cursor.execute("INSERT OR IGNORE INTO users (username, password) VALUES ('admin', '1234')")
 
-    # The primary super admin always carries owner role + every granular
-    # flag, so it keeps unrestricted access no matter what an operator
-    # toggles elsewhere. It is hidden from the User Management UI, so this
-    # row can never be edited or downgraded through the app.
-    try:
-        _flag_set_sql = ", ".join(f"{col} = 1" for col in GRANULAR_PERMISSIONS)
-        cursor.execute(
-            f"UPDATE users SET role = 'owner', {_flag_set_sql} WHERE username = ?",
-            (SUPER_ADMIN_USERNAME,)
-        )
-    except Exception:
-        pass
-
     # ---------------------------------------------------------
     # Calculation metadata / result storage migrations
     # ---------------------------------------------------------
@@ -2666,6 +2716,24 @@ def init_db():
             UNIQUE(patient_id, test_id, parameter_id)
         )
     """)
+
+    # Per-RESULT bold flag. Distinct from test_parameters.is_bold, which is
+    # the template/default for the parameter definition. This one records the
+    # MLT's per-patient decision to emphasise an individual result value on
+    # the printed report (e.g. a critical finding).
+    ppr_columns = {row[1] for row in cursor.execute("PRAGMA table_info(patient_parameter_results)").fetchall()}
+    if "is_bold" not in ppr_columns:
+        cursor.execute("ALTER TABLE patient_parameter_results ADD COLUMN is_bold INTEGER DEFAULT 0")
+
+    # Culture/ABST: lets the MLT suppress the antibiotic-sensitivity block on
+    # the printed report when the culture shows No Growth, so the report does
+    # not carry an empty or irrelevant ABST table.
+    try:
+        pat_columns = {row[1] for row in cursor.execute("PRAGMA table_info(patient_assigned_tests)").fetchall()}
+        if pat_columns and "hide_abst" not in pat_columns:
+            cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN hide_abst INTEGER DEFAULT 0")
+    except Exception:
+        pass
 
     # Tombstone table for explicitly-deleted standard-test parameters.
     #
@@ -2715,8 +2783,7 @@ def init_db():
 # silently wiped out every route registered above this point.
 
 # -------------------------------------------------------------
-# 1. MAIN DASHBOARD (sidebar layout, live stats, registrations
-#    chart, calendar, quick actions). Same links / same data as before.
+# 1. MAIN DASHBOARD (Updated Big Action Buttons UI with User Management)
 # -------------------------------------------------------------
 def _dash_trend_html(cur, prev):
     """Small coloured trend chip comparing `cur` against `prev`."""
@@ -3451,7 +3518,7 @@ def dashboard(request: Request):
     import json as _json
     from datetime import timedelta
 
-    user = getattr(request.state, "user", None) or get_current_user(request)
+    user = _shell_user_from_request(request) or get_current_user(request)
     raw_name = (user.get("username") or "").strip() or "User"
     display_name = raw_name[:1].upper() + raw_name[1:]
     role_label = (user.get("role") or "").strip() or "User"
@@ -3545,7 +3612,7 @@ def dashboard(request: Request):
     recent_results_html = ""
     try:
         cursor.execute(
-            "SELECT pat.id, p.title, p.name, t.name, pat.saved_at, pat.patient_id "
+            "SELECT pat.id, p.title, p.name, t.test_name, pat.saved_at, pat.patient_id "
             "FROM patient_assigned_tests pat "
             "JOIN patients p ON p.id = pat.patient_id "
             "JOIN tests t ON t.id = pat.test_id "
@@ -3648,14 +3715,13 @@ def dashboard(request: Request):
         page = page.replace(key, val)
     return page
 
-
 # -------------------------------------------------------------
 # 2. MANAGE USERS ROUTE (100% Crash-Proof & Error-Free)
 # -------------------------------------------------------------
 @app.get("/manage-users", response_class=HTMLResponse)
 def manage_users(request: Request):
     current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_manage_users", "manage_users"):
+    if not user_has_access(current_user, "manage_users"):
         return render_locked_page("Manage Users")
 
     conn = get_db_connection()
@@ -3681,10 +3747,13 @@ def manage_users(request: Request):
     except Exception:
         pass
         
-    # Hide the primary super-admin account from the User Management table.
-    # It keeps full access when logged in, but is invisible to (and so
-    # cannot be edited or deleted by) anyone managing users here.
-    cursor.execute("SELECT * FROM users WHERE username != ?", (SUPER_ADMIN_USERNAME,))
+    # The primary administrator is deliberately excluded from the user list.
+    # It cannot be edited or deleted, so showing it only invites confusion
+    # and offers an attack surface via the row's action links.
+    cursor.execute(
+        "SELECT * FROM users WHERE LOWER(TRIM(COALESCE(username, ''))) != ?",
+        (PROTECTED_ADMIN_USERNAME,)
+    )
     users = cursor.fetchall()
     conn.close()
 
@@ -3747,15 +3816,6 @@ def manage_users(request: Request):
         permission_checkboxes += f"""
         <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600;">
             <input type="checkbox" name="permissions" value="{perm_key}"> {html.escape(perm_label)}
-        </label>
-        """
-
-    granular_checkboxes = ""
-    for _col, (_label, _default) in GRANULAR_PERMISSIONS.items():
-        _highlight = "background:#fff5f5; border:1px solid #fed7d7; padding:8px 10px; border-radius:8px;" if _col == "can_cancel_bills" else ""
-        granular_checkboxes += f"""
-        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:14px; font-weight:600; {_highlight}">
-            <input type="checkbox" name="{_col}" value="1" {"checked" if _default else ""}> {html.escape(_label)}
         </label>
         """
 
@@ -3872,10 +3932,6 @@ def manage_users(request: Request):
                         <label>Permissions (ignored if role is Owner - Owner always has full access)</label>
                         {permission_checkboxes}
                     </div>
-                    <div class="form-group">
-                        <label>Granular Access Controls</label>
-                        {granular_checkboxes}
-                    </div>
                     <button type="submit" class="submit-btn"><i class="fa-solid fa-check"></i> Create User</button>
                 </form>
             </div>
@@ -3909,7 +3965,7 @@ def manage_users(request: Request):
 @app.get("/reports", response_class=HTMLResponse)
 def reports_page(request: Request, start_date: str = "", end_date: str = "", report_type: str = "sales"):
     current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_view_reports", "reports"):
+    if not (user_can(request, "can_view_reports") or user_can(request, "reports")):
         return render_locked_page("Reports & Analytics")
 
     conn = get_db_connection()
@@ -4073,7 +4129,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
     <body>
         <div class="header no-print">
             <div>
-                <h2>MEDISTAR MEDICAL LABORATORY - REPORTS</h2>
+                <h2>PRIME MEDICAL LABORATORY - REPORTS</h2>
             </div>
             <div>
                 <a href="/reports/sales-analytics" class="btn-secondary" style="padding: 6px 14px; font-size: 13px; background:#27ae60; margin-right:8px;">💰 Sales & Financial Analytics</a>
@@ -4115,7 +4171,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
                         <p style="margin: 4px 0 0 0; font-size: 12px; color: var(--text-muted);">{date_line}</p>
                     </div>
                     <div>
-                        <span style="font-size: 12px; font-weight: bold; color: var(--text-muted);">MEDISTAR MEDICAL LABORATORY</span>
+                        <span style="font-size: 12px; font-weight: bold; color: var(--text-muted);">PRIME MEDICAL LABORATORY</span>
                     </div>
                 </div>
 
@@ -4224,7 +4280,7 @@ def _render_cancel_bills_tab(conn, cursor, search, msg):
     for r in rows:
         p_id = r["patient_id"]
         p_name = f"{(r['title'] or '').strip()} {(r['name'] or '').strip()}".strip()
-        ref_no = f"Med-{p_id:04d}"
+        ref_no = f"PRI-{p_id:04d}"
         manual_bill_no = str(r["manual_bill_no"] or "").strip()
         display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
         date_str = str(r["created_at"] or "N/A")
@@ -4619,12 +4675,105 @@ def lookup_patient_by_phone(request: Request, phone: str = ""):
 
 
 # -------------------------------------------------------------
-# DOCTOR / CENTER PICKER HELPERS (shared by register + result entry)
+# Shared helpers: Doctor / Center dropdowns for the patient-details edit forms
+# (Result Entry + Patient Results). patients.doctor stores the doctor CODE
+# (that is what commission/reports join on), so editing must use a dropdown
+# of real doctors. A "Manual" option stores a typed name (no commission link).
 # -------------------------------------------------------------
-# patients.doctor stores a doctor CODE when picked from the list (so
-# commission reports can join to the doctors table) or plain typed text
-# when a manual name is used (no commission rate, reported by name).
 MANUAL_DOCTOR_VALUE = "__manual__"
+
+
+def _build_doctor_select_html(cursor, current_doctor, select_name, manual_name, input_style):
+    cursor.execute("SELECT code, name FROM doctors ORDER BY name")
+    docs = cursor.fetchall()
+    cur = str(current_doctor or "").strip()
+    selected_value = "None"
+    manual_text = ""
+    if cur and cur != "None":
+        by_code = [d for d in docs if str(d[0]) == cur]
+        by_name = [d for d in docs if str(d[1] or "").strip().lower() == cur.lower()]
+        if by_code:
+            selected_value = str(by_code[0][0])
+        elif by_name:
+            # Older records saved the typed doctor NAME - map it back to the
+            # real doctor so commission is calculated after the next save.
+            selected_value = str(by_name[0][0])
+        else:
+            selected_value = MANUAL_DOCTOR_VALUE
+            manual_text = cur
+    opts = f'<option value="None" {"selected" if selected_value == "None" else ""}>-- None --</option>'
+    for d in docs:
+        code = str(d[0])
+        opts += (f'<option value="{html.escape(code, quote=True)}" {"selected" if selected_value == code else ""}>'
+                 f'{html.escape(str(d[1] or ""))} ({html.escape(code)})</option>')
+    opts += (f'<option value="{MANUAL_DOCTOR_VALUE}" {"selected" if selected_value == MANUAL_DOCTOR_VALUE else ""}>'
+             f'&#9998; Other / Manual doctor name...</option>')
+    show_manual = "block" if selected_value == MANUAL_DOCTOR_VALUE else "none"
+    return f"""
+    <div>
+        <select name="{select_name}" style="{input_style}"
+                onchange="var m=this.parentNode.querySelector('.doc-manual-input'); m.style.display=(this.value==='{MANUAL_DOCTOR_VALUE}')?'block':'none'; if(this.value==='{MANUAL_DOCTOR_VALUE}') m.focus();">
+            {opts}
+        </select>
+        <input type="text" class="doc-manual-input" name="{manual_name}" value="{html.escape(manual_text, quote=True)}"
+               placeholder="Type doctor name" style="{input_style} display:{show_manual}; margin-top:6px;">
+    </div>
+    """
+
+
+def _build_center_select_html(cursor, current_center, select_name, input_style):
+    cursor.execute("SELECT center_name FROM collecting_centers ORDER BY center_name")
+    names = [str(r[0]) for r in cursor.fetchall() if r[0]]
+    cur = str(current_center or "").strip()
+    if not names:
+        names = ["Main Branch"]
+    opts = ""
+    if not cur:
+        opts += '<option value="" selected>-- Select Center --</option>'
+    if cur and cur not in names:
+        # Keep a legacy / since-deleted center value instead of losing it.
+        opts += f'<option value="{html.escape(cur, quote=True)}" selected>{html.escape(cur)}</option>'
+    for n in names:
+        opts += f'<option value="{html.escape(n, quote=True)}" {"selected" if n == cur else ""}>{html.escape(n)}</option>'
+    return f'<select name="{select_name}" style="{input_style}">{opts}</select>'
+
+
+def _resolve_doctor_form_value(selected, manual):
+    selected = str(selected or "").strip()
+    if selected == MANUAL_DOCTOR_VALUE:
+        return str(manual or "").strip() or "None"
+    return selected or "None"
+
+
+def _ensure_package_tables(cursor):
+    """Test Packages = a named group of existing tests. Additive only -
+    nothing in the existing tables is touched."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS test_packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_name TEXT UNIQUE NOT NULL,
+            created_at TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS test_package_items (
+            package_id INTEGER NOT NULL,
+            test_id INTEGER NOT NULL,
+            PRIMARY KEY (package_id, test_id)
+        )
+    """)
+    # package_price = fixed price charged for the whole package
+    # (NULL = simply add up the normal test prices). Additive migration only.
+    cursor.execute("PRAGMA table_info(test_packages)")
+    if "package_price" not in [r[1] for r in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE test_packages ADD COLUMN package_price REAL")
+    # price_override = price actually charged for this one assigned test.
+    # NULL = normal list price. Tests that came from a package carry their share
+    # of the package price here, so every bill / revenue total adds up correctly.
+    cursor.execute("PRAGMA table_info(patient_assigned_tests)")
+    if "price_override" not in [r[1] for r in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN price_override REAL")
+
 
 def _resolve_doctor_value(select_val, manual_val):
     sel = (select_val or "").strip()
@@ -4687,6 +4836,8 @@ def build_doctor_center_fields(cursor, current_doctor, current_center,
     )
     center_html = f'<select name="{center_name}" style="{input_style}">{c_opts}</select>'
     return doctor_html, center_html
+
+
 
 @app.get("/add-patient", response_class=HTMLResponse)
 def add_patient_page(request: Request, saved_id: int = None):
@@ -5203,26 +5354,6 @@ async def add_patient_post(request: Request):
         return f"<h3>Database Error: {str(e)}</h3><a href='/add-patient'>Go Back</a>"
 
 
-# -------------------------------------------------------------
-# TEST PACKAGES (create / edit / delete a named group of tests)
-# -------------------------------------------------------------
-def _load_packages(cursor):
-    """[{id, name, tests: [(test_id, test_name, price), ...]}, ...]"""
-    cursor.execute("SELECT id, package_name, package_price FROM test_packages ORDER BY package_name COLLATE NOCASE")
-    pkgs = [{"id": r[0], "name": r[1], "price": r[2], "tests": []} for r in cursor.fetchall()]
-    by_id = {p["id"]: p for p in pkgs}
-    if pkgs:
-        cursor.execute("""
-            SELECT i.package_id, t.id, t.test_name, COALESCE(t.price, 0)
-            FROM test_package_items i JOIN tests t ON t.id = i.test_id
-            ORDER BY t.test_name
-        """)
-        for pid, tid, tname, price in cursor.fetchall():
-            if pid in by_id:
-                by_id[pid]["tests"].append((tid, tname, price))
-    return pkgs
-
-
 _PACKAGE_CSS = """
     body { font-family: 'Inter','Segoe UI',system-ui,sans-serif; background: #f4f7fb; padding: 24px; }
     .pk-wrap { max-width: 1000px; margin: auto; }
@@ -5254,6 +5385,7 @@ _PACKAGE_CSS = """
     .pk-del:hover { background:#fee2e2; }
 """
 
+
 _PACKAGE_JS = """
     function pkFilter() {
         const q = document.getElementById('pkSearch').value.toLowerCase();
@@ -5278,6 +5410,23 @@ _PACKAGE_JS = """
         pkCount();
     });
 """
+
+
+def _load_packages(cursor):
+    """[{id, name, tests: [(test_id, test_name, price), ...]}, ...]"""
+    cursor.execute("SELECT id, package_name, package_price FROM test_packages ORDER BY package_name COLLATE NOCASE")
+    pkgs = [{"id": r[0], "name": r[1], "price": r[2], "tests": []} for r in cursor.fetchall()]
+    by_id = {p["id"]: p for p in pkgs}
+    if pkgs:
+        cursor.execute("""
+            SELECT i.package_id, t.id, t.test_name, COALESCE(t.price, 0)
+            FROM test_package_items i JOIN tests t ON t.id = i.test_id
+            ORDER BY t.test_name
+        """)
+        for pid, tid, tname, price in cursor.fetchall():
+            if pid in by_id:
+                by_id[pid]["tests"].append((tid, tname, price))
+    return pkgs
 
 
 def _package_form_html(action, name_value, tests, selected_ids, button_label, cancel_html="", price_value=None):
@@ -5515,7 +5664,6 @@ def delete_package(package_id: int, request: Request):
     conn.commit()
     conn.close()
     return _package_redirect("Package deleted.")
-
 
 from fastapi import Form
 
@@ -6129,7 +6277,6 @@ def manage_tests(request: Request, dept: str = ""):
         <div class="container">
             <div class="top-actions">
                 <a href="/dashboard" class="back-link" style="margin-bottom:0;">← Back to Dashboard</a>
-                <a href="/load-standard-templates" class="template-btn" onclick="return confirm('Load standard Sri Lankan lab tests (FBC, LFT, Lipid, UFR, etc.)?');">⚡ Load Standard Lab Templates</a>
             </div>
             
             <h2 style="margin-top:15px;">Test Categories List</h2>
@@ -6165,6 +6312,7 @@ def manage_tests(request: Request, dept: str = ""):
                         <button type="button" onclick="insertTag('<b>', '</b>')"><b>B</b></button>
                         <button type="button" onclick="insertTag('<i>', '</i>')"><i>I</i></button>
                         <button type="button" onclick="insertTag('<u>', '</u>')"><u>U</u></button>
+                        <button type="button" onclick="insertTag('<span style=\'font-size:14px;\'>', '</span>')">Larger Text</button>
                         <button type="button" onclick="insertTag('<hr style=\'border:0; border-top:1px solid #ccc; margin:10px 0;\'>', '')">Insert Line</button>
                         <button type="button" onclick="insertTag('<div style=\'border:1px solid #0f4c81; padding:8px; border-radius:4px; margin:5px 0;\'>', '</div>')">Box Border</button>
                         <button type="button" onclick="insertTag('<br>', '')">New Line</button>
@@ -6248,16 +6396,6 @@ def seed_standard_tests_and_parameters():
         _ensure_column(cursor, "test_parameters", "is_calculated", "is_calculated INTEGER DEFAULT 0")
         _ensure_column(cursor, "test_parameters", "calculation_key", "calculation_key TEXT")
         _ensure_column(cursor, "test_parameters", "is_bold", "is_bold INTEGER DEFAULT 0")
-        # Per-RESULT bold flag, set by the operator on the Result Entry
-        # screen. Distinct from test_parameters.is_bold above, which is a
-        # per-parameter *config* flag that bolds the parameter NAME for
-        # every patient. This one bolds one specific patient's result
-        # VALUE for one specific test.
-        _ensure_column(cursor, "patient_parameter_results", "is_bold", "is_bold INTEGER DEFAULT 0")
-        # Per-assigned-test flag: when set, the ABST / antibiotic
-        # susceptibility section is omitted from the printed report
-        # (used for "No Growth" culture reports).
-        _ensure_column(cursor, "patient_assigned_tests", "hide_abst", "hide_abst INTEGER DEFAULT 0")
 
         standards = [
             {
@@ -6529,131 +6667,14 @@ def calculate_and_save_derived_results(cursor, patient_id, test_id):
 
 
 # -----------------------------
-# LOAD STANDARD LAB TEMPLATES ROUTE
+# LOAD STANDARD LAB TEMPLATES ROUTE  -- DEPRECATED / DISABLED
 # -----------------------------
+# The "Load Standard Lab Templates" button was removed from Manage Tests;
+# tests are now added manually. This route is intentionally kept ONLY so
+# old bookmarks / cached pages do not hit a 404. It performs NO database
+# writes and simply redirects back to the Manage Tests page.
 @app.get("/load-standard-templates")
 def load_standard_templates():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    # Safety checks to ensure all columns exist in 'tests' table
-    try:
-        cursor.execute("ALTER TABLE tests ADD COLUMN notes TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE tests ADD COLUMN col_alignments TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cursor.execute("ALTER TABLE tests ADD COLUMN test_code TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    # Ensure columns exist in 'test_parameters' table
-    try:
-        cursor.execute("ALTER TABLE test_parameters ADD COLUMN default_result TEXT")
-        cursor.execute("ALTER TABLE test_parameters ADD COLUMN input_type TEXT DEFAULT 'numeric'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    standards = [
-        {
-            "code": "FBC", "name": "FULL BLOOD COUNT (FBC)", "price": 1200.0, "dept": "Hematology", "specimen": "Blood (EDTA)",
-            "params": [
-                ("White Blood Cell (WBC)", "10^3/uL", "4.0 - 11.0", "numeric", ""),
-                ("Red Blood Cell (RBC)", "10^6/uL", "4.5 - 5.5", "numeric", ""),
-                ("Hemoglobin (Hb)", "g/dL", "13.0 - 17.0", "numeric", ""),
-                ("Hematocrit (PCV)", "%", "40.0 - 50.0", "numeric", ""),
-                ("Platelets", "10^3/uL", "150 - 450", "numeric", ""),
-                ("Neutrophils", "%", "40 - 75", "numeric", ""),
-                ("Lymphocytes", "%", "20 - 45", "numeric", ""),
-                ("Eosinophils", "%", "1 - 6", "numeric", ""),
-                ("Monocytes", "%", "2 - 10", "numeric", "")
-            ]
-        },
-        {
-            "code": "LIPID", "name": "LIPID PROFILE", "price": 2500.0, "dept": "Biochemistry", "specimen": "Blood (Serum)",
-            "params": [
-                ("Total Cholesterol", "mg/dL", "< 200", "numeric", ""),
-                ("Triglycerides", "mg/dL", "< 150", "numeric", ""),
-                ("HDL Cholesterol", "mg/dL", "> 40", "numeric", ""),
-                ("LDL Cholesterol", "mg/dL", "< 100", "numeric", ""),
-                ("VLDL Cholesterol", "mg/dL", "2 - 30", "numeric", "")
-            ]
-        },
-        {
-            "code": "CREAT-EGFR", "name": "CREATININE WITH eGFR", "price": 1500.0, "dept": "Biochemistry", "specimen": "Blood (Serum)",
-            "params": [
-                ("Serum Creatinine", "mg/dL", "0.6 - 1.3", "numeric", ""),
-                ("Estimated GFR", "mL/min/1.73m²", ">= 90", "numeric", ""),
-            ]
-        },
-        {
-            "code": "LFT", "name": "LIVER FUNCTION TEST (LFT)", "price": 3000.0, "dept": "Biochemistry", "specimen": "Blood (Serum)",
-            "params": [
-                ("Total Bilirubin", "mg/dL", "0.2 - 1.2", "numeric", ""),
-                ("Direct Bilirubin", "mg/dL", "0.0 - 0.3", "numeric", ""),
-                ("SGOT (AST)", "U/L", "10 - 40", "numeric", ""),
-                ("SGPT (ALT)", "U/L", "7 - 56", "numeric", ""),
-                ("Alkaline Phosphatase", "U/L", "44 - 147", "numeric", ""),
-                ("Total Protein", "g/dL", "6.0 - 8.3", "numeric", ""),
-                ("Albumin", "g/dL", "3.5 - 5.0", "numeric", "")
-            ]
-        },
-        {
-            "code": "UFR", "name": "URINE FULL REPORT (UFR)", "price": 600.0, "dept": "Pathology", "specimen": "Urine",
-            "params": [
-                ("Color", "", "Yellow / Pale", "text", "Yellow"),
-                ("Appearance", "", "Clear", "text", "Clear"),
-                ("Albumin", "", "Negative", "text", "Nil"),
-                ("Sugar", "", "Negative", "text", "Nil"),
-                ("Pus Cells", "/HPF", "0 - 5", "text", "0 - 2"),
-                ("RBCs", "/HPF", "0 - 2", "text", "Nil"),
-                ("Epithelial Cells", "/HPF", "Occasional", "text", "Occasional")
-            ]
-        },
-        {
-            "code": "FBS", "name": "FASTING BLOOD SUGAR (FBS)", "price": 500.0, "dept": "Biochemistry", "specimen": "Blood (Fluoride)",
-            "params": [
-                ("Fasting Blood Sugar", "mg/dL", "70 - 99", "numeric", "")
-            ]
-        }
-    ]
-
-    for item in standards:
-        # Check if test code exists
-        cursor.execute("SELECT id FROM tests WHERE test_code = ? OR test_name = ?", (item["code"], item["name"]))
-        existing = cursor.fetchone()
-        
-        if not existing:
-            cursor.execute("""
-                INSERT INTO tests (test_code, test_name, price, department, specimen, col_alignments)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (item["code"], item["name"], item["price"], item["dept"], item["specimen"], "left,center,center,left,left"))
-            test_id = cursor.lastrowid
-        else:
-            test_id = existing[0]
-
-        # Insert standard parameters
-        for idx, (p_name, unit, ref, inp_type, def_res) in enumerate(item["params"], start=1):
-            cursor.execute("""
-                SELECT id FROM test_parameters WHERE test_id = ? AND param_name = ?
-            """, (test_id, p_name))
-            if not cursor.fetchone():
-                cursor.execute("""
-                    INSERT INTO test_parameters (test_id, param_name, unit, ref_range, display_order, default_result, input_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (test_id, p_name, unit, ref, idx, def_res, inp_type))
-
-    conn.commit()
-    conn.close()
     return RedirectResponse(url="/manage-tests", status_code=303)
 
 # -----------------------------
@@ -7193,7 +7214,9 @@ def edit_test_category_page(test_id: int):
 
     def sel(val, target): return "selected" if val == target else ""
 
-    notes_value = test[4] if test[4] else ""
+    # Escaped for the <textarea> only (same text the admin saw before, but a
+    # stray </textarea> or entity can no longer corrupt the page or the saved HTML).
+    notes_value = html.escape(html.unescape(str(test[4])), quote=False) if test[4] else ""
     price_value = test[1] if test[1] is not None else 0.0
     department_value = test[2] if test[2] else ""
     specimen_value = test[3] if test[3] else ""
@@ -7762,7 +7785,7 @@ def test_entry_page(patient_id: int, test_id: int):
     if bool(p_dict.get("is_cancelled")):
         conn.close()
         manual_bill_no = str(p_dict.get("manual_bill_no") or "").strip()
-        ref_no = f"Med-{patient_id:04d}"
+        ref_no = f"PRI-{patient_id:04d}"
         display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
         return render_cancelled_bill_page(display_ref_no)
 
@@ -8003,7 +8026,10 @@ def test_entry_page(patient_id: int, test_id: int):
         </div>
         <div style="text-align:center; margin-top:14px;">
             <a href="/whatsapp-share/{patient_id}/{test_id}" target="_blank" class="no-print" style="display:inline-flex; align-items:center; gap:8px; background:#25D366; color:#fff; padding:11px 24px; border-radius:8px; font-weight:700; font-size:14px; text-decoration:none;">
-                <i class="fa-brands fa-whatsapp" style="font-size:18px;"></i> Send Report via WhatsApp
+                <i class="fa-brands fa-whatsapp" style="font-size:18px;"></i> Send This Report
+            </a>
+            <a href="/whatsapp-share-multi/{patient_id}" target="_blank" class="no-print" style="display:inline-flex; align-items:center; gap:8px; background:#128C7E; color:#fff; padding:11px 24px; border-radius:8px; font-weight:700; font-size:14px; text-decoration:none; margin-left:8px;">
+                <i class="fa-brands fa-whatsapp" style="font-size:18px;"></i> Send All Saved Reports
             </a>
         </div>
         """
@@ -8217,7 +8243,7 @@ def update_patient_info(
     persisted. `patient_age` is still accepted so any older/cached form
     that posts a single value keeps working (treated as years).
     """
-    if not user_can(get_current_user(request), "can_edit_patients"):
+    if not user_can(request, "can_edit_patients"):
         return render_locked_page("Update Patient Details")
 
     def _as_int(value, fallback=0):
@@ -8267,7 +8293,7 @@ def update_patient_info(
 
 @app.post("/save-specific-test/{patient_id}/{test_id}")
 async def save_specific_test(patient_id: int, test_id: int, request: Request):
-    if not user_can(get_current_user(request), "can_edit_results"):
+    if not user_can(request, "can_edit_results"):
         return render_locked_page("Enter / Modify Test Results")
     form_data = await request.form()
     conn = get_db_connection()
@@ -8381,17 +8407,26 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     if bool(p.get("is_cancelled")):
         conn.close()
         manual_bill_no = str(p.get("manual_bill_no") or "").strip()
-        ref_no = f"Med-{patient_id:04d}"
+        ref_no = f"PRI-{patient_id:04d}"
         display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
         return render_cancelled_bill_page(display_ref_no)
 
     p_id = p.get("id")
     p_title = p.get("title") or p.get("salutation") or ""
     p_name = p.get("name") or p.get("patient_name") or p.get("full_name") or ""
-    p_age = p.get("age") or p.get("age_years") or p.get("patient_age") or ""
-    # Separate Years/Months/Days, mirroring test_entry_page()'s _age_part()
-    # helper, so infant/child ages entered in months or days round-trip
-    # correctly here too instead of collapsing into one "years" box.
+    # Infant-safe age display. Reading only the years column showed a BLANK
+    # age box for any patient under 1 year (0Y 3M 5D), so months/days could
+    # never be seen or edited. Render the full Y/M/D form when present.
+    _p_y = p.get("age_years") if p.get("age_years") not in (None, "") else p.get("age")
+    _p_m = p.get("age_months")
+    _p_d = p.get("age_days")
+    try:
+        p_age = format_age_components(_p_y or 0, _p_m or 0, _p_d or 0)
+    except Exception:
+        p_age = ""
+    if not p_age:
+        p_age = p.get("age") or p.get("age_years") or p.get("patient_age") or ""
+    # Separate Years/Months/Days values for the edit form (infant-safe).
     def _age_part(key):
         try:
             value = p.get(key)
@@ -8404,15 +8439,14 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     if p_age_years == 0 and p_age_months == 0 and p_age_days == 0:
         p_age_years = _age_part("age")
     p_gender = p.get("gender") or p.get("sex") or "Male"
+    # Age in days drives the age-aware reference-range selection below.
+    try:
+        p_age_days_val = patient_age_to_days(p)
+    except Exception:
+        p_age_days_val = 0
     p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
     p_doctor = p.get("doctor") or p.get("doctor_name") or p.get("ref_doctor") or ""
-    p_center = p.get("center") or p.get("collecting_center") or p.get("branch") or ""
-
-    # Needed for the same gender/age-aware reference-range lookup that
-    # test_entry_page() already uses, so a parameter's correct range shows
-    # up immediately here too instead of only after visiting report_view.
-    patient_age_days = patient_age_to_days(p)
-    patient_gender_val = p.get("gender") or ""
+    p_center = p.get("center") or p.get("branch") or ""
 
     # 2. Fetch Assigned Tests with Categories safely
     try:
@@ -8469,27 +8503,44 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 main_result = t["result"] if t["result"] else ""
                 test_comment = t["comment"] if "comment" in t.keys() and t["comment"] else ""
                 
-                # Fetch parameters straight from test_parameters, respecting
-                # the saved custom display order and pulling unit/ref_range
-                # too - same query test_entry_page() uses, so both Result
-                # Entry screens show identical reference ranges immediately
-                # on load instead of one of them needing a report_view visit
-                # or a Reset first to "discover" this data.
+                # Fetch parameters dynamically, respecting the saved custom
+                # display order. Tries "display_order ASC, id ASC" first;
+                # only falls back to the old "id ASC" ordering if the
+                # candidate table/column combination doesn't have a
+                # display_order column (legacy schema compatibility - same
+                # defensive try/except pattern already used for
+                # default_result below).
                 params = []
-                try:
-                    cursor.execute("""
-                        SELECT id, param_name AS p_name, unit, ref_range,
-                               COALESCE(display_order, 0) AS display_order,
-                               COALESCE(default_result, '') AS default_ref_range
-                        FROM test_parameters
-                        WHERE test_id = ?
-                        ORDER BY display_order ASC, id ASC
-                    """, (t_id,))
-                    params = cursor.fetchall()
-                except sqlite3.Error:
-                    params = []
+                for tbl in ["test_parameters", "parameters", "sub_tests", "test_fields"]:
+                    for col in ["parameter_name", "name", "param_name"]:
+                        try:
+                            cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY display_order ASC, id ASC", (t_id,))
+                            params = cursor.fetchall()
+                            if params: break
+                        except:
+                            try:
+                                cursor.execute(f"SELECT id, {col} as p_name, default_result as default_ref_range FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
+                                params = cursor.fetchall()
+                                if params: break
+                            except:
+                                try:
+                                    cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY display_order ASC, id ASC", (t_id,))
+                                    params = cursor.fetchall()
+                                    if params: break
+                                except:
+                                    try:
+                                        cursor.execute(f"SELECT id, {col} as p_name FROM {tbl} WHERE test_id = ? ORDER BY id ASC", (t_id,))
+                                        params = cursor.fetchall()
+                                        if params: break
+                                    except:
+                                        continue
+                    if params: break
                 
-                # Pre-fetch existing parameter values, bold flag & lock status
+                # Pre-fetch existing parameter values & determine lock status.
+                # Units and the gender/age-aware reference range are resolved
+                # HERE, on the initial GET, so Result Entry shows the same
+                # Ref/Unit context the printed report will use - previously
+                # the operator had to save first to see any of it.
                 param_values = []
                 has_saved_param_value = False
                 for p_item in params:
@@ -8501,43 +8552,55 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                     # there's nothing meaningful to type into a separator.
                     if str(p_name_val or "").strip() in {"", ".", "-", "_"}:
                         continue
-                    unit_val = p_item["unit"] or ""
                     default_val = p_item["default_ref_range"] if "default_ref_range" in p_item.keys() and p_item["default_ref_range"] else ""
 
-                    # Patient-specific reference range wins over the
-                    # parameter's own default, exactly like test_entry_page.
-                    selected_ref = None
+                    # Unit + template ref_range, fetched tolerantly so the
+                    # existing multi-table/multi-column fallback chain above
+                    # stays untouched.
+                    unit_val = ""
+                    tmpl_ref = ""
                     try:
-                        selected_ref = select_best_ref_range(cursor, p_id_param, patient_gender_val, patient_age_days)
+                        cursor.execute("SELECT COALESCE(unit,'') AS u, COALESCE(ref_range,'') AS r FROM test_parameters WHERE id = ?", (p_id_param,))
+                        ur_row = cursor.fetchone()
+                        if ur_row:
+                            unit_val = ur_row["u"] or ""
+                            tmpl_ref = ur_row["r"] or ""
                     except Exception:
-                        selected_ref = None
+                        pass
+
+                    # Gender/age-aware range wins over the template default.
+                    selected_ref = ""
+                    try:
+                        selected_ref = select_best_ref_range(cursor, int(p_id_param), p_gender, p_age_days_val) or ""
+                    except Exception:
+                        selected_ref = ""
                     if not selected_ref:
-                        selected_ref = p_item["ref_range"] or ""
+                        selected_ref = tmpl_ref
 
                     p_val = ""
-                    p_is_bold = 0
+                    p_bold = 0
                     try:
-                        cursor.execute(
-                            "SELECT result_value, COALESCE(is_bold, 0) AS is_bold FROM patient_parameter_results "
-                            "WHERE patient_id = ? AND test_id = ? AND parameter_id = ?",
-                            (patient_id, t_id, p_id_param)
-                        )
+                        cursor.execute("SELECT result_value, COALESCE(is_bold, 0) AS is_bold FROM patient_parameter_results WHERE patient_id = ? AND test_id = ? AND parameter_id = ?", (patient_id, t_id, p_id_param))
                         exist_res = cursor.fetchone()
                         if exist_res:
-                            if exist_res["result_value"] is not None:
-                                p_val = exist_res["result_value"]
-                            p_is_bold = int(exist_res["is_bold"] or 0)
-                    except Exception:
-                        # Older database without the is_bold column - fall
-                        # back to the value-only query.
+                            p_val = exist_res["result_value"]
+                            p_bold = int(exist_res["is_bold"] or 0)
+                    except: pass
+
+                    # No saved result yet -> fall back to the parameter's own
+                    # default bold setting from the test template.
+                    if not p_val or not str(p_val).strip():
                         try:
-                            cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id = ? AND test_id = ? AND parameter_id = ?", (patient_id, t_id, p_id_param))
-                            exist_res = cursor.fetchone()
-                            if exist_res: p_val = exist_res["result_value"]
-                        except: pass
+                            cursor.execute("SELECT COALESCE(is_bold, 0) AS b FROM test_parameters WHERE id = ?", (p_id_param,))
+                            b_row = cursor.fetchone()
+                            if b_row:
+                                p_bold = int(b_row["b"] or 0)
+                        except Exception:
+                            pass
+
                     if p_val and str(p_val).strip():
                         has_saved_param_value = True
-                    param_values.append((p_id_param, p_name_val, default_val, p_val, unit_val, selected_ref, p_is_bold))
+                    param_values.append((p_id_param, p_name_val, default_val, p_val, unit_val, selected_ref, p_bold))
 
                 has_results = bool(main_result and str(main_result).strip()) or has_saved_param_value
 
@@ -8558,6 +8621,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
 
                 # ---- WhatsApp button (only once results are saved) ----
                 wa_btn_html = f"""
+                                <label title="Include in 'Send Selected'" style="display: flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: #166534; cursor: pointer; margin: 0;"><input type="checkbox" class="wa-pick" value="{t_id}" checked onchange="waCount()" style="width: 14px; height: 14px; margin: 0;"> Select</label>
                                 <a href="/whatsapp-share/{p_id}/{t_id}" target="_blank" title="Send this report to the patient on WhatsApp" style="background: #25D366; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; text-decoration: none; display: flex; align-items: center; gap: 5px;">
                                     <i class="fa-brands fa-whatsapp"></i> WhatsApp
                                 </a>""" if has_results else ""
@@ -8616,11 +8680,11 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                         <span>Parameter</span><span>Result</span><span style="text-align:center;">Bold</span><span>Unit</span><span>Ref. Range</span>
                     </div>
                     <div style="display: grid; gap: 4px; margin-bottom: 8px;">"""
-                    for p_id_param, p_name_val, default_val, p_val, unit_val, selected_ref, p_is_bold in param_values:
+                    for p_id_param, p_name_val, default_val, p_val, unit_val, selected_ref, p_bold in param_values:
                         final_val = p_val if p_val != "" else default_val
 
                         bold_disabled = ' disabled' if has_results else ''
-                        bold_checked = ' checked' if p_is_bold else ''
+                        bold_checked = ' checked' if p_bold else ''
                         ref_html = (
                             f'<span style="font-size:11px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="{html.escape(str(selected_ref))}">{html.escape(str(selected_ref))}</span>'
                             if selected_ref else '<span></span>'
@@ -8647,6 +8711,27 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                     </div>
                     """
                 
+                # --- CULTURE / ABST VISIBILITY TOGGLE ---
+                # Only rendered for culture-type tests. The hidden companion
+                # field lets the save handler distinguish "unticked" from
+                # "not on screen", since unchecked boxes submit nothing.
+                if test_is_culture(t_name):
+                    try:
+                        cursor.execute("SELECT COALESCE(hide_abst, 0) AS h FROM patient_assigned_tests WHERE id = ?", (assigned_id,))
+                        _h_row = cursor.fetchone()
+                        _hide_abst_checked = "checked" if (_h_row and int(_h_row["h"] or 0)) else ""
+                    except Exception:
+                        _hide_abst_checked = ""
+                    categories_html += f"""
+                    <div style="margin-top: 8px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 7px 10px;">
+                        <input type="hidden" name="abst_present_{assigned_id}" value="1">
+                        <label style="display:flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600; color:#92400e; cursor:pointer;">
+                            <input type="checkbox" name="hide_abst_{assigned_id}" value="1" {_hide_abst_checked} style="width:15px; height:15px; accent-color:#b45309; cursor:pointer;">
+                            Hide ABST Section (No Growth)
+                        </label>
+                    </div>
+                    """
+
                 # --- TEST COMMENT / REMARK BOX WITH FORMATTING TOOLBAR ---
                 categories_html += f"""
                 <div style="margin-top: 12px; border-top: 1px dashed #cbd5e1; padding-top: 10px;">
@@ -8670,10 +8755,42 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     else:
         categories_html = '<div style="padding: 24px; text-align: center; color: #94a3b8; background: white; border-radius: 8px; border: 1px solid #e2e8f0;">No tests assigned for this patient.</div>'
 
-    doctor_field_html, center_field_html = build_doctor_center_fields(
-        cursor, p_doctor, p_center, "doctor", "doctor_manual", "center"
-    )
+    doctor_select_html = _build_doctor_select_html(cursor, p_doctor, "doctor", "doctor_manual", "")
+    center_select_html = _build_center_select_html(cursor, p_center, "center", "")
+
     conn.close()
+
+    wa_multi_bar_html = """
+    <div id="wa-multi-bar" style="display:none; align-items:center; flex-wrap:wrap; gap:12px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:12px 16px; margin-bottom:18px;">
+        <div style="display:flex; align-items:center; gap:8px; font-weight:700; color:#166534; font-size:14px;">
+            <i class="fa-brands fa-whatsapp" style="font-size:20px; color:#25D366;"></i> Send reports via WhatsApp
+        </div>
+        <label style="display:flex; align-items:center; gap:6px; font-size:13px; font-weight:600; color:#166534; cursor:pointer; margin:0;">
+            <input type="checkbox" id="wa-all" checked onchange="waToggleAll(this)" style="width:15px; height:15px; margin:0;"> Select all
+        </label>
+        <button type="button" onclick="waSendSelected()" style="margin-left:auto; background:#25D366; color:#fff; border:none; padding:9px 20px; border-radius:8px; font-weight:700; font-size:13px; cursor:pointer; display:flex; align-items:center; gap:8px;">
+            <i class="fa-brands fa-whatsapp"></i> Send Selected (<span id="wa-count">0</span>) in one message
+        </button>
+    </div>
+    <script>
+    function waPicks() { return Array.prototype.slice.call(document.querySelectorAll('.wa-pick')); }
+    function waCount() {
+        var p = waPicks(), n = 0;
+        p.forEach(function (c) { if (c.checked) n++; });
+        var el = document.getElementById('wa-count'); if (el) el.textContent = n;
+        var all = document.getElementById('wa-all'); if (all) all.checked = (p.length > 0 && n === p.length);
+    }
+    function waToggleAll(cb) { waPicks().forEach(function (c) { c.checked = cb.checked; }); waCount(); }
+    function waSendSelected() {
+        var ids = waPicks().filter(function (c) { return c.checked; }).map(function (c) { return c.value; });
+        if (!ids.length) { alert('Please tick at least one report to send.'); return; }
+        window.open('/whatsapp-share-multi/__PID__?tests=' + ids.join(','), '_blank');
+    }
+    document.addEventListener('DOMContentLoaded', function () {
+        if (waPicks().length) { var b = document.getElementById('wa-multi-bar'); if (b) b.style.display = 'flex'; waCount(); }
+    });
+    </script>
+    """.replace("__PID__", str(patient_id))
 
     is_verified = (total_tests > 0 and completed_count == total_tests)
     status_badge = """
@@ -8784,8 +8901,8 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                                 <select name="title">
                                     <option value="Mr." {"selected" if p_title == "Mr." else ""}>Mr.</option>
                                     <option value="Mrs." {"selected" if p_title == "Mrs." else ""}>Mrs.</option>
-                                    <option value="Ms." {"selected" if p_title == "Ms." else ""}>Ms.</option>
                                     <option value="Miss" {"selected" if p_title == "Miss" else ""}>Miss</option>
+                                    <option value="Ms." {"selected" if p_title == "Ms." else ""}>Ms.</option>
                                     <option value="Rev." {"selected" if p_title == "Rev." else ""}>Rev.</option>
                                     <option value="Dr." {"selected" if p_title == "Dr." else ""}>Dr.</option>
                                     <option value="Master" {"selected" if p_title == "Master" else ""}>Master</option>
@@ -8819,12 +8936,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                             </div>
                         </div>
                         <div class="form-group">
-                            <label>Doctor</label>
-                            {doctor_field_html}
+                            <label>Referred By (Doctor)</label>
+                            {doctor_select_html}
                         </div>
                         <div class="form-group">
                             <label>Center / Branch</label>
-                            {center_field_html}
+                            {center_select_html}
                         </div>
                         <button type="submit" class="btn-save"><i class="fa-solid fa-floppy-disk"></i> Save Patient Info</button>
                     </form>
@@ -8835,6 +8952,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                     <h3 style="margin-bottom: 25px;">
                         <span><i class="fa-solid fa-flask"></i> Assigned Tests, Results & Comments</span>
                     </h3>
+                    {wa_multi_bar_html}
                     {categories_html}
                 </div>
             </div>
@@ -8857,7 +8975,7 @@ async def update_patient_details(request: Request):
     still accepted and parsed the same way as before, purely so any other
     caller still posting the old format keeps working.
     """
-    if not user_can(get_current_user(request), "can_edit_patients"):
+    if not user_can(request, "can_edit_patients"):
         return render_locked_page("Update Patient Details")
     conn = None
     try:
@@ -8979,12 +9097,9 @@ async def update_patient_details(request: Request):
 # report so it can never be mistaken for a valid test bill.
 @app.post("/invoices/{invoice_id}/cancel")
 def cancel_invoice(invoice_id: int, request: Request):
-    current_user = get_current_user(request)
-    # Bill cancellation is destructive and financially significant, so it
-    # needs its own explicit grant - having general "reports" access is no
-    # longer sufficient. user_can() re-reads the flag from the database
-    # rather than trusting the (client-editable) permissions cookie.
-    if not user_can(current_user, "can_cancel_bills"):
+    # Dedicated, database-verified cancellation permission. "reports" is
+    # still accepted so existing report-admins keep working.
+    if not (user_can(request, "can_cancel_bills") or user_can(request, "reports")):
         return render_locked_page("Cancel Bill")
 
     conn = get_db_connection()
@@ -8999,7 +9114,7 @@ def cancel_invoice(invoice_id: int, request: Request):
     conn.commit()
     conn.close()
 
-    ref_no = f"Med-{invoice_id:04d}"
+    ref_no = f"PRI-{invoice_id:04d}"
     manual_bill_no = str(row["manual_bill_no"] or "").strip()
     display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
     success_msg = f"Bill {display_ref_no} cancelled successfully."
@@ -9013,8 +9128,9 @@ def cancel_invoice(invoice_id: int, request: Request):
 # =============================================================
 @app.post("/save-test-results")
 async def save_test_results(request: Request):
-    if not user_can(get_current_user(request), "can_edit_results"):
-        return render_locked_page("Enter / Modify Test Results")
+    # Database-verified permission to write results.
+    if not user_can(request, "can_edit_results"):
+        return render_locked_page("Edit Results")
     try:
         form_data = await request.form()
         patient_id = form_data.get("patient_id")
@@ -9030,7 +9146,7 @@ async def save_test_results(request: Request):
         p_row = cursor.fetchone()
         if p_row and bool(p_row["is_cancelled"]):
             conn.close()
-            return render_cancelled_bill_page(f"Med-{patient_id:04d}")
+            return render_cancelled_bill_page(f"PRI-{patient_id:04d}")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS patient_parameter_results (
@@ -9082,12 +9198,6 @@ async def save_test_results(request: Request):
                 test_id = parts[1]
                 param_id = parts[2]
 
-                # An unchecked checkbox is simply absent from the POST
-                # body, so the bold flag is derived from presence of
-                # bold_<test>_<param> - same convention save_specific_test()
-                # (test_entry_page's save handler) already uses.
-                is_bold_flag = 1 if form_data.get(f"bold_{test_id}_{param_id}") else 0
-
                 # Locking: only allow setting the parameter result if it isn't already saved.
                 cursor.execute("""
                     SELECT result_value FROM patient_parameter_results 
@@ -9096,11 +9206,29 @@ async def save_test_results(request: Request):
                 existing_param = cursor.fetchone()
                 existing_param_value = existing_param["result_value"] if existing_param else None
                 if not (existing_param_value and str(existing_param_value).strip()):
+                    bold_flag = 1 if form_data.get(f"bold_{test_id}_{param_id}") else 0
                     cursor.execute("""
                         INSERT INTO patient_parameter_results (patient_id, test_id, parameter_id, result_value, is_bold)
                         VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(patient_id, test_id, parameter_id) DO UPDATE SET result_value = excluded.result_value, is_bold = excluded.is_bold
-                    """, (patient_id, test_id, param_id, value, is_bold_flag))
+                        ON CONFLICT(patient_id, test_id, parameter_id) DO UPDATE SET
+                            result_value = excluded.result_value,
+                            is_bold = excluded.is_bold
+                    """, (patient_id, test_id, param_id, value, bold_flag))
+
+        # Culture/ABST visibility. Checkbox is only present for culture-type
+        # tests; an unchecked box submits nothing, so the flag is derived from
+        # the hidden companion field listing which assigned rows were on-screen.
+        for key, value in form_data.items():
+            if key.startswith("abst_present_"):
+                assigned_id_abst = key.replace("abst_present_", "", 1)
+                hide_flag = 1 if form_data.get(f"hide_abst_{assigned_id_abst}") else 0
+                try:
+                    cursor.execute(
+                        "UPDATE patient_assigned_tests SET hide_abst = ? WHERE id = ?",
+                        (hide_flag, assigned_id_abst)
+                    )
+                except Exception:
+                    pass
 
         # Persist the "Hide ABST" toggle (only sent by culture/sensitivity test forms).
         if form_data.get("abst_toggle_present"):
@@ -9206,10 +9334,110 @@ def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
     greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
     message = (
         f"Hello {greet},\n"
-        f"Your test report from Medistar Medical Laboratory is now ready.\n"
+        f"Your test report from Prime Medical Laboratory is now ready.\n"
         f"You can view and download your report using this secure link:\n"
         f"\U0001F517 {report_url}\n\n"
         f"Thank you!"
+    )
+    number = _wa_phone_digits(p_phone)
+    if number:
+        wa_url = f"https://wa.me/{number}?text={quote(message)}"
+    else:
+        wa_url = f"https://api.whatsapp.com/send?text={quote(message)}"
+    return RedirectResponse(url=wa_url, status_code=303)
+
+
+@app.get("/whatsapp-share-multi/{patient_id}")
+def whatsapp_share_multi(patient_id: int, request: Request, tests: str = ""):
+    """One WhatsApp message containing a secure (letterhead) link for every selected
+    report of the patient. ?tests=1,2,3 = chosen tests; no value = all saved tests."""
+    wanted = []
+    for part in str(tests or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            wanted.append(int(part))
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+        prow = cursor.fetchone()
+        if not prow:
+            return HTMLResponse("<h3 style='font-family:Arial'>Patient not found.</h3>", status_code=404)
+        try:
+            cursor.execute("""
+                SELECT pat.test_id, pat.result,
+                       COALESCE(t.test_name, tt.test_name, 'Test') AS test_name
+                FROM patient_assigned_tests pat
+                LEFT JOIN tests t ON pat.test_id = t.id
+                LEFT JOIN test_types tt ON pat.test_id = tt.id
+                WHERE pat.patient_id = ?
+                ORDER BY pat.id
+            """, (patient_id,))
+            assigned = cursor.fetchall()
+        except Exception:
+            cursor.execute("""
+                SELECT pat.test_id, pat.result, COALESCE(t.test_name, 'Test') AS test_name
+                FROM patient_assigned_tests pat
+                LEFT JOIN tests t ON pat.test_id = t.id
+                WHERE pat.patient_id = ?
+                ORDER BY pat.id
+            """, (patient_id,))
+            assigned = cursor.fetchall()
+
+        chosen = []
+        seen = set()
+        for r in assigned:
+            tid = r["test_id"]
+            if tid in seen:
+                continue
+            if wanted:
+                if tid not in wanted:
+                    continue
+            else:
+                # no explicit list -> only tests that already have saved results
+                saved = bool(r["result"] and str(r["result"]).strip())
+                if not saved:
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM patient_parameter_results WHERE patient_id = ? AND test_id = ?", (patient_id, tid))
+                        saved = cursor.fetchone()[0] > 0
+                    except Exception:
+                        saved = False
+                if not saved:
+                    continue
+            seen.add(tid)
+            chosen.append((tid, str(r["test_name"] or "Test").strip()))
+    finally:
+        conn.close()
+
+    if not chosen:
+        return HTMLResponse("<h3 style='font-family:Arial'>No saved reports found to send for this patient.</h3>", status_code=404)
+
+    p = dict(prow)
+    p_name = str(p.get("name") or p.get("patient_name") or p.get("full_name") or "").strip()
+    p_title = str(p.get("title") or p.get("salutation") or "").strip()
+    p_phone = p.get("phone") or p.get("telephone") or p.get("mobile") or ""
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+
+    lines = []
+    for idx, (tid, tname) in enumerate(chosen, start=1):
+        token = _get_or_create_report_qr_token(patient_id, tid)
+        if not token:
+            continue
+        lines.append(f"{idx}. *{tname}*\n\U0001F517 {proto}://{host}/public-report/{token}")
+    if not lines:
+        return HTMLResponse("<h3 style='font-family:Arial'>Could not create the report links.</h3>", status_code=404)
+
+    greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
+    plural = len(lines) > 1
+    message = (
+        f"Hello {greet},\n"
+        f"Your test {'reports' if plural else 'report'} from Prime Medical Laboratory {'are' if plural else 'is'} now ready.\n"
+        f"You can view and download {'them' if plural else 'it'} using the secure {'links' if plural else 'link'} below:\n\n"
+        + "\n\n".join(lines)
+        + "\n\nThank you!"
     )
     number = _wa_phone_digits(p_phone)
     if number:
@@ -9246,96 +9474,10 @@ def print_report(patient_id: int):
 
 
 # -------------------------------------------------------------
-# DIRECT PDF DOWNLOAD ROUTE (QR + Download Button)
-# -------------------------------------------------------------
-@app.get("/report-download/{patient_id}/{test_id}")
-def report_download(patient_id: int, test_id: int, request: Request):
-    """Render the existing report HTML to a PDF for QR-code/download use.
-
-    The report-view route remains the single source of truth for report data and
-    styling, so this does not duplicate or change the existing report logic.
-    """
-    try:
-        from weasyprint import HTML
-    except Exception:
-        # Keep the system usable on installations without WeasyPrint.
-        return RedirectResponse(url=f"/report-view/{patient_id}/{test_id}", status_code=303)
-
-    report_html = report_view(patient_id, test_id, request)
-    if isinstance(report_html, HTMLResponse):
-        html_bytes = report_html.body
-        html_text = html_bytes.decode("utf-8")
-    elif isinstance(report_html, str):
-        html_text = report_html
-    else:
-        return report_html
-    try:
-        pdf_bytes = HTML(string=html_text, base_url=str(request.base_url)).write_pdf()
-    except Exception as exc:
-        return HTMLResponse(content=f"<h3>Unable to generate PDF: {html.escape(str(exc))}</h3>", status_code=500)
-
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"MEDISTAR_{patient_id}_{test_id}").strip("_") or "MEDISTAR_REPORT"
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
-    )
-
-# -------------------------------------------------------------
-# PUBLIC (QR) REPORT ROUTES - token-gated, read-only, no login, no cookies
+# DIRECT PDF DOWNLOAD ROUTE (staff) + PUBLIC QR REPORT ROUTES
 # -------------------------------------------------------------
 _REPORT_QR_TABLE_READY = False
 _QR_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
-
-# Widths per symbol value (0..105 data/start, 106 = stop), in modules,
-# alternating bar/space starting with a bar.
-_CODE128_WIDTHS = [
-    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
-    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
-    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
-    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
-    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
-    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
-    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
-    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
-    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
-    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
-    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
-    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
-    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
-    "211214", "211232", "2331112",
-]
-
-
-def _code128b_data_uri(text: str):
-    """SVG data: URI of a Code 128-B barcode for `text` (generated locally, no
-    external service), or None if it cannot be encoded."""
-    try:
-        if not text or any(not (32 <= ord(ch) <= 126) for ch in text):
-            return None
-        values = [104] + [ord(ch) - 32 for ch in text]
-        checksum = (104 + sum(i * v for i, v in enumerate(values[1:], start=1))) % 103
-        values += [checksum, 106]
-        quiet = 10
-        x = quiet
-        rects = []
-        for val in values:
-            is_bar = True
-            for w in _CODE128_WIDTHS[val]:
-                width = int(w)
-                if is_bar:
-                    rects.append(f'<rect x="{x}" y="0" width="{width}" height="30"/>')
-                x += width
-                is_bar = not is_bar
-        total = x + quiet
-        svg = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total} 30" '
-            f'preserveAspectRatio="none" shape-rendering="crispEdges">'
-            f'<rect width="{total}" height="30" fill="#fff"/><g fill="#000">{"".join(rects)}</g></svg>'
-        )
-        return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("ascii")).decode("ascii")
-    except Exception:
-        return None
 
 
 def _ensure_report_qr_table(cursor) -> None:
@@ -9357,8 +9499,8 @@ def _ensure_report_qr_table(cursor) -> None:
 
 
 def _get_or_create_report_qr_token(patient_id: int, test_id: int):
-    """Stable QR token for a report (created on first use), or None on any
-    problem (callers then keep the previous QR target)."""
+    """Returns the stable QR token for a report (creating it if needed), or
+    None on any problem (callers then omit the QR - fail closed)."""
     conn = None
     try:
         conn = get_db_connection()
@@ -9444,13 +9586,127 @@ def _public_message_page(title: str, message: str, status_code: int) -> HTMLResp
     )
 
 
+def _legacy_qr_notice_page() -> HTMLResponse:
+    """Shown when an OLD printed QR (/report-download/{patient}/{test}) is opened
+    without staff permission. It never redirects to login, never sets cookies
+    and never reveals report data."""
+    return _public_message_page(
+        "This QR link is no longer active",
+        "This QR code comes from an older report format and can no longer open the report directly. "
+        "Please contact the laboratory to receive your report.",
+        410,
+    )
+
+
+def _report_pdf_response(patient_id: int, test_id: int, request: Request,
+                         public: bool, fallback_url: str, public_report_layout: bool = False):
+    """Render the existing report HTML to a PDF. The report builder stays the
+    single source of truth for report data and styling."""
+    extra_headers = dict(PUBLIC_REPORT_HEADERS) if public else {}
+    try:
+        from weasyprint import HTML
+    except Exception:
+        # Keep the system usable on installations without WeasyPrint.
+        return RedirectResponse(url=fallback_url, status_code=303)
+
+    if public and public_report_layout:
+        report_html = _build_public_report_html(patient_id, test_id, request)
+    else:
+        report_html = _build_report_html(patient_id, test_id, request, public=public)
+    if isinstance(report_html, HTMLResponse):
+        html_text = report_html.body.decode("utf-8")
+        if report_html.status_code != 200:
+            return report_html
+    elif isinstance(report_html, str):
+        html_text = report_html
+    else:
+        return report_html
+    try:
+        pdf_bytes = HTML(string=html_text, base_url=str(request.base_url)).write_pdf()
+    except Exception as exc:
+        return HTMLResponse(content=f"<h3>Unable to generate PDF: {html.escape(str(exc))}</h3>", status_code=500)
+
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"PRIME_{patient_id}_{test_id}").strip("_") or "PRIME_REPORT"
+    headers = {"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
+    headers.update(extra_headers)
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+@app.get("/report-download/{patient_id}/{test_id}")
+def report_download(patient_id: int, test_id: int, request: Request):
+    """STAFF-ONLY PDF download (legacy URL, kept so existing routes/links work).
+
+    Old printed reports have a QR pointing here. Visitors without report
+    permission now get a neutral notice instead of an auth-gated page - this
+    route never logs anyone in, never sets cookies and never redirects to /login.
+    """
+    if not (user_can(request, "can_view_reports") or user_can(request, "reports")):
+        return _legacy_qr_notice_page()
+    return _report_pdf_response(
+        patient_id, test_id, request, public=False,
+        fallback_url=f"/report-view/{patient_id}/{test_id}",
+    )
+
+
+# ---- Local Code 128-B barcode (no third-party request) for the PUBLIC report ----
+# Widths per symbol value (0..105 data/start, 106 = stop), in modules, alternating
+# bar/space starting with a bar.
+_CODE128_WIDTHS = [
+    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
+    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
+    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
+    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
+    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
+    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
+    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
+    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
+    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
+    "211214", "211232", "2331112",
+]
+
+
+def _code128b_data_uri(text: str):
+    """Returns an SVG data: URI of a Code 128-B barcode for `text` (the lab
+    reference number), or None if it cannot be encoded."""
+    try:
+        if not text or any(not (32 <= ord(ch) <= 126) for ch in text):
+            return None
+        values = [104] + [ord(ch) - 32 for ch in text]
+        checksum = (104 + sum(i * v for i, v in enumerate(values[1:], start=1))) % 103
+        values += [checksum, 106]
+        quiet = 10
+        x = quiet
+        rects = []
+        for val in values:
+            is_bar = True
+            for w in _CODE128_WIDTHS[val]:
+                width = int(w)
+                if is_bar:
+                    rects.append(f'<rect x="{x}" y="0" width="{width}" height="30"/>')
+                x += width
+                is_bar = not is_bar
+        total = x + quiet
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total} 30" '
+            f'preserveAspectRatio="none" shape-rendering="crispEdges">'
+            f'<rect width="{total}" height="30" fill="#fff"/><g fill="#000">{"".join(rects)}</g></svg>'
+        )
+        return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("ascii")).decode("ascii")
+    except Exception:
+        return None
+
+
 def _build_public_report_html(patient_id: int, test_id: int, request: Request):
     """Public report HTML = the official staff report layout (always with the
-    lab letterhead, barcode and patient registration box), minus staff
-    controls, with the barcode generated locally."""
+    lab letterhead, barcode and patient registration box), minus staff controls.
+    Only used by the two /public-report/{token} routes."""
     built = _build_report_html(patient_id, test_id, request, letterhead=1, public=True)
     if isinstance(built, str):
-        ref_no = f"Med-{patient_id:04d}"
+        ref_no = f"PRI-{patient_id:04d}"
         remote = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
         local = _code128b_data_uri(ref_no)
         if local and remote in built:
@@ -9461,7 +9717,7 @@ def _build_public_report_html(patient_id: int, test_id: int, request: Request):
 @app.get("/public-report/{token}", response_class=HTMLResponse)
 def public_report_view(token: str, request: Request):
     """Public, unauthenticated, READ-ONLY view of exactly one report, reached
-    from the QR code. Access = possession of the random token. It reads no
+    from the QR code. Access = possession of the random token. It ignores any
     cookies, sets none, and exposes no staff controls or other patient data."""
     target = _resolve_report_qr_token(token)
     if not target:
@@ -9481,7 +9737,7 @@ def public_report_view(token: str, request: Request):
     # Fail closed: the official letterhead, barcode and patient registration box
     # must all be present before anything is served.
     if ("url('" not in built or 'class="top-barcode-container"' not in built
-            or 'class="patient-box"' not in built or "/static/letterhead.png" not in built):
+            or 'class="patient-box"' not in built or "/letterhead.png" not in built):
         return _public_message_page("Report unavailable", "This report cannot be displayed right now.", 500)
 
     # Fail closed: refuse to serve if any staff control survived.
@@ -9527,31 +9783,11 @@ def public_report_download(token: str, request: Request):
             404,
         )
     patient_id, test_id = target
-
-    try:
-        from weasyprint import HTML
-    except Exception:
-        # Keep the system usable on installations without WeasyPrint.
-        return RedirectResponse(url=f"/public-report/{token}", status_code=303)
-
-    report_html = _build_public_report_html(patient_id, test_id, request)
-    if isinstance(report_html, HTMLResponse):
-        if report_html.status_code != 200:
-            return report_html
-        html_text = report_html.body.decode("utf-8")
-    elif isinstance(report_html, str):
-        html_text = report_html
-    else:
-        return report_html
-    try:
-        pdf_bytes = HTML(string=html_text, base_url=str(request.base_url)).write_pdf()
-    except Exception as exc:
-        return _public_message_page("Unable to generate PDF", "The PDF could not be generated right now. Please try again.", 500)
-
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"MEDISTAR_{patient_id}_{test_id}").strip("_") or "MEDISTAR_REPORT"
-    headers = {"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
-    headers.update(PUBLIC_REPORT_HEADERS)
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+    return _report_pdf_response(
+        patient_id, test_id, request, public=True,
+        fallback_url=f"/public-report/{token}",
+        public_report_layout=True,
+    )
 
 # -------------------------------------------------------------
 # SHAREABLE REPORT LINKS (for WhatsApp / public sharing)
@@ -9622,7 +9858,7 @@ def share_reports_page(request: Request, q: str = ""):
         share_url = f"{base_url}/shared-report/{token}"
         wa_message = (
             f"Hello {p_name},\n"
-            f"Your test report from Medistar Medical Laboratory is now ready.\n"
+            f"Your test report from Prime Medical Laboratory is now ready.\n"
             f"You can view and download your report in PDF or Image format using this secure link:\n"
             f"🔗 {share_url}\n\n"
             f"Thank you!"
@@ -9759,8 +9995,8 @@ def shared_report_view(token: str, request: Request):
         return HTMLResponse("<h2 style='font-family:Arial; text-align:center; margin-top:80px; color:#e74c3c;'>This report link is invalid or has expired.</h2>", status_code=404)
 
     patient_id, test_id = row[0], row[1]
-    lab_no = f"Med-{patient_id:04d}"
-    inner_report = report_view(patient_id, test_id, request)
+    lab_no = f"PRI-{patient_id:04d}"
+    inner_report = _build_report_html(patient_id, test_id, request, public=True)
     if isinstance(inner_report, HTMLResponse):
         inner_html = inner_report.body.decode("utf-8")
     elif isinstance(inner_report, str):
@@ -9854,7 +10090,10 @@ def shared_report_download(token: str, request: Request):
         return HTMLResponse("<h2 style='font-family:Arial; text-align:center; margin-top:80px; color:#e74c3c;'>This report link is invalid or has expired.</h2>", status_code=404)
 
     patient_id, test_id = row[0], row[1]
-    return report_download(patient_id, test_id, request)
+    return _report_pdf_response(
+        patient_id, test_id, request, public=True,
+        fallback_url=f"/shared-report/{token}",
+    )
 
 
 # -------------------------------------------------------------
@@ -10164,87 +10403,109 @@ def report_letterhead_preview(patient_id: int, test_id: int, request: Request):
     return report_view(patient_id, test_id, request, letterhead=1)
 
 
+# -------------------------------------------------------------
+# TEST CATEGORY NOTES / DESCRIPTION -> safe, well-formed HTML fragment
+# -------------------------------------------------------------
+# The note is entered as HTML (tables, <b>, <br>, ...) in Manage Tests and is
+# printed raw on the report. These helpers make sure it (a) is un-escaped even
+# if it was stored escaped/double-escaped, (b) cannot run scripts, and (c)
+# cannot leave a tag open and swallow the rest of the report (signature, QR).
+_NOTE_ESCAPED_TAG_RE = re.compile(
+    r"&lt;\s*/?\s*(?:table|thead|tbody|tfoot|tr|td|th|caption|colgroup|col|b|strong|i|em|u|br|hr|p|div|span|"
+    r"ul|ol|li|h[1-6]|font|sub|sup|center|small|big)\b",
+    re.I,
+)
+_NOTE_BLOCK_RE = re.compile(
+    r"<\s*(script|iframe|object|embed|applet|form|style\s+[^>]*onload)\b[^>]*>.*?<\s*/\s*\1\s*>", re.I | re.S
+)
+_NOTE_SINGLE_RE = re.compile(
+    r"<\s*/?\s*(?:script|iframe|object|embed|applet|form|meta|link|base|input|button|textarea|select)\b[^>]*>", re.I
+)
+_NOTE_EVENT_ATTR_RE = re.compile(r"""\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+_NOTE_JS_URL_RE = re.compile(
+    r"""(href|src|action|formaction|xlink:href)\s*=\s*(["']?)\s*(?:javascript|vbscript)\s*:[^"'>\s]*\2""", re.I
+)
+_NOTE_VOID_TAGS = {"br", "hr", "img", "col", "input", "meta", "link", "wbr", "area", "base", "source", "track"}
+
+
+class _NoteBalancer(HTMLParser):
+    """Re-emits an HTML fragment unchanged, except that stray closing tags are
+    dropped and any tag left open is closed at the end."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.out = []
+        self.stack = []
+
+    def handle_starttag(self, tag, attrs):
+        self.out.append(self.get_starttag_text())
+        if tag not in _NOTE_VOID_TAGS:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        self.out.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        if tag in self.stack:
+            while self.stack:
+                top = self.stack.pop()
+                self.out.append(f"</{top}>")
+                if top == tag:
+                    break
+        # else: unmatched closing tag -> dropped
+
+    def handle_data(self, data):
+        self.out.append(data)
+
+    def handle_entityref(self, name):
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self.out.append(f"&#{name};")
+
+    def close_all(self):
+        self.close()
+        while self.stack:
+            self.out.append(f"</{self.stack.pop()}>")
+        return "".join(self.out)
+
+
+def prepare_category_note_html(raw_note) -> str:
+    """Turns a stored test-category note/description into HTML that is safe to
+    print raw on a report. Never raises: on any problem the (escaped) text is
+    returned so the report always renders."""
+    text = "" if raw_note is None else str(raw_note)
+    try:
+        text = html.unescape(text)
+        for _ in range(2):  # handle notes that were stored double-escaped
+            if _NOTE_ESCAPED_TAG_RE.search(text):
+                text = html.unescape(text)
+            else:
+                break
+        for _ in range(5):  # repeat so nested/obfuscated tags cannot survive
+            cleaned = _NOTE_BLOCK_RE.sub("", text)
+            cleaned = _NOTE_SINGLE_RE.sub("", cleaned)
+            cleaned = _NOTE_EVENT_ATTR_RE.sub("", cleaned)
+            cleaned = _NOTE_JS_URL_RE.sub(r'\1="#"', cleaned)
+            if cleaned == text:
+                break
+            text = cleaned
+        balancer = _NoteBalancer()
+        balancer.feed(text)
+        return balancer.close_all()
+    except Exception:
+        return html.escape(text)
+
+
 @app.get("/report-view/{patient_id}/{test_id}", response_class=HTMLResponse)
 def report_view(patient_id: int, test_id: int, request: Request, letterhead: Optional[int] = None):
-    # Staff route: behaviour unchanged.
+    # Staff route: unchanged behaviour, still requires a DB-verified permission.
     return _build_report_html(patient_id, test_id, request, letterhead=letterhead, public=False)
 
 
-# ---- ABST (antibiotic sensitivity) section detection for culture reports ----
-_ABST_MARKER_RE = re.compile(r"\b(abst|antibiotic|antibiotics|antibiogram|sensitivity|susceptibility)\b", re.I)
-_ABST_DRUG_RE = re.compile(
-    r"\b(amoxicillin|amoxycillin|ampicillin|augmentin|amoxiclav|co-?amoxiclav|cefalexin|cephalexin|cefuroxime|"
-    r"cefixime|ceftriaxone|ceftazidime|cefotaxime|cefepime|cefazolin|cefoxitin|ciprofloxacin|levofloxacin|"
-    r"norfloxacin|ofloxacin|gentamicin|gentamycin|amikacin|tobramycin|nitrofurantoin|cotrimoxazole|"
-    r"co-trimoxazole|trimethoprim|sulfamethoxazole|meropenem|imipenem|ertapenem|piperacillin|tazobactam|"
-    r"azithromycin|erythromycin|clarithromycin|clindamycin|doxycycline|tetracycline|vancomycin|linezolid|"
-    r"teicoplanin|colistin|polymyxin|fosfomycin|chloramphenicol|cloxacillin|flucloxacillin|penicillin|"
-    r"oxacillin|aztreonam)\b",
-    re.I,
-)
-
-
-def _abst_param_ids_to_skip(cursor, params, name_col, patient_id, test_id, hide_abst, test_name):
-    """Ids of the parameter rows that make up the ABST section of a culture
-    report and must be left out of the printed table. Returns an empty set
-    (nothing hidden) whenever in doubt, so a report is never emptied.
-
-    The ABST section is: every row from the first row whose name looks like an
-    ABST heading (ABST / Antibiotic / Sensitivity / Susceptibility) to the end;
-    or, when there is no such heading row, the rows named after common
-    antibiotics. It is hidden when the "Hide ABST" toggle is ticked, and also
-    automatically when no ABST result has been entered at all.
-    """
-    try:
-        if not params:
-            return set()
-        tn = str(test_name or "").lower()
-        if not any(k in tn for k in ("culture", "sensitivity", "abst", "c/s", "c & s")):
-            return set()
-
-        rows = []  # (id, name, is_spacer)
-        for p in params:
-            d = dict(p)
-            nm = str(d.get(name_col) or "").strip()
-            rows.append((d.get("id"), nm, nm in ("", ".", "-", "_")))
-
-        marker_idx = next((i for i, r in enumerate(rows) if not r[2] and _ABST_MARKER_RE.search(r[1])), None)
-        if marker_idx is not None:
-            abst_rows = rows[marker_idx:]
-        else:
-            first_drug = next((i for i, r in enumerate(rows) if not r[2] and _ABST_DRUG_RE.search(r[1])), None)
-            if first_drug is None:
-                return set()
-            abst_rows = [r for i, r in enumerate(rows)
-                         if i >= first_drug and (r[2] or _ABST_DRUG_RE.search(r[1]))]
-
-        abst_ids = {r[0] for r in abst_rows if r[0] is not None}
-        real_ids = [r[0] for r in abst_rows if not r[2] and r[0] is not None]
-        if not real_ids:
-            return set()
-
-        if not hide_abst:
-            # Toggle left on "show": still omit the section when it is entirely empty.
-            for pid in real_ids:
-                cursor.execute(
-                    "SELECT result_value FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",
-                    (patient_id, test_id, pid),
-                )
-                rr = cursor.fetchone()
-                if rr and rr[0] is not None and str(rr[0]).strip():
-                    return set()
-
-        # Never hide every visible row.
-        if not [r for r in rows if r[0] not in abst_ids and not r[2]]:
-            return set()
-        return abst_ids
-    except Exception:
-        return set()
-
-
 def _strip_staff_controls(report_html: str) -> str:
-    """Removes the staff action bar ("Back to Edit", print-mode links) so it
-    can never be shown on a public page."""
+    """Removes the staff action bar ("Back to Edit", print-mode links) from
+    report HTML so it can never be shown on a public page."""
     return re.sub(
         r'<div class="action-bar">.*?</div>\s*</div>',
         "",
@@ -10256,8 +10517,10 @@ def _strip_staff_controls(report_html: str) -> str:
 
 def _build_report_html(patient_id: int, test_id: int, request: Request,
                        letterhead: Optional[int] = None, public: bool = False):
-    """public=True is only ever passed by the token-validated /public-report
-    routes (it is a function argument, never a request parameter)."""
+    """public=False -> staff view (permission checked).
+    public=True  -> only ever called by token-validated public routes; staff
+    controls are stripped from the output. This is a plain function (not a
+    route parameter) so `public` can never be supplied by a client."""
     result = _report_html_impl(patient_id, test_id, request, letterhead, public)
     if public and isinstance(result, str):
         result = _strip_staff_controls(result)
@@ -10266,6 +10529,11 @@ def _build_report_html(patient_id: int, test_id: int, request: Request,
 
 def _report_html_impl(patient_id: int, test_id: int, request: Request,
                       letterhead: Optional[int] = None, public: bool = False):
+    # Database-verified permission to view/print a finished report.
+    # Skipped ONLY for the token-gated public routes (public=True).
+    if not public and not (user_can(request, "can_view_reports") or user_can(request, "reports")):
+        return render_locked_page("View Reports")
+
     # Opaque, unguessable token that the printed QR code points to.
     qr_token = _get_or_create_report_qr_token(patient_id, test_id)
 
@@ -10277,12 +10545,12 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     if letterhead is None:
         letterhead = print_settings["default_letterhead"]
 
-    # Computed once here as plain, literal inline pixel values (no calc(),
-    # no CSS var()) and written directly onto the signature <img> tag. An
-    # inline style is required rather than a class/variable because print
-    # and PDF rendering does not reliably resolve CSS custom properties.
-    # Defaults mirror the original hardcoded .sig-img-new rule, so output
-    # is unchanged until an admin edits these in Print Settings.
+    # Computed once here as plain, literal inline pixel values (no
+    # calc(), no CSS var()) - written directly onto the signature <img>
+    # tag itself further down. See the comment on .sig-img-new in the
+    # <style> block for why this pattern (not a CSS class/variable) is
+    # what's needed for it to actually apply in printed/PDF output via
+    # WeasyPrint, not just in a live browser tab.
     sig_img_inline_style = (
         f"margin-top: {print_settings['sig_margin_top_px']}px !important; "
         f"margin-bottom: {print_settings['sig_margin_bottom_px']}px !important; "
@@ -10304,8 +10572,8 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
 
     # Base URL for static images (Fixes 404 Not Found error for letterhead & signature)
     base_url_str = str(request.base_url).rstrip("/")
-    letterhead_img_url = f"{base_url_str}/static/letterhead.png"
-    signature_img_url = f"{base_url_str}/static/mlt_signature.png"
+    letterhead_img_url = f"{base_url_str}/letterhead.png"
+    signature_img_url = f"{base_url_str}/signature.png"
 
     # 1. Fetch Patient Details
     cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
@@ -10350,7 +10618,7 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         or "Main Branch"
     )
 
-    ref_no = f"Med-{patient.get('id', 0):04d}"
+    ref_no = f"PRI-{patient.get('id', 0):04d}"
     manual_bill_no = str(patient.get("manual_bill_no") or "").strip()
     # Keep the existing reference number unchanged when no manual bill was
     # entered; otherwise append it exactly once using the requested slash.
@@ -10423,7 +10691,7 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
             for n_key in ["notes", "description", "details", "info", "test_description"]:
                 if n_key in t_keys and test_row[n_key]:
                     raw_note = str(test_row[n_key])
-                    clean_note = html.unescape(raw_note)
+                    clean_note = prepare_category_note_html(raw_note)
                     test_notes_html = f"<div class='report-test-note test-category-note interpretation-note'>{clean_note}</div>"
                     break
     except Exception as e:
@@ -10479,15 +10747,9 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     main_result_val = ""
     comment_text = ""
     saved_at_value = None
-    # Set from the "Hide ABST Section (No Growth / Not Applicable)" toggle on
-    # the Result Entry screen. Use this to gate any antibiotic-susceptibility
-    # block: `if not hide_abst: ...render ABST table...`
-    hide_abst = False
     
     if assigned_res:
         assigned_keys = assigned_res.keys()
-        if "hide_abst" in assigned_keys:
-            hide_abst = bool(int(assigned_res["hide_abst"] or 0))
         if "result" in assigned_keys and assigned_res["result"]:
             main_result_val = str(assigned_res["result"])
             
@@ -10567,15 +10829,33 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
 
     visible_col_count = sum(col_visible) or 1
 
-    # ABST (antibiotic sensitivity) rows left out of the printed table when the
-    # "Hide ABST" toggle is ticked, or when no ABST result was entered.
-    abst_skip_ids = _abst_param_ids_to_skip(cursor, params, name_col, patient_id, test_id, hide_abst, test_name)
+    # Culture/ABST suppression. When the MLT ticked "Hide ABST Section
+    # (No Growth)" for this assigned test, every parameter from the ABST
+    # heading onward is omitted from the printed report.
+    hide_abst_flag = False
+    try:
+        cursor.execute(
+            "SELECT COALESCE(hide_abst, 0) AS h FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ? LIMIT 1",
+            (patient_id, test_id)
+        )
+        _abst_row = cursor.fetchone()
+        hide_abst_flag = bool(_abst_row and int(_abst_row["h"] or 0))
+    except Exception:
+        hide_abst_flag = False
+    in_abst_section = False
 
     if params:
         for p in params:
             d=dict(p); p_id=d.get("id")
-            if p_id in abst_skip_ids:
-                continue
+
+            # Once the ABST heading is reached, skip the rest of the table
+            # for this test if ABST output is suppressed.
+            if hide_abst_flag:
+                _abst_name = str(d.get(name_col) or "").strip()
+                if not in_abst_section and is_abst_section_marker(_abst_name):
+                    in_abst_section = True
+                if in_abst_section:
+                    continue
 
             # FIX #1: Some parameter rows are deliberately named "." (or
             # left blank) purely to create a visual gap between groups of
@@ -10599,18 +10879,20 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
             matched=select_best_ref_range(cursor,int(p_id),patient_gender,patient_age_days) if p_id is not None else None
             ref_range=matched or default_ref
             res="-"
-            result_marked_bold = False
+            result_is_bold = False
             try:
-                cursor.execute("SELECT result_value, COALESCE(is_bold, 0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",(patient_id,test_id,p_id))
+                cursor.execute("SELECT result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",(patient_id,test_id,p_id))
                 rr=cursor.fetchone()
-                if rr and rr["result_value"] is not None and str(rr["result_value"]).strip(): res=str(rr["result_value"]).strip()
-                if rr:
-                    result_marked_bold = bool(int(rr["is_bold"] or 0))
+                if rr and rr["result_value"] is not None and str(rr["result_value"]).strip():
+                    res=str(rr["result_value"]).strip()
+                    result_is_bold = bool(rr["is_bold"])
             except sqlite3.Error:
                 try:
-                    cursor.execute("SELECT result_value FROM patient_parameter_results WHERE patient_id=? AND parameter_id=? LIMIT 1",(patient_id,p_id))
+                    cursor.execute("SELECT result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND parameter_id=? LIMIT 1",(patient_id,p_id))
                     rr=cursor.fetchone()
-                    if rr and rr["result_value"] is not None and str(rr["result_value"]).strip(): res=str(rr["result_value"]).strip()
+                    if rr and rr["result_value"] is not None and str(rr["result_value"]).strip():
+                        res=str(rr["result_value"]).strip()
+                        result_is_bold = bool(rr["is_bold"])
                 except sqlite3.Error: pass
 
             # Capture Total WBC / differential % values for the Absolute
@@ -10632,10 +10914,9 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
             flag,is_abnormal=evaluate_result_flag(res,ref_range)
             if fia_result_value is None:
                 fia_result_value = _try_float(res)
-            # Bold the result value when it is out of range (existing
-            # behaviour) OR when the operator explicitly ticked "Bold" for
-            # this specific result on the Result Entry screen.
-            result_weight="bold" if (is_abnormal or result_marked_bold) else "normal"
+            # Bold if the value is abnormal OR the operator explicitly
+            # flagged this individual result as bold on Result Entry.
+            result_weight="bold" if (is_abnormal or result_is_bold) else "normal"
             investigation_weight="bold" if int(d.get("is_bold", 0) or 0) else "normal"
             cells = [
                 (html.escape(p_name), align_inv, investigation_weight, "#000"),
@@ -10824,11 +11105,11 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     if qr_token:
         # Dedicated, unauthenticated, read-only public page for this ONE report.
         download_url = str(request.base_url).rstrip("/") + f"/public-report/{qr_token}"
+        qr_data = quote(download_url, safe="")
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=120x120&data={qr_data}"
     else:
-        # Token could not be created: keep the previous QR target (unchanged behaviour).
-        download_url = str(request.base_url).rstrip("/") + f"/report-download/{patient_id}/{test_id}"
-    qr_data = quote(download_url, safe="")
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=120x120&data={qr_data}"
+        # Fail closed: never fall back to a guessable /report-download/{id}/{id} link.
+        qr_url = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
 
     show_letterhead_bg = letterhead != 0
 
@@ -10857,7 +11138,7 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     <!DOCTYPE html>
     <html>
     <head>
-        <title>MEDISTAR MEDICAL LABORATORY - Lab Report - {patient_name}</title>
+        <title>PRIME MEDICAL LABORATORY - Lab Report - {patient_name}</title>
         <style>
             /* Print Layout Settings, admin-configurable at /print-settings.
                Every dynamic value in this stylesheet reads from these
@@ -10966,13 +11247,6 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                awkward blank gap before the notes/guidelines text below.
                This tightens the gap specifically in that case only -
                every other test's note spacing above is untouched. */
-            /* Every element inside the category note (p, span, td, th, li,
-               pasted <font size> / inline font-size...) uses ONE font family and
-               the size chosen in Print Settings. The generic
-               ".report-page *" rule above otherwise resets every child to the
-               base size, which made notes print with mixed sizes. */
-            .report-page .report-test-note, .report-page .report-test-note * {{ font-family: Verdana, Geneva, sans-serif !important; font-size: var(--dynamic-category-note-font) !important; line-height: 1.4; }}
-            .report-page .report-test-note sub, .report-page .report-test-note sup {{ font-size: 0.75em !important; }}
             .fia-inline-row + .report-note, .fia-inline-row + .report-test-note, .fia-inline-row + .test-category-note, .fia-inline-row + .interpretation-note {{ margin-top: -5px; }}
 
             /* Tables typed into a Test Category's Notes / Description box
@@ -11093,14 +11367,33 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                 align-items: center;
                 line-height: 1.15; 
             }}
+            /* Structural/base styling only. Position (top/bottom/left/
+               right margins) and height are NOT set here - they're
+               admin-configurable via /print-settings and injected as
+               literal inline pixel values directly on the <img> tag
+               itself (see fia_graph_wrap_style-style handling in the
+               Python code above). This mirrors the fix already applied
+               to the FIA graph box: calc()/CSS-variable-driven margins
+               were found to be unreliable specifically in WeasyPrint
+               (the PDF/print engine), even though they resolved fine in
+               a normal browser tab - literal Python-computed inline
+               values with !important are what actually work identically
+               across browser screen, browser print, and WeasyPrint.
+               width:auto + max-width lets the image scale proportionally
+               when only its height is adjusted, instead of stretching. */
             .sig-img-new {{ 
-                width: 420px; 
-                height: 135px; 
+                width: auto;
+                max-width: 420px;
                 object-fit: contain; 
                 display: block; 
-                margin-top: -45px; 
-                margin-bottom: -32px; 
-                margin-left: 10px; 
+            }}
+            @media print {{
+                /* Deliberately empty / no .sig-img-new rule here - the
+                   inline style (with !important) already applies in
+                   print output, and this comment exists so a future
+                   edit doesn't accidentally reintroduce a hardcoded
+                   override that would silently win over the dynamic
+                   settings again. */
             }}
             /* MLT Signature: the technologist's typed name under the
                signature image. Independently adjustable at
@@ -11108,7 +11401,9 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                touching the "MLT Details" lines below it. */
             .mlt-name {{
                 font-size: var(--dynamic-mlt-signature-font) !important;
+                margin-top: 0px !important;
                 margin-bottom: 1px;
+                line-height: 1.15;
                 display: block;
             }}
             /* MLT Details: designation ("Medical Laboratory Technologist
@@ -11116,6 +11411,8 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                adjustable at /print-settings, separate from the name. */
             .mlt-details {{
                 font-size: var(--dynamic-mlt-details-font) !important;
+                margin-top: 0px !important;
+                line-height: 1.15;
                 display: block;
             }}
 
@@ -11130,16 +11427,40 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                 color: #000;
             }}
 
+            /* Strict single-sheet A4 rules (browser print, mobile
+               print-to-PDF, and WeasyPrint all read this block). */
+            @page {{ size: A4 portrait; margin: 0; }}
             @media print {{
-                body {{ background: none; padding: 0; margin: 0; }}
+                html, body {{ width: 210mm; margin: 0 !important; padding: 0 !important; background: none; }}
                 .action-bar {{ display: none !important; }}
                 .report-page {{ 
-                    box-shadow: none; margin: 0; width: 100%; height: auto; min-height: 297mm; 
+                    box-shadow: none; margin: 0; width: 100%; height: auto; 
+                    /* 296mm (not 297mm): a box exactly as tall as the sheet
+                       spills 1-2 px onto a blank 2nd page in mobile print
+                       engines because of rounding / scaling. Content taller
+                       than one sheet is NOT clipped - it still flows onto
+                       page 2 normally (no overflow:hidden anywhere). */
+                    min-height: 296mm;
+                    box-sizing: border-box;
                     padding: 38mm 15mm 15mm 15mm; border: none; 
+                    page-break-after: avoid; break-after: avoid;
+                    page-break-inside: avoid; break-inside: avoid;
                     -webkit-print-color-adjust: exact; print-color-adjust: exact; 
                     {print_bg_css}
                 }}
-                @page {{ size: A4; margin: 0; }}
+                /* Mobile-only tightening. The "mobile-print" class is added
+                   by the tiny script at the end of <body> ONLY on
+                   phones/tablets, so the desktop output and the WeasyPrint
+                   PDF (no JS) are unchanged. Top padding stays 38mm so
+                   content never runs into the letterhead header artwork. */
+                .mobile-print .report-page {{
+                    min-height: 290mm;
+                    padding-bottom: 10mm;
+                    background-size: 210mm 290mm !important;
+                }}
+                .mobile-print .top-barcode-container {{ margin-bottom: 4px; }}
+                .mobile-print .patient-box {{ margin-bottom: 8px; }}
+                .mobile-print .printed-on-line {{ margin-top: 6px; }}
             }}
         </style>
     </head>
@@ -11252,15 +11573,25 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                     </div>
                     <div class="sig-wrapper-new">
                         <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" style="{sig_img_inline_style}" onerror="this.style.display='none';">
-                        <b class="mlt-name">S.P.Jananga</b>
+                        <b class="mlt-name">W.C.M.A.Fernando</b>
                         <span class="mlt-details" style="color: #222;">Medical Laboratory Technologist (MLT)</span>
-                        <span class="mlt-details" style="color: #444;">SLMC No 2867</span>
+                        <span class="mlt-details" style="color: #444;">SLMC No 2866</span>
                         {"<div class=\"printed-on-line\">Printed on: " + printed_on + "</div>" if print_settings.get("show_printed_on", 1) else ""}
                     </div>
                 </div>
             </div>
         </div>
 
+        <script>
+            (function () {{
+                try {{
+                    var ua = navigator.userAgent || "";
+                    var isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua) ||
+                        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+                    if (isMobile) {{ document.documentElement.classList.add("mobile-print"); }}
+                }} catch (e) {{}}
+            }})();
+        </script>
     </body>
     </html>
     """
@@ -11305,7 +11636,7 @@ def sales_analytics_page(
     view: str = "table",
 ):
     current_user = get_current_user(request)
-    if not user_can_or_legacy(current_user, "can_view_reports", "reports"):
+    if not user_has_access(current_user, "reports"):
         return render_locked_page("Sales & Financial Analytics")
 
     start_date, end_date, label_start, label_end = _sales_analytics_date_range(preset, start_date, end_date)
@@ -11392,6 +11723,7 @@ def sales_analytics_page(
         cursor.execute(f"""
             SELECT p.doctor as doctor_code, COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
                    COUNT(DISTINCT p.id) as patient_count,
+                   COUNT(pat.id) as tests_count,
                    SUM(COALESCE(pat.price_override, t.price, 0)) as revenue,
                    COALESCE(d.commission_rate, 0) as commission_rate
             FROM patients p
@@ -11425,79 +11757,24 @@ def sales_analytics_page(
     except Exception:
         center_summary_rows = []
 
-    # ---- Test-wise counts (overall, per doctor, per center) ----
-    test_summary_rows = []
-    tests_by_doctor = {}
-    tests_by_center = {}
-    test_doc_split = {}
-    test_center_split = {}
+    # ---- Test-wise detail (one row per test performed, cancelled bills excluded) ----
+    test_detail_rows = []
     try:
-        _label = "COALESCE(NULLIF(t.test_code, ''), t.test_name)"
         cursor.execute(f"""
-            SELECT t.id as test_id, t.test_name, COALESCE(t.test_code, '') as test_code,
-                   COALESCE(t.price, 0) as unit_price,
-                   COUNT(pat.id) as cnt, SUM(COALESCE(pat.price_override, t.price, 0)) as amount
-            FROM patients p
-            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
-            JOIN tests t ON t.id = pat.test_id
-            {where_sql}
-            GROUP BY t.id
-            ORDER BY cnt DESC, t.test_name
-        """, where_params)
-        test_summary_rows = cursor.fetchall()
-
-        cursor.execute(f"""
-            SELECT p.doctor as doctor_code, {_label} as tlabel, COUNT(pat.id) as cnt
-            FROM patients p
-            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
-            JOIN tests t ON t.id = pat.test_id
-            {where_sql}
-            GROUP BY p.doctor, t.id
-            ORDER BY cnt DESC
-        """, where_params)
-        for r in cursor.fetchall():
-            tests_by_doctor.setdefault(r["doctor_code"], []).append((r["tlabel"], r["cnt"]))
-
-        cursor.execute(f"""
-            SELECT COALESCE(p.center, p.collecting_center, 'Main Branch') as cname,
-                   {_label} as tlabel, COUNT(pat.id) as cnt
-            FROM patients p
-            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
-            JOIN tests t ON t.id = pat.test_id
-            {where_sql}
-            GROUP BY cname, t.id
-            ORDER BY cnt DESC
-        """, where_params)
-        for r in cursor.fetchall():
-            tests_by_center.setdefault(r["cname"], []).append((r["tlabel"], r["cnt"]))
-
-        cursor.execute(f"""
-            SELECT t.id as test_id, COALESCE(d.name, p.doctor, 'Not Specified') as dname, COUNT(pat.id) as cnt
+            SELECT t.id as test_id, t.test_name, COALESCE(pat.price_override, t.price, 0) as price,
+                   p.id as patient_id, p.title, p.name, p.created_at, p.manual_bill_no,
+                   COALESCE(d.name, p.doctor, 'Not Specified') as doctor_name,
+                   COALESCE(p.center, p.collecting_center, 'Main Branch') as center_name
             FROM patients p
             JOIN patient_assigned_tests pat ON pat.patient_id = p.id
             JOIN tests t ON t.id = pat.test_id
             LEFT JOIN doctors d ON d.code = p.doctor
             {where_sql}
-            GROUP BY t.id, p.doctor
-            ORDER BY cnt DESC
+            ORDER BY t.test_name COLLATE NOCASE, p.id DESC
         """, where_params)
-        for r in cursor.fetchall():
-            test_doc_split.setdefault(r["test_id"], []).append((r["dname"], r["cnt"]))
-
-        cursor.execute(f"""
-            SELECT t.id as test_id, COALESCE(p.center, p.collecting_center, 'Main Branch') as cname,
-                   COUNT(pat.id) as cnt
-            FROM patients p
-            JOIN patient_assigned_tests pat ON pat.patient_id = p.id
-            JOIN tests t ON t.id = pat.test_id
-            {where_sql}
-            GROUP BY t.id, cname
-            ORDER BY cnt DESC
-        """, where_params)
-        for r in cursor.fetchall():
-            test_center_split.setdefault(r["test_id"], []).append((r["cname"], r["cnt"]))
+        test_detail_rows = cursor.fetchall()
     except Exception:
-        pass
+        test_detail_rows = []
 
     # ---- Cancelled bills (dedicated audit tab) ----
     cancelled_rows = []
@@ -11553,22 +11830,6 @@ def sales_analytics_page(
         </tr>
         """
 
-    def _test_count_row_html(items):
-        if not items:
-            return ""
-        total_cnt = sum(c for _, c in items)
-        chips = " &middot; ".join(f"{html.escape(str(n))} &times; <b>{c}</b>" for n, c in items)
-        return f"""
-        <tr style="background: rgba(39,174,96,0.07);">
-            <td colspan="7" style="padding:7px 10px; border-bottom:1px solid var(--border-color); font-size:12.5px;">
-                <b>Test-wise count ({total_cnt} total):</b> {chips}
-            </td>
-        </tr>
-        """
-
-    def _split_text(items):
-        return " &middot; ".join(f"{html.escape(str(n))} &times; <b>{c}</b>" for n, c in items) or "-"
-
     # Group the already-fetched (cancelled-excluded, filtered) bill rows so each
     # doctor / center section lists its own bills.
     bills_by_doctor = {}
@@ -11595,11 +11856,10 @@ def sales_analytics_page(
             body_rows += f"""
             <tr style="background: rgba(15,76,129,0.10);">
                 <td colspan="7" style="padding:10px; border-bottom:1px solid var(--border-color); font-weight:bold; color:#0f4c81;">
-                    {doc_label} ({doc_code}) &mdash; {r['patient_count']} patient(s) &middot; Revenue: LKR {revenue:,.2f} &middot; Commission {rate:.1f}%: LKR {commission:,.2f}
+                    {doc_label} ({doc_code}) &mdash; {r['patient_count']} patient(s) &middot; {r['tests_count']} test(s) &middot; Revenue: LKR {revenue:,.2f} &middot; Commission {rate:.1f}%: LKR {commission:,.2f}
                 </td>
             </tr>
             """
-            body_rows += _test_count_row_html(tests_by_doctor.get(r["doctor_code"], []))
             for b in group_bills:
                 body_rows += _detail_bill_row_html(b)
             body_rows += f"""
@@ -11639,7 +11899,6 @@ def sales_analytics_page(
                 </td>
             </tr>
             """
-            body_rows += _test_count_row_html(tests_by_center.get(c_name, []))
             for b in group_bills:
                 body_rows += _detail_bill_row_html(b)
             body_rows += f"""
@@ -11657,36 +11916,81 @@ def sales_analytics_page(
         </tr>
         """
 
-    elif view == "tests":
-        table_title = "Test-wise Count & Revenue"
-        table_header_html = "<th>#</th><th>Test</th><th>Code</th><th style='text-align:right;'>Count</th><th style='text-align:right;'>Unit Price</th><th style='text-align:right;'>Revenue (LKR)</th><th>Doctor-wise count</th><th>Center-wise count</th>"
+    elif view == "test":
+        table_title = "Test-wise Count & Detailed Report"
+        table_header_html = "<th>Date</th><th>Invoice/Lab No</th><th>Patient Name</th><th>Test</th><th>Doctor</th><th>Center</th><th style='text-align:right;'>Price (LKR)</th>"
         body_rows = ""
-        total_count = 0
-        total_amount = 0.0
-        for idx, r in enumerate(test_summary_rows, 1):
-            total_count += r["cnt"] or 0
-            total_amount += r["amount"] or 0
-            body_rows += f"""
+        grouped_tests = {}
+        for _r in test_detail_rows:
+            grouped_tests.setdefault((_r["test_id"], _r["test_name"]), []).append(_r)
+        total_test_count = 0
+        total_test_amount = 0.0
+        # Summary of every test first (count + revenue), then the details below.
+        summary_rows_html = ""
+        for (_tid, _tname), _items in sorted(grouped_tests.items(), key=lambda kv: (-len(kv[1]), str(kv[0][1]).lower())):
+            _amt = sum((i["price"] or 0) for i in _items)
+            summary_rows_html += f"""
             <tr>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{idx}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(r['test_name'] or '')}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(r['test_code'] or '')}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right; font-weight:bold;">{r['cnt']}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(r['unit_price'] or 0):,.2f}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(r['amount'] or 0):,.2f}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-size:12px;">{_split_text(test_doc_split.get(r['test_id'], []))}</td>
-                <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-size:12px;">{_split_text(test_center_split.get(r['test_id'], []))}</td>
+                <td colspan="3" style="padding:7px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(str(_tname or ''))}</td>
+                <td style="padding:7px 10px; border-bottom:1px solid var(--border-color); text-align:center; font-weight:bold;">{len(_items)}</td>
+                <td colspan="2" style="padding:7px 10px; border-bottom:1px solid var(--border-color); color: var(--text-muted);">time(s) performed</td>
+                <td style="padding:7px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{_amt:,.2f}</td>
             </tr>
             """
-        if not body_rows:
-            body_rows = '<tr><td colspan="8" style="padding:20px; text-align:center; color: var(--text-muted);">No data for the selected filters.</td></tr>'
+        if summary_rows_html:
+            body_rows += f"""
+            <tr style="background:#0f4c81;">
+                <td colspan="3" style="padding:9px 10px; color:white; font-weight:bold;">TEST SUMMARY</td>
+                <td style="padding:9px 10px; color:white; font-weight:bold; text-align:center;">Count</td>
+                <td colspan="2" style="padding:9px 10px;"></td>
+                <td style="padding:9px 10px; color:white; font-weight:bold; text-align:right;">Amount (LKR)</td>
+            </tr>
+            {summary_rows_html}
+            <tr><td colspan="7" style="padding:10px;"></td></tr>
+            """
+        for (_tid, _tname), _items in sorted(grouped_tests.items(), key=lambda kv: str(kv[0][1]).lower()):
+            _amt = sum((i["price"] or 0) for i in _items)
+            total_test_count += len(_items)
+            total_test_amount += _amt
+            body_rows += f"""
+            <tr style="background: rgba(15,76,129,0.10);">
+                <td colspan="7" style="padding:10px; border-bottom:1px solid var(--border-color); font-weight:bold; color:#0f4c81;">
+                    {html.escape(str(_tname or ''))} &mdash; {len(_items)} time(s) performed &middot; Revenue: LKR {_amt:,.2f}
+                </td>
+            </tr>
+            """
+            for i in _items:
+                _ref = f"PRI-{i['patient_id']:04d}"
+                _disp = f"{_ref} / {i['manual_bill_no']}" if i["manual_bill_no"] else _ref
+                _date = str(i["created_at"] or "").split(" ")[0].split("T")[0]
+                _pname = f"{i['title'] or ''} {i['name'] or ''}".strip()
+                body_rows += f"""
+                <tr>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{_date}</td>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{_disp}</td>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); font-weight:bold;">{html.escape(_pname)}</td>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(str(_tname or ''))}</td>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(i['doctor_name'] or 'Not Specified')}</td>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color);">{html.escape(i['center_name'] or 'Main Branch')}</td>
+                    <td style="padding:8px 10px; border-bottom:1px solid var(--border-color); text-align:right;">{(i['price'] or 0):,.2f}</td>
+                </tr>
+                """
+            body_rows += f"""
+            <tr style="font-weight:bold; background: rgba(15,76,129,0.04);">
+                <td colspan="6" style="padding:8px 10px; text-align:right; border-bottom:2px solid var(--border-color);">Subtotal &mdash; {html.escape(str(_tname or ''))} ({len(_items)})</td>
+                <td style="padding:8px 10px; text-align:right; border-bottom:2px solid var(--border-color);">{_amt:,.2f}</td>
+            </tr>
+            """
+        if not grouped_tests:
+            body_rows = '<tr><td colspan="7" style="padding:20px; text-align:center; color: var(--text-muted);">No tests found for the selected filters.</td></tr>'
         footer_html = f"""
         <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
-            <td colspan="3" style="padding:10px; text-align:right;">TOTAL TESTS / REVENUE</td>
-            <td style="padding:10px; text-align:right;">{total_count}</td>
-            <td></td>
-            <td style="padding:10px; text-align:right;">{total_amount:,.2f}</td>
-            <td colspan="2"></td>
+            <td colspan="6" style="padding:10px; text-align:right;">TOTAL TESTS PERFORMED</td>
+            <td style="padding:10px; text-align:right;">{total_test_count}</td>
+        </tr>
+        <tr style="font-weight:bold; background: rgba(15,76,129,0.06);">
+            <td colspan="6" style="padding:10px; text-align:right;">TOTAL AMOUNT (LKR)</td>
+            <td style="padding:10px; text-align:right;">{total_test_amount:,.2f}</td>
         </tr>
         """
 
@@ -11695,7 +11999,7 @@ def sales_analytics_page(
         table_header_html = "<th>Date / Time</th><th>Invoice / Lab No</th><th>Patient Name</th><th>Doctor Name</th><th>Collecting Center</th><th style='text-align:right;'>Cancelled Bill Amount (LKR)</th>"
         body_rows = ""
         for r in cancelled_rows:
-            ref_no = f"Med-{r['patient_id']:04d}"
+            ref_no = f"PRI-{r['patient_id']:04d}"
             display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
             date_str = str(r["created_at"] or "")
             patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
@@ -11724,7 +12028,7 @@ def sales_analytics_page(
         table_header_html = "<th>Date</th><th>Invoice/Lab No</th><th>Patient Name</th><th>Test(s) Performed</th><th>Doctor</th><th>Center</th><th style='text-align:right;'>Amount (LKR)</th>"
         body_rows = ""
         for r in sales_rows:
-            ref_no = f"Med-{r['patient_id']:04d}"
+            ref_no = f"PRI-{r['patient_id']:04d}"
             display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
             date_str = str(r["created_at"] or "").split(" ")[0]
             patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
@@ -11755,7 +12059,7 @@ def sales_analytics_page(
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>Sales & Financial Analytics - MEDISTAR MEDICAL LABORATORY</title>
+        <title>Sales & Financial Analytics - PRIME MEDICAL LABORATORY</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
         <style>
@@ -11838,7 +12142,7 @@ def sales_analytics_page(
                 <a href="{_view_link('table')}" class="tab-link {'active' if view == 'table' else ''}">📋 Sales Table</a>
                 <a href="{_view_link('doctor')}" class="tab-link {'active' if view == 'doctor' else ''}">👨‍⚕️ Doctor-wise Details</a>
                 <a href="{_view_link('center')}" class="tab-link {'active' if view == 'center' else ''}">🏥 Center-wise Details</a>
-                <a href="{_view_link('tests')}" class="tab-link {'active' if view == 'tests' else ''}">🧪 Test-wise Count</a>
+                <a href="{_view_link('test')}" class="tab-link {'active' if view == 'test' else ''}">🧪 Test-wise Count</a>
                 <a href="{_view_link('cancelled')}" class="tab-link cancelled-tab {'active' if view == 'cancelled' else ''}">🚫 Cancelled Invoices</a>
             </div>
 
@@ -11861,7 +12165,7 @@ def sales_analytics_page(
                         <h3 style="margin:0; font-size:17px;">{table_title}</h3>
                         <p style="margin:4px 0 0 0; font-size:12px; color: var(--text-muted);">Date Range: {label_start} to {label_end}</p>
                     </div>
-                    <span style="font-size:12px; font-weight:bold; color: var(--text-muted);">MEDISTAR MEDICAL LABORATORY</span>
+                    <span style="font-size:12px; font-weight:bold; color: var(--text-muted);">PRIME MEDICAL LABORATORY</span>
                 </div>
 
                 <table id="exportTable">
@@ -11871,6 +12175,7 @@ def sales_analytics_page(
                         {footer_html}
                     </tbody>
                 </table>
+            </div>
         </div>
 
         <script>
