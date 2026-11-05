@@ -12583,6 +12583,7 @@ _MARKETING_EXTRA_SCRIPT = """
                     img.src = d.url; img.style.display='inline-block';
                     document.getElementById('mkt-image-remove').style.display='inline-block';
                     document.getElementById('mkt-image-status').textContent = 'Image attached: ' + f.name;
+                    var sib = document.getElementById('mkt-share-img-btn'); if (sib) sib.style.display = 'inline-block';
                 } else {
                     document.getElementById('mkt-image-status').textContent = 'Upload failed: ' + (d.error||'');
                 }
@@ -12595,6 +12596,7 @@ _MARKETING_EXTRA_SCRIPT = """
             document.getElementById('mkt-image-remove').style.display='none';
             document.getElementById('mkt-image').value='';
             document.getElementById('mkt-image-status').textContent='';
+            var sib = document.getElementById('mkt-share-img-btn'); if (sib) sib.style.display = 'none';
         }
         function saveSettings(form){
             var fd = new FormData(form);
@@ -12820,6 +12822,7 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
 
                 <div class="action-row">
                     <button type="button" class="btn btn-wa" onclick="sendBulk()"><i class="fa-brands fa-whatsapp"></i> Send to Selected (<span id="mkt-count">0</span>)</button>
+                    <button type="button" class="btn" id="mkt-share-img-btn" style="display:none; background:#128C7E; color:#fff; border:none; padding:8px 14px; border-radius:8px; cursor:pointer; font-weight:700;" onclick="shareImageMobile()"><i class="fa-solid fa-share-nodes"></i> Share Image (Mobile)</button>
                     <button type="button" class="btn btn-gray" onclick="copyNumbers()"><i class="fa-regular fa-copy"></i> Copy Numbers</button>
                     <button type="button" class="btn btn-blue" onclick="exportCSV()"><i class="fa-solid fa-file-csv"></i> Export CSV</button>
                 </div>
@@ -12890,7 +12893,12 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
             if (d.length >= 10) return '+' + d;
             return '';
         }}
-        function buildMsg(name){{ return (document.getElementById('mkt-msg').value || '').replace(/\\{{name\\}}/g, name || ''); }}
+        function buildMsg(name){{
+            var base = (document.getElementById('mkt-msg').value || '').replace(/\\{{name\\}}/g, name || '');
+            var imgUrl = (typeof mktImageUrl !== 'undefined') ? mktImageUrl : '';
+            if (imgUrl) {{ base += '\\n\\n[Image/Poster] ' + imgUrl; }}
+            return base;
+        }}
         function openOneChat(link){{
             var phone = normalizePhone(link.getAttribute('data-phone'));
             var tr = link.closest ? link.closest('tr') : null;
@@ -12940,6 +12948,25 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
                 setTimeout(next, 1200);
             }}
             next();
+        }}
+        function shareImageMobile(){{
+            var imgUrl = (typeof mktImageUrl !== 'undefined') ? mktImageUrl : '';
+            if (!imgUrl) {{ alert('Attach an image/poster first.'); return; }}
+            var msg = buildMsg('');
+            if (navigator.share && navigator.canShare) {{
+                fetch(imgUrl).then(function(r){{ return r.blob(); }}).then(function(blob){{
+                    var ext = ((imgUrl.split('.').pop() || 'jpg').split('?')[0] || 'jpg').toLowerCase();
+                    if (['jpg','jpeg','png','webp','gif'].indexOf(ext) < 0) ext = 'jpg';
+                    var file = new File([blob], 'poster.' + ext, {{ type: blob.type || 'image/jpeg' }});
+                    if (navigator.canShare({{ files: [file] }})) {{
+                        navigator.share({{ files: [file], text: msg }}).catch(function(){{}});
+                    }} else {{
+                        alert('This browser cannot share image files. Use "Send to Selected" (image link included) or the WhatsApp Business API option.');
+                    }}
+                }}).catch(function(){{ alert('Could not load the image for sharing.'); }});
+            }} else {{
+                alert('Web Share is supported only on mobile browsers. On this device use "Send to Selected" — the image link is now included in the message, or enable the WhatsApp Business API to send images for real.');
+            }}
         }}
         Array.prototype.forEach.call(document.querySelectorAll('.mkt-pick'), function(c){{ c.addEventListener('change', updateCount); }});
         updateCount();
