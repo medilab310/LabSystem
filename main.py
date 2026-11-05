@@ -425,9 +425,34 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # mount below. FileResponse 404s cleanly if a file is ever missing,
 # instead of crashing the app - same defensive pattern used elsewhere
 # in this file for optional assets.
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg")
+_IMAGE_STEM_ALIASES = {
+    "signature": ("mlt_signature", "mlt-signature", "mlt-sinature", "mlt_sinature", "signature"),
+}
+
+
+def _find_image_file(stem: str):
+    """Looks in static/ first, then next to main.py, for stem.<any image ext>
+    (case-insensitive). Works whether the file is .png, .jpg, .jpeg, .webp..."""
+    stems = _IMAGE_STEM_ALIASES.get(stem, (stem,))
+    for folder in (os.path.join(BASE_DIR, "static"), BASE_DIR):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        lower = {n.lower(): n for n in names}
+        for st in stems:
+            for ext in _IMAGE_EXTS:
+                real = lower.get((st + ext).lower())
+                if real and os.path.isfile(os.path.join(folder, real)):
+                    return os.path.join(folder, real)
+    return None
+
+
 def _root_image_response(filename: str):
-    path = os.path.join(BASE_DIR, filename)
-    if not os.path.isfile(path):
+    stem = os.path.splitext(filename)[0]
+    path = _find_image_file(stem)
+    if not path:
         return HTMLResponse(f"<h3>{filename} not found on server.</h3>", status_code=404)
     return FileResponse(path)
 
@@ -444,15 +469,7 @@ def serve_logo_png():
 
 @app.get("/signature.png")
 def serve_signature_png():
-    # MLT signature lives in static/ (mlt-sinature / mlt-signature, any image
-    # extension); falls back to the old root-level signature.png.
-    for folder in (os.path.join(BASE_DIR, "static"), BASE_DIR):
-        for stem in ("mlt-sinature", "mlt-signature", "signature"):
-            for ext in (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG"):
-                path = os.path.join(folder, stem + ext)
-                if os.path.isfile(path):
-                    return FileResponse(path)
-    return HTMLResponse("<h3>signature image not found on server.</h3>", status_code=404)
+    return _root_image_response("signature.png")
 
 
 @app.get("/bg-lab.png")
