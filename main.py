@@ -14,8 +14,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from typing import Optional
-from fastapi import FastAPI, Form, Request, Query, Response
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from fastapi import FastAPI, Form, Request, Query, Response, UploadFile, File
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response as StarletteResponse
 from contextlib import asynccontextmanager
@@ -2631,6 +2631,37 @@ def init_db():
         )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+
+    # 12c. App settings (key-value), marketing campaign log, and uploaded
+    # marketing media (stored as BLOBs so they survive Vercel's read-only
+    # filesystem). All additive-only - zero risk to existing data.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS marketing_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT,
+            image_url TEXT,
+            recipients_count INTEGER DEFAULT 0,
+            sent_count INTEGER DEFAULT 0,
+            failed_list TEXT,
+            created_at TEXT,
+            created_by TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS marketing_media (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            content_type TEXT,
+            data BLOB,
+            created_at TEXT
+        )
+    """)
     conn.commit()
 
     # 13. Print Layout Settings Table (dashboard-configurable report styling)
@@ -12534,6 +12565,107 @@ def sales_analytics_page(
 # WhatsApp sending. Gated by the same "share_reports" permission
 # as Share Reports.
 # =============================================================
+# Plain (non-f-string) script block for the marketing page: image upload,
+# WhatsApp Business API send, settings, and campaign history. Kept out of the
+# f-string so JS braces don't need doubling.
+_MARKETING_EXTRA_SCRIPT = """
+        <script>
+        var mktImageUrl = '';
+        function uploadImage(input){
+            var f = input.files[0]; if(!f) return;
+            var fd = new FormData(); fd.append('file', f);
+            document.getElementById('mkt-image-status').textContent = 'Uploading...';
+            fetch('/api/marketing-upload', {method:'POST', body:fd}).then(function(r){return r.json();}).then(function(d){
+                if(d.ok){
+                    mktImageUrl = d.url;
+                    document.getElementById('mkt-image-url').value = d.url;
+                    var img = document.getElementById('mkt-image-preview');
+                    img.src = d.url; img.style.display='inline-block';
+                    document.getElementById('mkt-image-remove').style.display='inline-block';
+                    document.getElementById('mkt-image-status').textContent = 'Image attached: ' + f.name;
+                } else {
+                    document.getElementById('mkt-image-status').textContent = 'Upload failed: ' + (d.error||'');
+                }
+            }).catch(function(){ document.getElementById('mkt-image-status').textContent = 'Upload failed.'; });
+        }
+        function removeImage(){
+            mktImageUrl='';
+            document.getElementById('mkt-image-url').value='';
+            document.getElementById('mkt-image-preview').style.display='none';
+            document.getElementById('mkt-image-remove').style.display='none';
+            document.getElementById('mkt-image').value='';
+            document.getElementById('mkt-image-status').textContent='';
+        }
+        function saveSettings(form){
+            var fd = new FormData(form);
+            document.getElementById('wa-settings-status').textContent = 'Saving...';
+            fetch('/api/marketing-settings', {method:'POST', body:fd}).then(function(r){return r.json();}).then(function(d){
+                document.getElementById('wa-settings-status').textContent = d.ok ? 'Saved!' : 'Error: ' + (d.error||'');
+                loadSettings();
+            }).catch(function(){ document.getElementById('wa-settings-status').textContent = 'Save failed.'; });
+        }
+        function loadSettings(){
+            fetch('/api/marketing-settings').then(function(r){return r.json();}).then(function(d){
+                var s = document.getElementById('wa-api-state');
+                if(!s) return;
+                if(d.ok && d.wa_enabled){
+                    s.textContent = 'API ready';
+                    s.style.color='#86efac';
+                    var cb = document.getElementById('wa-enabled'); if(cb) cb.checked = true;
+                    var pi = document.getElementById('wa-phone-id'); if(pi) pi.value = d.wa_phone_number_id || '';
+                } else {
+                    s.textContent = 'not configured (text-only)';
+                    s.style.color='#fcd34d';
+                }
+            }).catch(function(){});
+        }
+        function sendViaAPI(){
+            var picks = Array.prototype.slice.call(document.querySelectorAll('.mkt-pick:checked'));
+            if(!picks.length){ alert('Select at least one patient.'); return; }
+            var msg = document.getElementById('mkt-msg').value || '';
+            if(!msg.trim() && !mktImageUrl){ alert('Type a message or attach an image.'); return; }
+            if(!confirm('Send via WhatsApp Business API to ' + picks.length + ' patient(s)? This may take a while.')) return;
+            var numbers = picks.map(function(c){ return (normalizePhone(c.value)||'').replace('+',''); });
+            var prog = document.getElementById('mkt-api-progress');
+            prog.style.display='block'; prog.style.color='#075e54'; prog.textContent='Sending... (please wait)';
+            fetch('/api/marketing-send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({numbers:numbers, message:msg, image_url:mktImageUrl})})
+                .then(function(r){return r.json();}).then(function(d){
+                    if(d.ok){
+                        prog.textContent = 'Done. Sent: ' + d.sent + ' / ' + d.total + (d.failed && d.failed.length ? ' — failed: ' + d.failed.length : '');
+                        loadCampaigns();
+                    } else {
+                        prog.style.color='#dc2626';
+                        prog.textContent = 'Error: ' + (d.error||'');
+                    }
+                }).catch(function(){ prog.style.color='#dc2626'; prog.textContent='Send failed.'; });
+        }
+        function loadCampaigns(){
+            fetch('/api/marketing-campaigns').then(function(r){return r.json();}).then(function(d){
+                var body = document.getElementById('mkt-campaigns-body');
+                if(!body) return;
+                if(!d.ok || !d.campaigns || !d.campaigns.length){
+                    body.innerHTML = '<tr><td colspan="6" style="padding:14px; text-align:center; color:#94a3b8;">No campaigns sent yet.</td></tr>';
+                    return;
+                }
+                body.innerHTML = d.campaigns.map(function(c){
+                    var img = c.image_url ? '<a href="'+c.image_url+'" target="_blank" style="color:#2563eb;">view</a>' : '-';
+                    return '<tr>' +
+                        '<td style="padding:8px 10px; border-bottom:1px solid #eee; font-size:12px;">'+(c.created_at||'').slice(0,16)+'</td>' +
+                        '<td style="padding:8px 10px; border-bottom:1px solid #eee; font-size:12px; max-width:300px;">'+(c.message||'').slice(0,80)+'</td>' +
+                        '<td style="padding:8px 10px; border-bottom:1px solid #eee; font-size:12px;">'+img+'</td>' +
+                        '<td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center; font-weight:700; color:#15803d;">'+(c.sent_count||0)+'</td>' +
+                        '<td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center; color:#dc2626;">'+(c.failed_count||0)+'</td>' +
+                        '<td style="padding:8px 10px; border-bottom:1px solid #eee; font-size:12px;">'+(c.created_by||'')+'</td>' +
+                        '</tr>';
+                }).join('');
+            }).catch(function(){});
+        }
+        loadSettings();
+        loadCampaigns();
+        </script>
+"""
+
+
 @app.get("/marketing", response_class=HTMLResponse)
 def whatsapp_marketing_page(request: Request, q: str = ""):
     current_user = get_current_user(request)
@@ -12674,6 +12806,16 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
                 </div>
 
                 <textarea id="mkt-msg" placeholder="Type your message here... Use {{name}} to insert the patient's name."></textarea>
+                <div style="margin:10px 0; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                    <input type="hidden" id="mkt-image-url" value="">
+                    <label style="background:#f1f5f9; border:1px dashed #94a3b8; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600; color:#475569;">
+                        <i class="fa-solid fa-image"></i> Attach Image / Poster
+                        <input type="file" id="mkt-image" accept="image/*" style="display:none;" onchange="uploadImage(this)">
+                    </label>
+                    <span id="mkt-image-status" style="font-size:12px; color:#64748b;"></span>
+                    <img id="mkt-image-preview" style="max-height:60px; border-radius:6px; display:none; border:1px solid #e2e8f0;">
+                    <button type="button" id="mkt-image-remove" style="display:none; background:none; border:none; color:#dc2626; cursor:pointer; font-size:12px; font-weight:700;" onclick="removeImage()"><i class="fa-solid fa-xmark"></i> Remove</button>
+                </div>
                 <div class="hint">Tip: WhatsApp opens one chat at a time. "Send to Selected" opens each recipient's chat in turn (allow pop-ups when asked). You can also copy all numbers or export CSV to use with any bulk WhatsApp service.</div>
 
                 <div class="action-row">
@@ -12682,6 +12824,22 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
                     <button type="button" class="btn btn-blue" onclick="exportCSV()"><i class="fa-solid fa-file-csv"></i> Export CSV</button>
                 </div>
                 <div id="mkt-progress"></div>
+                <div style="margin-top:14px; border-top:1px solid #e2e8f0; padding-top:12px;">
+                    <details style="font-size:13px;">
+                        <summary style="cursor:pointer; font-weight:700; color:#0f4c81;"><i class="fa-solid fa-gear"></i> WhatsApp Business API Settings (required to send images)</summary>
+                        <p style="color:#64748b; font-size:12px; margin:8px 0;">wa.me links can only send TEXT. To send images/posters inside WhatsApp, create a free WhatsApp Business Cloud API account at business.facebook.com and paste your token + phone number ID below. Until configured, the attached image is sent as a clickable link inside the text message.</p>
+                        <form onsubmit="saveSettings(this); return false;" style="display:grid; gap:8px; max-width:480px;">
+                            <label style="display:flex; align-items:center; gap:8px; font-weight:600; color:#334155;"><input type="checkbox" name="wa_enabled" id="wa-enabled" style="width:16px;height:16px;"> Enable WhatsApp Business API sending</label>
+                            <input type="text" name="wa_phone_number_id" id="wa-phone-id" placeholder="Phone Number ID (from Meta dashboard)" style="padding:8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                            <input type="password" name="wa_api_token" placeholder="Permanent Access Token (leave blank to keep existing)" style="padding:8px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px;">
+                            <div><button type="submit" class="btn btn-blue" style="padding:7px 14px; font-size:12px;"><i class="fa-solid fa-save"></i> Save Settings</button> <span id="wa-settings-status" style="font-size:12px; color:#15803d; margin-left:8px;"></span></div>
+                        </form>
+                    </details>
+                </div>
+                <div class="action-row" style="margin-top:10px;">
+                    <button type="button" class="btn" style="background:#075e54;" onclick="sendViaAPI()"><i class="fa-brands fa-whatsapp"></i> Send via API (with image) — <span id="wa-api-state" style="font-weight:400;">checking...</span></button>
+                </div>
+                <div id="mkt-api-progress" style="display:none; margin-top:8px; font-size:13px; font-weight:700; color:#075e54;"></div>
             </div>
 
             <div class="card">
@@ -12699,6 +12857,15 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
                     <tbody>
                         {patient_rows_html}
                     </tbody>
+                </table>
+                </div>
+            </div>
+            <div class="card">
+                <h2 style="font-size:17px;"><i class="fa-solid fa-clock-rotate-left"></i> Recent Campaigns</h2>
+                <div style="overflow-x:auto;">
+                <table>
+                    <thead><tr><th>Date</th><th>Message</th><th>Image</th><th style="text-align:center;">Sent</th><th style="text-align:center;">Failed</th><th>By</th></tr></thead>
+                    <tbody id="mkt-campaigns-body"><tr><td colspan="6" style="padding:14px; text-align:center; color:#94a3b8;">Loading...</td></tr></tbody>
                 </table>
                 </div>
             </div>
@@ -12777,6 +12944,243 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
         Array.prototype.forEach.call(document.querySelectorAll('.mkt-pick'), function(c){{ c.addEventListener('change', updateCount); }});
         updateCount();
         </script>
+""" + _MARKETING_EXTRA_SCRIPT + """
     </body>
     </html>
     """
+
+
+# -------------------------------------------------------------
+# Marketing backend: image upload (BLOB in DB), WhatsApp Business
+# Cloud API send, settings, and campaign history. wa.me links can
+# only send text; images require the optional API integration below.
+# -------------------------------------------------------------
+def _get_setting(key: str, default: str = "") -> str:
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return str(row[0]) if row and row[0] is not None else default
+    except Exception:
+        return default
+
+
+def _set_setting(key: str, value: str) -> None:
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+@app.get("/marketing-media/{media_id}")
+def marketing_media(media_id: int):
+    """Serve an uploaded marketing image straight from the database
+    (BLOB), so it works on Vercel's read-only filesystem."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT data, content_type FROM marketing_media WHERE id = ?", (media_id,))
+        row = cur.fetchone()
+        if row is None:
+            return Response(content=b"not found", status_code=404)
+        return Response(content=bytes(row[0]), media_type=str(row[1] or "image/png"))
+    except Exception:
+        return Response(content=b"error", status_code=500)
+
+
+@app.post("/api/marketing-upload")
+async def marketing_upload(request: Request, file: UploadFile = File(...)):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return JSONResponse({"ok": False, "error": "Access denied"}, status_code=403)
+    try:
+        content = await file.read()
+        if len(content) > 5 * 1024 * 1024:
+            return JSONResponse({"ok": False, "error": "Image too large (max 5MB)"}, status_code=400)
+        fname = (file.filename or "image.png").lower()
+        allowed_ext = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+        if not fname.endswith(allowed_ext):
+            return JSONResponse({"ok": False, "error": "Only PNG/JPG/WEBP/GIF images allowed"}, status_code=400)
+        ctype = file.content_type or "image/png"
+        if not ctype.startswith("image/"):
+            ctype = "image/png"
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO marketing_media (filename, content_type, data, created_at) VALUES (?, ?, ?, ?)",
+            (file.filename or "image", ctype, content, datetime.now().isoformat()),
+        )
+        conn.commit()
+        media_id = cur.lastrowid
+        base = str(request.base_url).rstrip("/")
+        return JSONResponse({"ok": True, "url": f"{base}/marketing-media/{media_id}", "id": media_id})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/marketing-settings")
+def marketing_settings_get(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return JSONResponse({"ok": False, "error": "Access denied"}, status_code=403)
+    enabled = _get_setting("wa_api_enabled", "0") == "1"
+    phone_id = _get_setting("wa_phone_number_id", "")
+    token_set = bool(_get_setting("wa_api_token", ""))
+    return JSONResponse({"ok": True, "wa_enabled": enabled, "wa_phone_number_id": phone_id, "token_set": token_set})
+
+
+@app.post("/api/marketing-settings")
+async def marketing_settings_save(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return JSONResponse({"ok": False, "error": "Access denied"}, status_code=403)
+    try:
+        form = await request.form()
+        _set_setting("wa_api_enabled", "1" if (form.get("wa_enabled") in ("1", "true", "on")) else "0")
+        _set_setting("wa_phone_number_id", (form.get("wa_phone_number_id") or "").strip())
+        token = (form.get("wa_api_token") or "").strip()
+        if token:
+            _set_setting("wa_api_token", token)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+def _wa_normalize_phone(p: str) -> str:
+    d = re.sub(r"\D", "", p or "")
+    if d.startswith("0") and len(d) == 10:
+        return "94" + d[1:]
+    if d.startswith("94") and len(d) >= 11:
+        return d
+    if len(d) == 9 and d.startswith("7"):
+        return "94" + d
+    return d
+
+
+@app.post("/api/marketing-send")
+async def marketing_send(request: Request):
+    """Send a message (+ optional image caption) to each selected number
+    via the WhatsApp Business Cloud API. Only works once API credentials
+    are saved; otherwise returns an error and the UI falls back to wa.me
+    text links."""
+    import json as _json
+    import urllib.request
+
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return JSONResponse({"ok": False, "error": "Access denied"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+
+    if _get_setting("wa_api_enabled", "0") != "1":
+        return JSONResponse({
+            "ok": False,
+            "error": "WhatsApp Business API is not configured. Open 'API Settings' on this page and save your token + phone number ID, or use the 'Send to Selected' button (text-only wa.me links)."
+        }, status_code=400)
+
+    token = _get_setting("wa_api_token", "")
+    phone_id = _get_setting("wa_phone_number_id", "")
+    if not token or not phone_id:
+        return JSONResponse({"ok": False, "error": "WhatsApp API token or phone number ID is missing."}, status_code=400)
+
+    numbers = body.get("numbers") or []
+    message = str(body.get("message") or "")
+    image_url = str(body.get("image_url") or "")
+    if not numbers:
+        return JSONResponse({"ok": False, "error": "No recipients selected."}, status_code=400)
+    if not message.strip() and not image_url:
+        return JSONResponse({"ok": False, "error": "Type a message or upload an image first."}, status_code=400)
+
+    api_url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
+    sent = 0
+    failed = []
+    for raw in numbers:
+        to = _wa_normalize_phone(str(raw))
+        if not to:
+            failed.append({"number": str(raw), "error": "invalid phone"})
+            continue
+        if image_url:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "image",
+                "image": {"link": image_url, "caption": message},
+            }
+        else:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": message},
+            }
+        data = _json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            api_url, data=data, method="POST",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                if 200 <= resp.status < 300:
+                    sent += 1
+                else:
+                    failed.append({"number": to, "error": f"HTTP {resp.status}"})
+        except Exception as e:
+            failed.append({"number": to, "error": str(e)[:120]})
+        time.sleep(0.6)
+
+    # Log the campaign
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO marketing_campaigns (message, image_url, recipients_count, sent_count, failed_list, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (message[:2000], image_url, len(numbers), sent, _json.dumps(failed)[:4000], datetime.now().isoformat(), current_user.get("username", "")),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True, "sent": sent, "total": len(numbers), "failed": failed})
+
+
+@app.get("/api/marketing-campaigns")
+def marketing_campaigns(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return JSONResponse({"ok": False, "error": "Access denied"}, status_code=403)
+    import json as _json
+    campaigns = []
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, message, image_url, recipients_count, sent_count, failed_list, created_at, created_by FROM marketing_campaigns ORDER BY id DESC LIMIT 20"
+        )
+        for r in cur.fetchall():
+            failed_count = 0
+            try:
+                failed_count = len(_json.loads(str(r[5] or "[]")))
+            except Exception:
+                failed_count = 0
+            campaigns.append({
+                "id": r[0],
+                "message": str(r[1] or ""),
+                "image_url": str(r[2] or ""),
+                "recipients_count": r[3] or 0,
+                "sent_count": r[4] or 0,
+                "failed_count": failed_count,
+                "created_at": str(r[6] or ""),
+                "created_by": str(r[7] or ""),
+            })
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, "campaigns": campaigns})
