@@ -4305,7 +4305,7 @@ def _render_cancel_bills_tab(conn, cursor, search, msg):
     for r in rows:
         p_id = r["patient_id"]
         p_name = f"{(r['title'] or '').strip()} {(r['name'] or '').strip()}".strip()
-        ref_no = f"PRI-{p_id:04d}"
+        ref_no = f"MED-{p_id:04d}"
         manual_bill_no = str(r["manual_bill_no"] or "").strip()
         display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
         date_str = str(r["created_at"] or "N/A")
@@ -7810,7 +7810,7 @@ def test_entry_page(patient_id: int, test_id: int):
     if bool(p_dict.get("is_cancelled")):
         conn.close()
         manual_bill_no = str(p_dict.get("manual_bill_no") or "").strip()
-        ref_no = f"PRI-{patient_id:04d}"
+        ref_no = f"MED-{patient_id:04d}"
         display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
         return render_cancelled_bill_page(display_ref_no)
 
@@ -8432,7 +8432,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     if bool(p.get("is_cancelled")):
         conn.close()
         manual_bill_no = str(p.get("manual_bill_no") or "").strip()
-        ref_no = f"PRI-{patient_id:04d}"
+        ref_no = f"MED-{patient_id:04d}"
         display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
         return render_cancelled_bill_page(display_ref_no)
 
@@ -9139,7 +9139,7 @@ def cancel_invoice(invoice_id: int, request: Request):
     conn.commit()
     conn.close()
 
-    ref_no = f"PRI-{invoice_id:04d}"
+    ref_no = f"MED-{invoice_id:04d}"
     manual_bill_no = str(row["manual_bill_no"] or "").strip()
     display_ref_no = f"{ref_no} / {manual_bill_no}" if manual_bill_no else ref_no
     success_msg = f"Bill {display_ref_no} cancelled successfully."
@@ -9171,7 +9171,7 @@ async def save_test_results(request: Request):
         p_row = cursor.fetchone()
         if p_row and bool(p_row["is_cancelled"]):
             conn.close()
-            return render_cancelled_bill_page(f"PRI-{patient_id:04d}")
+            return render_cancelled_bill_page(f"MED-{patient_id:04d}")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS patient_parameter_results (
@@ -9737,7 +9737,7 @@ def _build_public_report_html(patient_id: int, test_id: int, request: Request):
     Only used by the two /public-report/{token} routes."""
     built = _build_report_html(patient_id, test_id, request, letterhead=1, public=True)
     if isinstance(built, str):
-        ref_no = f"PRI-{patient_id:04d}"
+        ref_no = f"MED-{patient_id:04d}"
         remote = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
         local = _code128b_data_uri(ref_no)
         if local and remote in built:
@@ -10224,7 +10224,7 @@ def shared_report_view(token: str, request: Request):
         return HTMLResponse("<h2 style='font-family:Arial; text-align:center; margin-top:80px; color:#e74c3c;'>This report link is invalid or has expired.</h2>", status_code=404)
 
     patient_id, test_id = row[0], row[1]
-    lab_no = f"PRI-{patient_id:04d}"
+    lab_no = f"MED-{patient_id:04d}"
     inner_report = _build_report_html(patient_id, test_id, request, public=True)
     if isinstance(inner_report, HTMLResponse):
         inner_html = inner_report.body.decode("utf-8")
@@ -10847,7 +10847,7 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         or "Main Branch"
     )
 
-    ref_no = f"PRI-{patient.get('id', 0):04d}"
+    ref_no = f"MED-{patient.get('id', 0):04d}"
     manual_bill_no = str(patient.get("manual_bill_no") or "").strip()
     # Keep the existing reference number unchanged when no manual bill was
     # entered; otherwise append it exactly once using the requested slash.
@@ -12043,7 +12043,7 @@ def sales_analytics_page(
     # Shared helper for the detailed doctor-wise / center-wise views: renders one
     # bill row using the exact same 7-column structure as the main sales table.
     def _detail_bill_row_html(r):
-        ref_no = f"PRI-{r['patient_id']:04d}"
+        ref_no = f"MED-{r['patient_id']:04d}"
         display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
         date_str = str(r["created_at"] or "").split(" ")[0]
         patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
@@ -12189,7 +12189,7 @@ def sales_analytics_page(
             </tr>
             """
             for i in _items:
-                _ref = f"PRI-{i['patient_id']:04d}"
+                _ref = f"MED-{i['patient_id']:04d}"
                 _disp = f"{_ref} / {i['manual_bill_no']}" if i["manual_bill_no"] else _ref
                 _date = str(i["created_at"] or "").split(" ")[0].split("T")[0]
                 _pname = f"{i['title'] or ''} {i['name'] or ''}".strip()
@@ -12228,7 +12228,7 @@ def sales_analytics_page(
         table_header_html = "<th>Date / Time</th><th>Invoice / Lab No</th><th>Patient Name</th><th>Doctor Name</th><th>Collecting Center</th><th style='text-align:right;'>Cancelled Bill Amount (LKR)</th>"
         body_rows = ""
         for r in cancelled_rows:
-            ref_no = f"PRI-{r['patient_id']:04d}"
+            ref_no = f"MED-{r['patient_id']:04d}"
             display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
             date_str = str(r["created_at"] or "")
             patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
@@ -12257,7 +12257,7 @@ def sales_analytics_page(
         table_header_html = "<th>Date</th><th>Invoice/Lab No</th><th>Patient Name</th><th>Test(s) Performed</th><th>Doctor</th><th>Center</th><th style='text-align:right;'>Amount (LKR)</th>"
         body_rows = ""
         for r in sales_rows:
-            ref_no = f"PRI-{r['patient_id']:04d}"
+            ref_no = f"MED-{r['patient_id']:04d}"
             display_ref_no = f"{ref_no} / {r['manual_bill_no']}" if r["manual_bill_no"] else ref_no
             date_str = str(r["created_at"] or "").split(" ")[0]
             patient_name = f"{r['title'] or ''} {r['name'] or ''}".strip()
