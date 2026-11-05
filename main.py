@@ -444,7 +444,15 @@ def serve_logo_png():
 
 @app.get("/signature.png")
 def serve_signature_png():
-    return _root_image_response("signature.png")
+    # MLT signature lives in static/ (mlt-sinature / mlt-signature, any image
+    # extension); falls back to the old root-level signature.png.
+    for folder in (os.path.join(BASE_DIR, "static"), BASE_DIR):
+        for stem in ("mlt-sinature", "mlt-signature", "signature"):
+            for ext in (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG"):
+                path = os.path.join(folder, stem + ext)
+                if os.path.isfile(path):
+                    return FileResponse(path)
+    return HTMLResponse("<h3>signature image not found on server.</h3>", status_code=404)
 
 
 @app.get("/bg-lab.png")
@@ -1410,7 +1418,7 @@ def _shell_header_html(user: dict) -> str:
     <button class="ms-burger" id="msBurger" type="button" aria-label="Menu"><i class="fa-solid fa-bars"></i></button>
     <a href="/dashboard" class="ms-brandlink">
       <div class="ms-logo"><i class="fa-solid fa-flask-vial"></i></div>
-      <div class="ms-brandtxt"><h1>PRIME MEDICAL LABORATORY</h1><p>Patient &amp; Laboratory Report Management System</p></div>
+      <div class="ms-brandtxt"><h1>MEDISTAR MEDICAL LABORATORY</h1><p>Patient &amp; Laboratory Report Management System</p></div>
     </a>
   </div>
   <div class="ms-hright">
@@ -1515,7 +1523,7 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     if title_m:
         page_title = html.unescape(re.sub(r"<[^>]+>", "", title_m.group(1))).strip()
         page_title = re.sub(r"^Lab System\s*-\s*", "", page_title)
-        page_title = re.sub(r"\s*-\s*PRIME MEDICAL LABORATORY.*$", "", page_title)
+        page_title = re.sub(r"\s*-\s*MEDISTAR MEDICAL LABORATORY.*$", "", page_title)
 
     # Remove every "Back to Dashboard" style link - the sidebar replaces them.
     body_inner = _RE_SHELL_DASH_LINK.sub("", body_inner)
@@ -1643,7 +1651,7 @@ def login_page(error: str = ""):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PRIME MEDICAL LABORATORY - Login</title>
+<title>MEDISTAR MEDICAL LABORATORY - Login</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <script>
   (function () { try { var t = localStorage.getItem('lab_theme'); if (t && t !== 'light') document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
@@ -1687,8 +1695,8 @@ def login_page(error: str = ""):
 <body>
   <div class="login-card">
     <div class="card-top">
-      <img src="/logo.png" alt="Prime Medical Laboratory Logo" class="login-logo">
-      <h2>PRIME MEDICAL LABORATORY</h2>
+      <img src="/logo.png" alt="Medistar Medical Laboratory Logo" class="login-logo">
+      <h2>MEDISTAR MEDICAL LABORATORY</h2>
       <p>Patient &amp; Laboratory Report Management System</p>
     </div>
     <div class="card-body">
@@ -4129,7 +4137,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
     <body>
         <div class="header no-print">
             <div>
-                <h2>PRIME MEDICAL LABORATORY - REPORTS</h2>
+                <h2>MEDISTAR MEDICAL LABORATORY - REPORTS</h2>
             </div>
             <div>
                 <a href="/reports/sales-analytics" class="btn-secondary" style="padding: 6px 14px; font-size: 13px; background:#27ae60; margin-right:8px;">💰 Sales & Financial Analytics</a>
@@ -4171,7 +4179,7 @@ def reports_page(request: Request, start_date: str = "", end_date: str = "", rep
                         <p style="margin: 4px 0 0 0; font-size: 12px; color: var(--text-muted);">{date_line}</p>
                     </div>
                     <div>
-                        <span style="font-size: 12px; font-weight: bold; color: var(--text-muted);">PRIME MEDICAL LABORATORY</span>
+                        <span style="font-size: 12px; font-weight: bold; color: var(--text-muted);">MEDISTAR MEDICAL LABORATORY</span>
                     </div>
                 </div>
 
@@ -9305,6 +9313,14 @@ def _wa_phone_digits(raw_phone: str) -> str:
     return digits if len(digits) >= 10 else ""
 
 
+def _wa_greeting(title: str, name: str) -> str:
+    """Polite Sri Lankan-style salutation: 'Dear Mr. Silva,' / 'Dear Sir/Madam,'."""
+    title = str(title or "").strip()
+    name = str(name or "").strip()
+    who = f"{title} {name}".strip()
+    return f"Dear {who}," if who else "Dear Sir/Madam,"
+
+
 @app.get("/whatsapp-share/{patient_id}/{test_id}")
 def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
     """Opens WhatsApp with a ready message + secure link to this report.
@@ -9331,13 +9347,14 @@ def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
     report_url = f"{proto}://{host}/public-report/{token}"
 
-    greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
+    greet = _wa_greeting(p_title, p_name)
     message = (
-        f"Hello {greet},\n"
-        f"Your test report from Prime Medical Laboratory is now ready.\n"
+        f"{greet}\n\n"
+        f"Your test report from Medistar Medical Laboratory is now ready.\n"
         f"You can view and download your report using this secure link:\n"
         f"\U0001F517 {report_url}\n\n"
-        f"Thank you!"
+        f"Thank you for choosing Medistar Medical Laboratory.\n"
+        f"Best regards,\nMedistar Medical Laboratory"
     )
     number = _wa_phone_digits(p_phone)
     if number:
@@ -9421,23 +9438,20 @@ def whatsapp_share_multi(patient_id: int, request: Request, tests: str = ""):
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
 
-    lines = []
-    for idx, (tid, tname) in enumerate(chosen, start=1):
-        token = _get_or_create_report_qr_token(patient_id, tid)
-        if not token:
-            continue
-        lines.append(f"{idx}. *{tname}*\n\U0001F517 {proto}://{host}/public-report/{token}")
-    if not lines:
-        return HTMLResponse("<h3 style='font-family:Arial'>Could not create the report links.</h3>", status_code=404)
+    bundle = _get_or_create_bundle_token(patient_id)
+    if not bundle:
+        return HTMLResponse("<h3 style='font-family:Arial'>Could not create the report link.</h3>", status_code=404)
+    all_url = f"{proto}://{host}/public-report/all/{bundle}"
 
-    greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
-    plural = len(lines) > 1
+    greet = _wa_greeting(p_title, p_name)
+    plural = len(chosen) > 1
     message = (
-        f"Hello {greet},\n"
-        f"Your test {'reports' if plural else 'report'} from Prime Medical Laboratory {'are' if plural else 'is'} now ready.\n"
-        f"You can view and download {'them' if plural else 'it'} using the secure {'links' if plural else 'link'} below:\n\n"
-        + "\n\n".join(lines)
-        + "\n\nThank you!"
+        f"{greet}\n\n"
+        f"Your test {'reports' if plural else 'report'} from Medistar Medical Laboratory {'are' if plural else 'is'} now ready.\n"
+        f"You can view and download {'all your reports' if plural else 'your report'} using this single secure link:\n"
+        f"\U0001F517 {all_url}\n\n"
+        f"Thank you for choosing Medistar Medical Laboratory.\n"
+        f"Best regards,\nMedistar Medical Laboratory"
     )
     number = _wa_phone_digits(p_phone)
     if number:
@@ -9626,7 +9640,7 @@ def _report_pdf_response(patient_id: int, test_id: int, request: Request,
     except Exception as exc:
         return HTMLResponse(content=f"<h3>Unable to generate PDF: {html.escape(str(exc))}</h3>", status_code=500)
 
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"PRIME_{patient_id}_{test_id}").strip("_") or "PRIME_REPORT"
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", f"MEDISTAR_{patient_id}_{test_id}").strip("_") or "MEDISTAR_REPORT"
     headers = {"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'}
     headers.update(extra_headers)
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
@@ -9714,8 +9728,186 @@ def _build_public_report_html(patient_id: int, test_id: int, request: Request):
     return built
 
 
+_BUNDLE_TABLE_READY = False
+
+
+def _ensure_bundle_table(cursor) -> None:
+    global _BUNDLE_TABLE_READY
+    if _BUNDLE_TABLE_READY:
+        return
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS patient_report_bundle_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            patient_id INTEGER UNIQUE NOT NULL,
+            created_at TEXT
+        )
+    """)
+    _BUNDLE_TABLE_READY = True
+
+
+def _get_or_create_bundle_token(patient_id: int):
+    """One stable, unguessable token per patient = ONE link for all reports."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        _ensure_bundle_table(cursor)
+        cursor.execute("SELECT token FROM patient_report_bundle_tokens WHERE patient_id = ? LIMIT 1", (patient_id,))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        cursor.execute(
+            "INSERT OR IGNORE INTO patient_report_bundle_tokens (token, patient_id, created_at) VALUES (?, ?, ?)",
+            (secrets.token_urlsafe(24), patient_id, now_colombo().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        cursor.execute("SELECT token FROM patient_report_bundle_tokens WHERE patient_id = ? LIMIT 1", (patient_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _resolve_bundle_token(token: str):
+    if not token or not _QR_TOKEN_RE.match(token):
+        return None
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        _ensure_bundle_table(cursor)
+        cursor.execute("SELECT patient_id FROM patient_report_bundle_tokens WHERE token = ? LIMIT 1", (token,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+@app.get("/public-report/all/{bundle_token}", response_class=HTMLResponse)
+def public_report_bundle(bundle_token: str, request: Request):
+    """Public page listing ALL saved reports of one patient (single WhatsApp link)."""
+    invalid = lambda: _public_message_page(
+        "Report link invalid",
+        "This report link is invalid or no longer available. Please contact the laboratory.",
+        404,
+    )
+    patient_id = _resolve_bundle_token(bundle_token)
+    if not patient_id:
+        return invalid()
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
+        prow = cursor.fetchone()
+        if not prow:
+            return invalid()
+        pd = dict(prow)
+        if str(pd.get("is_cancelled") or "0").strip().lower() in ("1", "true", "yes"):
+            return invalid()
+        p_name = str(pd.get("name") or pd.get("patient_name") or pd.get("full_name") or "").strip()
+        p_title = str(pd.get("title") or pd.get("salutation") or "").strip()
+        try:
+            cursor.execute("""
+                SELECT pat.test_id, pat.result,
+                       COALESCE(t.test_name, tt.test_name, 'Test') AS test_name
+                FROM patient_assigned_tests pat
+                LEFT JOIN tests t ON pat.test_id = t.id
+                LEFT JOIN test_types tt ON pat.test_id = tt.id
+                WHERE pat.patient_id = ? ORDER BY pat.id
+            """, (patient_id,))
+            assigned = cursor.fetchall()
+        except Exception:
+            cursor.execute("""
+                SELECT pat.test_id, pat.result, COALESCE(t.test_name, 'Test') AS test_name
+                FROM patient_assigned_tests pat
+                LEFT JOIN tests t ON pat.test_id = t.id
+                WHERE pat.patient_id = ? ORDER BY pat.id
+            """, (patient_id,))
+            assigned = cursor.fetchall()
+        chosen, seen = [], set()
+        for r in assigned:
+            tid = r["test_id"]
+            if tid in seen:
+                continue
+            saved = bool(r["result"] and str(r["result"]).strip())
+            if not saved:
+                try:
+                    cursor.execute("SELECT COUNT(*) FROM patient_parameter_results WHERE patient_id = ? AND test_id = ?", (patient_id, tid))
+                    saved = cursor.fetchone()[0] > 0
+                except Exception:
+                    saved = False
+            if not saved:
+                continue
+            seen.add(tid)
+            chosen.append((tid, str(r["test_name"] or "Test").strip()))
+    finally:
+        conn.close()
+
+    cards = []
+    for tid, tname in chosen:
+        tok = _get_or_create_report_qr_token(patient_id, tid)
+        if not tok:
+            continue
+        st = html.escape(tok, quote=True)
+        cards.append(
+            f'''<section class="rep">
+            <div class="rep-head">{html.escape(tname)}</div>
+            <iframe class="rep-frame" src="/public-report/{st}?embed=1" title="{html.escape(tname, quote=True)}" scrolling="no" loading="eager"></iframe>
+            <div class="rep-dl"><a href="/public-report/{st}/download">&#128196; Download PDF &ndash; {html.escape(tname)}</a></div>
+            </section>'''
+        )
+    if not cards:
+        return _public_message_page("No reports yet", "Your reports are not ready yet. Please contact the laboratory.", 404)
+
+    who = html.escape(f"{p_title} {p_name}".strip())
+    page = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Your Reports - Medistar Medical Laboratory</title>
+<style>
+body{{font-family:Arial,sans-serif;background:#e9eef7;color:#1b2559;margin:0;padding:14px 8px 30px;}}
+.wrap{{max-width:900px;margin:0 auto;}}
+.top{{text-align:center;margin:6px 0 14px;}}
+.top h2{{margin:0 0 4px;font-size:19px;}}
+.top p{{margin:0;color:#707eae;font-size:13px;}}
+.rep{{margin:0 0 26px;}}
+.rep-head{{font-weight:bold;font-size:14px;margin:0 2px 6px;}}
+.rep-frame{{width:100%;border:1px solid #cbd5e1;background:#fff;border-radius:6px;display:block;min-height:600px;box-shadow:0 2px 8px rgba(0,0,0,.08);}}
+.rep-dl{{text-align:center;margin-top:10px;}}
+.rep-dl a{{display:inline-block;background:#0f4c81;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:14px;}}
+</style></head>
+<body><div class="wrap">
+<div class="top"><h2>MEDISTAR MEDICAL LABORATORY</h2>
+<p>{('Reports for ' + who + ' &mdash; ') if who else ''}{len(cards)} report{'s' if len(cards) != 1 else ''}</p></div>
+{''.join(cards)}
+</div>
+<script>
+function fit(f){{try{{var d=f.contentDocument;if(!d)return;var h=Math.max(d.documentElement.scrollHeight,d.body?d.body.scrollHeight:0);f.style.height=(h+4)+'px';}}catch(e){{}}}}
+document.querySelectorAll('.rep-frame').forEach(function(f){{
+  f.addEventListener('load',function(){{fit(f);setTimeout(function(){{fit(f);}},400);setTimeout(function(){{fit(f);}},1500);}});
+}});
+window.addEventListener('resize',function(){{document.querySelectorAll('.rep-frame').forEach(fit);}});
+</script>
+</body></html>"""
+    return HTMLResponse(page, headers=dict(PUBLIC_REPORT_HEADERS))
+
+
 @app.get("/public-report/{token}", response_class=HTMLResponse)
-def public_report_view(token: str, request: Request):
+def public_report_view(token: str, request: Request, embed: int = 0):
     """Public, unauthenticated, READ-ONLY view of exactly one report, reached
     from the QR code. Access = possession of the random token. It ignores any
     cookies, sets none, and exposes no staff controls or other patient data."""
@@ -9760,6 +9952,10 @@ def public_report_view(token: str, request: Request):
     </div>
     """
 
+    if embed:
+        # Shown inside the "all reports" page: no bottom bar, no extra padding.
+        public_bar = ""
+        head_css = head_css.replace("body{padding-bottom:76px !important;}", "")
     if "</head>" in built:
         built = built.replace("</head>", head_css + "</head>", 1)
     else:
@@ -9858,7 +10054,7 @@ def share_reports_page(request: Request, q: str = ""):
         share_url = f"{base_url}/shared-report/{token}"
         wa_message = (
             f"Hello {p_name},\n"
-            f"Your test report from Prime Medical Laboratory is now ready.\n"
+            f"Your test report from Medistar Medical Laboratory is now ready.\n"
             f"You can view and download your report in PDF or Image format using this secure link:\n"
             f"🔗 {share_url}\n\n"
             f"Thank you!"
@@ -11138,7 +11334,7 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     <!DOCTYPE html>
     <html>
     <head>
-        <title>PRIME MEDICAL LABORATORY - Lab Report - {patient_name}</title>
+        <title>MEDISTAR MEDICAL LABORATORY - Lab Report - {patient_name}</title>
         <style>
             /* Print Layout Settings, admin-configurable at /print-settings.
                Every dynamic value in this stylesheet reads from these
@@ -11573,9 +11769,9 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                     </div>
                     <div class="sig-wrapper-new">
                         <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" style="{sig_img_inline_style}" onerror="this.style.display='none';">
-                        <b class="mlt-name">W.C.M.A.Fernando</b>
+                        <b class="mlt-name">S.P.Jananga</b>
                         <span class="mlt-details" style="color: #222;">Medical Laboratory Technologist (MLT)</span>
-                        <span class="mlt-details" style="color: #444;">SLMC No 2866</span>
+                        <span class="mlt-details" style="color: #444;">SLMC No 2867</span>
                         {"<div class=\"printed-on-line\">Printed on: " + printed_on + "</div>" if print_settings.get("show_printed_on", 1) else ""}
                     </div>
                 </div>
@@ -12059,7 +12255,7 @@ def sales_analytics_page(
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>Sales & Financial Analytics - PRIME MEDICAL LABORATORY</title>
+        <title>Sales & Financial Analytics - MEDISTAR MEDICAL LABORATORY</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
         <style>
@@ -12165,7 +12361,7 @@ def sales_analytics_page(
                         <h3 style="margin:0; font-size:17px;">{table_title}</h3>
                         <p style="margin:4px 0 0 0; font-size:12px; color: var(--text-muted);">Date Range: {label_start} to {label_end}</p>
                     </div>
-                    <span style="font-size:12px; font-weight:bold; color: var(--text-muted);">PRIME MEDICAL LABORATORY</span>
+                    <span style="font-size:12px; font-weight:bold; color: var(--text-muted);">MEDISTAR MEDICAL LABORATORY</span>
                 </div>
 
                 <table id="exportTable">
