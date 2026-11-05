@@ -9305,14 +9305,6 @@ def _wa_phone_digits(raw_phone: str) -> str:
     return digits if len(digits) >= 10 else ""
 
 
-def _wa_greeting(title: str, name: str) -> str:
-    """Polite Sri Lankan-style salutation: 'Dear Mr. Silva,' / 'Dear Sir/Madam,'."""
-    title = str(title or "").strip()
-    name = str(name or "").strip()
-    who = f"{title} {name}".strip()
-    return f"Dear {who}," if who else "Dear Sir/Madam,"
-
-
 @app.get("/whatsapp-share/{patient_id}/{test_id}")
 def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
     """Opens WhatsApp with a ready message + secure link to this report.
@@ -9339,14 +9331,13 @@ def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
     report_url = f"{proto}://{host}/public-report/{token}"
 
-    greet = _wa_greeting(p_title, p_name)
+    greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
     message = (
-        f"{greet}\n\n"
+        f"Hello {greet},\n"
         f"Your test report from Prime Medical Laboratory is now ready.\n"
         f"You can view and download your report using this secure link:\n"
         f"\U0001F517 {report_url}\n\n"
-        f"Thank you for choosing Prime Medical Laboratory.\n"
-        f"Best regards,\nPrime Medical Laboratory"
+        f"Thank you!"
     )
     number = _wa_phone_digits(p_phone)
     if number:
@@ -9430,20 +9421,23 @@ def whatsapp_share_multi(patient_id: int, request: Request, tests: str = ""):
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
 
-    bundle = _get_or_create_bundle_token(patient_id)
-    if not bundle:
-        return HTMLResponse("<h3 style='font-family:Arial'>Could not create the report link.</h3>", status_code=404)
-    all_url = f"{proto}://{host}/public-report/all/{bundle}"
+    lines = []
+    for idx, (tid, tname) in enumerate(chosen, start=1):
+        token = _get_or_create_report_qr_token(patient_id, tid)
+        if not token:
+            continue
+        lines.append(f"{idx}. *{tname}*\n\U0001F517 {proto}://{host}/public-report/{token}")
+    if not lines:
+        return HTMLResponse("<h3 style='font-family:Arial'>Could not create the report links.</h3>", status_code=404)
 
-    greet = _wa_greeting(p_title, p_name)
-    plural = len(chosen) > 1
+    greet = (f"{p_title} {p_name}").strip() or "Sir/Madam"
+    plural = len(lines) > 1
     message = (
-        f"{greet}\n\n"
+        f"Hello {greet},\n"
         f"Your test {'reports' if plural else 'report'} from Prime Medical Laboratory {'are' if plural else 'is'} now ready.\n"
-        f"You can view and download {'all your reports' if plural else 'your report'} using this single secure link:\n"
-        f"\U0001F517 {all_url}\n\n"
-        f"Thank you for choosing Prime Medical Laboratory.\n"
-        f"Best regards,\nPrime Medical Laboratory"
+        f"You can view and download {'them' if plural else 'it'} using the secure {'links' if plural else 'link'} below:\n\n"
+        + "\n\n".join(lines)
+        + "\n\nThank you!"
     )
     number = _wa_phone_digits(p_phone)
     if number:
@@ -9718,165 +9712,6 @@ def _build_public_report_html(patient_id: int, test_id: int, request: Request):
         if local and remote in built:
             built = built.replace(remote, local, 1)
     return built
-
-
-_BUNDLE_TABLE_READY = False
-
-
-def _ensure_bundle_table(cursor) -> None:
-    global _BUNDLE_TABLE_READY
-    if _BUNDLE_TABLE_READY:
-        return
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS patient_report_bundle_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT UNIQUE NOT NULL,
-            patient_id INTEGER UNIQUE NOT NULL,
-            created_at TEXT
-        )
-    """)
-    _BUNDLE_TABLE_READY = True
-
-
-def _get_or_create_bundle_token(patient_id: int):
-    """One stable, unguessable token per patient = ONE link for all reports."""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        _ensure_bundle_table(cursor)
-        cursor.execute("SELECT token FROM patient_report_bundle_tokens WHERE patient_id = ? LIMIT 1", (patient_id,))
-        row = cursor.fetchone()
-        if row:
-            return row[0]
-        cursor.execute(
-            "INSERT OR IGNORE INTO patient_report_bundle_tokens (token, patient_id, created_at) VALUES (?, ?, ?)",
-            (secrets.token_urlsafe(24), patient_id, now_colombo().isoformat(timespec="seconds")),
-        )
-        conn.commit()
-        cursor.execute("SELECT token FROM patient_report_bundle_tokens WHERE patient_id = ? LIMIT 1", (patient_id,))
-        row = cursor.fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-def _resolve_bundle_token(token: str):
-    if not token or not _QR_TOKEN_RE.match(token):
-        return None
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        _ensure_bundle_table(cursor)
-        cursor.execute("SELECT patient_id FROM patient_report_bundle_tokens WHERE token = ? LIMIT 1", (token,))
-        row = cursor.fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-@app.get("/public-report/all/{bundle_token}", response_class=HTMLResponse)
-def public_report_bundle(bundle_token: str, request: Request):
-    """Public page listing ALL saved reports of one patient (single WhatsApp link)."""
-    invalid = lambda: _public_message_page(
-        "Report link invalid",
-        "This report link is invalid or no longer available. Please contact the laboratory.",
-        404,
-    )
-    patient_id = _resolve_bundle_token(bundle_token)
-    if not patient_id:
-        return invalid()
-
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM patients WHERE id = ?", (patient_id,))
-        prow = cursor.fetchone()
-        if not prow:
-            return invalid()
-        pd = dict(prow)
-        if str(pd.get("is_cancelled") or "0").strip().lower() in ("1", "true", "yes"):
-            return invalid()
-        p_name = str(pd.get("name") or pd.get("patient_name") or pd.get("full_name") or "").strip()
-        p_title = str(pd.get("title") or pd.get("salutation") or "").strip()
-        try:
-            cursor.execute("""
-                SELECT pat.test_id, pat.result,
-                       COALESCE(t.test_name, tt.test_name, 'Test') AS test_name
-                FROM patient_assigned_tests pat
-                LEFT JOIN tests t ON pat.test_id = t.id
-                LEFT JOIN test_types tt ON pat.test_id = tt.id
-                WHERE pat.patient_id = ? ORDER BY pat.id
-            """, (patient_id,))
-            assigned = cursor.fetchall()
-        except Exception:
-            cursor.execute("""
-                SELECT pat.test_id, pat.result, COALESCE(t.test_name, 'Test') AS test_name
-                FROM patient_assigned_tests pat
-                LEFT JOIN tests t ON pat.test_id = t.id
-                WHERE pat.patient_id = ? ORDER BY pat.id
-            """, (patient_id,))
-            assigned = cursor.fetchall()
-        chosen, seen = [], set()
-        for r in assigned:
-            tid = r["test_id"]
-            if tid in seen:
-                continue
-            saved = bool(r["result"] and str(r["result"]).strip())
-            if not saved:
-                try:
-                    cursor.execute("SELECT COUNT(*) FROM patient_parameter_results WHERE patient_id = ? AND test_id = ?", (patient_id, tid))
-                    saved = cursor.fetchone()[0] > 0
-                except Exception:
-                    saved = False
-            if not saved:
-                continue
-            seen.add(tid)
-            chosen.append((tid, str(r["test_name"] or "Test").strip()))
-    finally:
-        conn.close()
-
-    cards = []
-    for tid, tname in chosen:
-        tok = _get_or_create_report_qr_token(patient_id, tid)
-        if not tok:
-            continue
-        st = html.escape(tok, quote=True)
-        cards.append(
-            f'''<div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px 16px;margin:10px 0;">
-            <div style="font-weight:bold;font-size:15px;margin-bottom:10px;">{html.escape(tname)}</div>
-            <a href="/public-report/{st}" style="display:inline-block;background:#0f4c81;color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:bold;margin:2px 4px 2px 0;">View Report</a>
-            <a href="/public-report/{st}/download" style="display:inline-block;background:#0f172a;color:#fff;padding:9px 18px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:bold;margin:2px 0;">Download PDF</a>
-            </div>'''
-        )
-    if not cards:
-        return _public_message_page("No reports yet", "Your reports are not ready yet. Please contact the laboratory.", 404)
-
-    who = html.escape(f"{p_title} {p_name}".strip())
-    page = f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Your Reports - Prime Medical Laboratory</title></head>
-<body style="font-family:Arial,sans-serif;background:#f4f7fe;color:#1b2559;margin:0;padding:20px 14px;">
-<div style="max-width:520px;margin:0 auto;">
-<h2 style="margin:0 0 4px 0;font-size:20px;">PRIME MEDICAL LABORATORY</h2>
-<p style="margin:0 0 16px 0;color:#707eae;font-size:14px;">{('Reports for ' + who) if who else 'Your reports'} &mdash; {len(cards)} report{'s' if len(cards) != 1 else ''}</p>
-{''.join(cards)}
-</div></body></html>"""
-    return HTMLResponse(page, headers=dict(PUBLIC_REPORT_HEADERS))
 
 
 @app.get("/public-report/{token}", response_class=HTMLResponse)
