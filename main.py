@@ -9897,7 +9897,7 @@ def public_report_bundle(bundle_token: str, request: Request):
 <title>Your Reports - Medistar Medical Laboratory</title>
 <style>
 body{{font-family:Arial,sans-serif;background:#e9eef7;color:#1b2559;margin:0;padding:14px 8px 30px;}}
-.wrap{{max-width:900px;margin:0 auto;}}
+.wrap{{max-width:794px;margin:0 auto;}}
 .top{{text-align:center;margin:6px 0 14px;}}
 .top h2{{margin:0 0 4px;font-size:19px;}}
 .top p{{margin:0;color:#707eae;font-size:13px;}}
