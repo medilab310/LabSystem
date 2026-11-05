@@ -9883,7 +9883,7 @@ def public_report_bundle(bundle_token: str, request: Request):
         cards.append(
             f'''<section class="rep">
             <div class="rep-head">{html.escape(tname)}</div>
-            <iframe class="rep-frame" src="/public-report/{st}?embed=1" title="{html.escape(tname, quote=True)}" scrolling="no" loading="eager"></iframe>
+            <div class="rep-box"><iframe class="rep-frame" src="/public-report/{st}?embed=1" title="{html.escape(tname, quote=True)}" scrolling="no" loading="eager"></iframe></div>
             <div class="rep-dl"><a href="/public-report/{st}/download">&#128196; Download PDF &ndash; {html.escape(tname)}</a></div>
             </section>'''
         )
@@ -9903,7 +9903,8 @@ body{{font-family:Arial,sans-serif;background:#e9eef7;color:#1b2559;margin:0;pad
 .top p{{margin:0;color:#707eae;font-size:13px;}}
 .rep{{margin:0 0 26px;}}
 .rep-head{{font-weight:bold;font-size:14px;margin:0 2px 6px;}}
-.rep-frame{{width:100%;border:1px solid #cbd5e1;background:#fff;border-radius:6px;display:block;min-height:600px;box-shadow:0 2px 8px rgba(0,0,0,.08);}}
+.rep-box{{width:100%;overflow:hidden;position:relative;background:#fff;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);}}
+.rep-frame{{width:794px;border:0;background:#fff;display:block;height:1123px;transform-origin:top left;}}
 .rep-dl{{text-align:center;margin-top:10px;}}
 .rep-dl a{{display:inline-block;background:#0f4c81;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:14px;}}
 </style></head>
@@ -9913,7 +9914,15 @@ body{{font-family:Arial,sans-serif;background:#e9eef7;color:#1b2559;margin:0;pad
 {''.join(cards)}
 </div>
 <script>
-function fit(f){{try{{var d=f.contentDocument;if(!d)return;var h=Math.max(d.documentElement.scrollHeight,d.body?d.body.scrollHeight:0);f.style.height=(h+4)+'px';}}catch(e){{}}}}
+var W=794;
+function fit(f){{try{{var d=f.contentDocument;if(!d)return;var box=f.parentNode;
+var sc=Math.min(1,box.clientWidth/W);
+f.style.height='auto';
+var h=Math.max(d.documentElement.scrollHeight,d.body?d.body.scrollHeight:0);
+f.style.height=h+'px';
+f.style.transform='scale('+sc+')';
+f.style.marginLeft=Math.max(0,(box.clientWidth-W*sc)/2)+'px';
+box.style.height=(h*sc)+'px';}}catch(e){{}}}}
 document.querySelectorAll('.rep-frame').forEach(function(f){{
   f.addEventListener('load',function(){{fit(f);setTimeout(function(){{fit(f);}},400);setTimeout(function(){{fit(f);}},1500);}});
 }});
@@ -9972,7 +9981,14 @@ def public_report_view(token: str, request: Request, embed: int = 0):
     if embed:
         # Shown inside the "all reports" page: no bottom bar, no extra padding.
         public_bar = ""
-        head_css = head_css.replace("body{padding-bottom:76px !important;}", "")
+        head_css = head_css.replace(
+            "body{padding-bottom:76px !important;}",
+            "body{padding:0 !important;margin:0 !important;background:#fff !important;}"
+            ".report-page{box-shadow:none !important;margin:0 !important;}",
+        )
+    if not embed:
+        # A4-width report: let phones scale the whole page to fit the screen.
+        head_css = '<meta name="viewport" content="width=840">' + head_css
     if "</head>" in built:
         built = built.replace("</head>", head_css + "</head>", 1)
     else:
