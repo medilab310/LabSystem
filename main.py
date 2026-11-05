@@ -398,19 +398,90 @@ def _prune_expired_sessions_locked() -> None:
         SESSIONS.pop(t, None)
 
 
+def _db_session_save(token, username, role, permissions, created_at, expires_at):
+    """Persist a session to Turso so it survives a serverless cold start.
+    Best-effort: the in-memory SESSIONS dict always remains the fast path."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO sessions (token, username, role, permissions, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (token, username, role, permissions, created_at, expires_at),
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _db_session_get(token):
+    """Load a session from Turso (used after a cold start wiped the in-memory
+    store). Returns the session dict or None. Expired rows are deleted."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT token, username, role, permissions, created_at, expires_at FROM sessions WHERE token = ?",
+            (token,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        now = time.time()
+        try:
+            expires_at = float(row["expires_at"] or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        if now > expires_at:
+            try:
+                cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                conn.commit()
+            except Exception:
+                pass
+            return None
+        try:
+            created_at = float(row["created_at"] or now)
+        except (TypeError, ValueError):
+            created_at = now
+        return {
+            "username": row["username"],
+            "role": row["role"],
+            "permissions": row["permissions"],
+            "created_at": created_at,
+        }
+    except Exception:
+        return None
+
+
+def _db_session_delete(token):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+    except Exception:
+        pass
+
+
 def _get_session(token):
-    """Return the session dict for a token, or None if missing/expired."""
+    """Return the session dict for a token, or None if missing/expired.
+    Fast path: in-memory SESSIONS. Fallback: Turso (survives cold starts)."""
     if not token:
         return None
     with _SESSIONS_LOCK:
         _prune_expired_sessions_locked()
         entry = SESSIONS.get(token)
-        if entry is None:
-            return None
-        if time.time() - entry.get("created_at", 0) > SESSION_TTL_SECONDS:
-            SESSIONS.pop(token, None)
-            return None
-        return entry
+        if entry is not None:
+            if time.time() - entry.get("created_at", 0) > SESSION_TTL_SECONDS:
+                SESSIONS.pop(token, None)
+                return None
+            return entry
+    # In-memory miss (e.g. serverless cold start) -> check the database.
+    db_entry = _db_session_get(token)
+    if db_entry is None:
+        return None
+    with _SESSIONS_LOCK:
+        SESSIONS[token] = db_entry
+    return db_entry
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1104,6 +1175,7 @@ _SHELL_NAV = [
         ("sales", "Sales & Finance", "fa-sack-dollar", "/reports/sales-analytics", "reports", "can_view_reports"),
         ("pricelist", "Test Price List", "fa-tags", "/reports?report_type=pricelist", "reports", "can_view_reports"),
         ("share", "Share Reports", "fa-share-nodes", "/share-reports", "share_reports", None),
+        ("marketing", "WhatsApp Marketing", "fa-bullhorn", "/marketing", "share_reports", None),
     ]),
     ("Setup", [
         ("tests", "Manage Tests", "fa-gear", "/manage-tests", "manage_tests", None),
@@ -1124,6 +1196,7 @@ _SHELL_MATCH = [
     ("entry", ("/select-patient", "/add-test-entry")),
     ("register", ("/add-patient",)),
     ("share", ("/share-reports",)),
+    ("marketing", ("/marketing",)),
     ("packages", ("/manage-packages", "/edit-package")),
     ("tests", ("/manage-tests", "/edit-test-category", "/manage-ranges", "/edit-parameter", "/load-standard-templates")),
     ("doctors", ("/manage-doctors",)),
@@ -1627,6 +1700,7 @@ def logout(request: Request):
     if _logout_token:
         with _SESSIONS_LOCK:
             SESSIONS.pop(_logout_token, None)
+        _db_session_delete(_logout_token)
     response = HTMLResponse(
         content="""
         <!DOCTYPE html>
@@ -1824,28 +1898,38 @@ async def login_post(request: Request):
             
             # හැමෝම Dashboard එකට යවනවා සහ Cookies සෙට් කරනවා
             resp = RedirectResponse(url="/dashboard", status_code=303)
-            resp.set_cookie(key="username", value=username)
-            resp.set_cookie(key="role", value=user_role)
-            resp.set_cookie(key="permissions", value=user_permissions)
+            _now_ts = time.time()
+            resp.set_cookie(key="username", value=username, max_age=SESSION_TTL_SECONDS)
+            resp.set_cookie(key="role", value=user_role, max_age=SESSION_TTL_SECONDS)
+            resp.set_cookie(key="permissions", value=user_permissions, max_age=SESSION_TTL_SECONDS)
             # Additive: clear rate-limit state and create a server-side
-            # session. The three legacy cookies above are kept byte-identical
-            # for backwards compatibility with existing JS.
+            # session. The three legacy cookies above are kept for backwards
+            # compatibility with existing JS. The session is also persisted to
+            # the database, so a serverless cold start no longer logs the user
+            # out mid-work. max_age makes the cookies survive a browser restart
+            # (previously they were session cookies that vanished on close).
             with _FAILED_LOGINS_LOCK:
                 FAILED_LOGINS.pop(rl_key, None)
             _session_token = secrets.token_urlsafe(32)
+            _session_entry = {
+                "username": username,
+                "role": user_role,
+                "permissions": user_permissions,
+                "created_at": _now_ts,
+            }
             with _SESSIONS_LOCK:
-                SESSIONS[_session_token] = {
-                    "username": username,
-                    "role": user_role,
-                    "permissions": user_permissions,
-                    "created_at": time.time(),
-                }
+                SESSIONS[_session_token] = _session_entry
+            _db_session_save(
+                _session_token, username, user_role, user_permissions,
+                _now_ts, _now_ts + SESSION_TTL_SECONDS,
+            )
             resp.set_cookie(
                 key="session_token",
                 value=_session_token,
                 httponly=True,
                 samesite="strict",
                 secure=False,  # set secure=True under HTTPS
+                max_age=SESSION_TTL_SECONDS,
             )
             return resp
 
@@ -2531,6 +2615,22 @@ def init_db():
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_share_links_token ON share_links(token)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_share_links_patient_test ON share_links(patient_id, test_id)")
+
+    # 12b. Persistent Sessions Table (survives serverless cold starts)
+    # Sessions are also kept in-memory for speed; this table is the fallback
+    # that stops users from being randomly logged out when the platform
+    # recycles the process. Additive only - no existing tables are touched.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            username TEXT,
+            role TEXT,
+            permissions TEXT,
+            created_at REAL,
+            expires_at REAL
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
     conn.commit()
 
     # 13. Print Layout Settings Table (dashboard-configurable report styling)
@@ -8647,8 +8747,8 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 # ---- WhatsApp button (only once results are saved) ----
                 wa_btn_html = f"""
                                 <label title="Include in 'Send Selected'" style="display: flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: #166534; cursor: pointer; margin: 0;"><input type="checkbox" class="wa-pick" value="{t_id}" checked onchange="waCount()" style="width: 14px; height: 14px; margin: 0;"> Select</label>
-                                <a href="/whatsapp-share/{p_id}/{t_id}" target="_blank" title="Send this report to the patient on WhatsApp" style="background: #25D366; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; text-decoration: none; display: flex; align-items: center; gap: 5px;">
-                                    <i class="fa-brands fa-whatsapp"></i> WhatsApp
+                                <a href="/whatsapp-share/{p_id}/{t_id}" target="_blank" title="Send this report to the patient on WhatsApp" style="background: #25D366; color: white; border: none; padding: 3px 9px; border-radius: 5px; font-weight: 600; font-size: 11px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 4px;">
+                                    <i class="fa-brands fa-whatsapp" style="font-size:13px;"></i> WhatsApp
                                 </a>""" if has_results else ""
 
                 # ---- Culture / ABST: "Hide ABST" toggle on this screen too ----
@@ -10654,6 +10754,12 @@ _NOTE_EVENT_ATTR_RE = re.compile(r"""\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+
 _NOTE_JS_URL_RE = re.compile(
     r"""(href|src|action|formaction|xlink:href)\s*=\s*(["']?)\s*(?:javascript|vbscript)\s*:[^"'>\s]*\2""", re.I
 )
+# Pasted tables (from Word/Excel) often carry border="...", cellspacing,
+# cellpadding presentation attributes that render as thick/beveled lines on
+# the report. Strip them - the report CSS controls all table borders.
+_NOTE_TABLE_PRESENT_ATTR_RE = re.compile(
+    r"""\s(?:border|cellspacing|cellpadding)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I
+)
 _NOTE_VOID_TAGS = {"br", "hr", "img", "col", "input", "meta", "link", "wbr", "area", "base", "source", "track"}
 
 
@@ -10716,6 +10822,7 @@ def prepare_category_note_html(raw_note) -> str:
             cleaned = _NOTE_SINGLE_RE.sub("", cleaned)
             cleaned = _NOTE_EVENT_ATTR_RE.sub("", cleaned)
             cleaned = _NOTE_JS_URL_RE.sub(r'\1="#"', cleaned)
+            cleaned = _NOTE_TABLE_PRESENT_ATTR_RE.sub("", cleaned)
             if cleaned == text:
                 break
             text = cleaned
@@ -11484,11 +11591,11 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                unreadable jammed-together text. These scoped rules give
                them a clean bordered grid in screen view AND print view.
                Only affects tables inside the notes block. */
-            .report-test-note table, .test-category-note table, .interpretation-note table {{ display: table !important; width: 100%; border-collapse: collapse; margin: 6px 0; table-layout: auto; border: 1px solid #000; break-inside: avoid; page-break-inside: avoid; }}
+            .report-test-note table, .test-category-note table, .interpretation-note table {{ display: table !important; width: 100%; border-collapse: collapse !important; margin: 6px 0; table-layout: auto; border: 1px solid #000 !important; break-inside: avoid; page-break-inside: avoid; }}
             .report-test-note thead, .test-category-note thead {{ display: table-header-group; }}
             .report-test-note tbody, .test-category-note tbody {{ display: table-row-group; }}
             .report-test-note tr, .test-category-note tr {{ display: table-row; break-inside: avoid; page-break-inside: avoid; }}
-            .report-test-note th, .report-test-note td, .test-category-note th, .test-category-note td {{ display: table-cell; border: 1px solid #000; padding: 3px 6px; text-align: left; vertical-align: top; color: #000; line-height: 1.3; overflow-wrap: anywhere; }}
+            .report-test-note th, .report-test-note td, .test-category-note th, .test-category-note td {{ display: table-cell; border: 1px solid #000 !important; padding: 3px 6px; text-align: left; vertical-align: top; color: #000; line-height: 1.3; overflow-wrap: anywhere; }}
             .report-test-note th, .test-category-note th {{ font-weight: bold; background: #f2f2f2; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
@@ -12414,6 +12521,261 @@ def sales_analytics_page(
                 const stamp = new Date().toISOString().slice(0, 10);
                 XLSX.writeFile(wb, "Sales_Report_" + stamp + ".xlsx");
             }}
+        </script>
+    </body>
+    </html>
+    """
+
+
+# =============================================================
+# WHATSAPP MARKETING / FESTIVAL BROADCAST
+# All patient phone numbers collected in one place (deduplicated),
+# with Sri Lankan festival/special-day templates and one-click
+# WhatsApp sending. Gated by the same "share_reports" permission
+# as Share Reports.
+# =============================================================
+@app.get("/marketing", response_class=HTMLResponse)
+def whatsapp_marketing_page(request: Request, q: str = ""):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "share_reports"):
+        return render_locked_page("WhatsApp Marketing")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    q_clean = (q or "").strip()
+    like = f"%{q_clean}%"
+
+    # Deduplicate by phone number (one patient = one number), taking the most
+    # recent registration's name. Only active (non-cancelled) patients with a
+    # non-empty phone number are included.
+    base_subquery = """
+        SELECT MAX(id) FROM patients
+        WHERE phone IS NOT NULL AND TRIM(phone) != ''
+          AND (is_cancelled IS NULL OR is_cancelled = 0)
+        GROUP BY phone
+    """
+    if q_clean:
+        cursor.execute(
+            f"""
+            SELECT p.id, p.title, p.name, p.phone, p.created_at
+            FROM patients p
+            WHERE p.id IN ({base_subquery})
+              AND (p.name LIKE ? OR p.phone LIKE ? OR CAST(p.id AS TEXT) = ?)
+            ORDER BY p.id DESC
+            LIMIT 500
+            """,
+            (like, like, q_clean),
+        )
+    else:
+        cursor.execute(
+            f"""
+            SELECT p.id, p.title, p.name, p.phone, p.created_at
+            FROM patients p
+            WHERE p.id IN ({base_subquery})
+            ORDER BY p.id DESC
+            LIMIT 500
+            """
+        )
+    rows = cursor.fetchall()
+
+    total_unique = 0
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(DISTINCT phone) FROM patients
+            WHERE phone IS NOT NULL AND TRIM(phone) != ''
+              AND (is_cancelled IS NULL OR is_cancelled = 0)
+            """
+        )
+        r = cursor.fetchone()
+        total_unique = int(r[0] or 0) if r else 0
+    except Exception:
+        total_unique = len(rows)
+    conn.close()
+
+    patient_rows_html = ""
+    for r in rows:
+        p_id = r[0]
+        title = html.escape(str(r[1] or ""))
+        name = html.escape(str(r[2] or ""))
+        phone = html.escape(str(r[3] or ""))
+        created = html.escape(str(r[4] or ""))[:10]
+        patient_rows_html += f"""
+        <tr class="mkt-row">
+            <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center;">
+                <input type="checkbox" class="mkt-pick" value="{phone}" data-name="{name}" checked style="width:15px;height:15px;margin:0;">
+            </td>
+            <td style="padding:8px 10px; border-bottom:1px solid #eee;">#{p_id}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid #eee; font-weight:600;">{title} {name}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid #eee; font-family:monospace;">{phone}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid #eee; color:#64748b; font-size:12px;">{created}</td>
+            <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:right; white-space:nowrap;">
+                <a href="#" onclick="openOneChat(this); return false;" data-phone="{phone}"
+                   style="background:#25D366;color:white;padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;gap:4px;">
+                    <i class="fa-brands fa-whatsapp"></i> Message
+                </a>
+            </td>
+        </tr>
+        """
+    if not patient_rows_html:
+        patient_rows_html = '<tr><td colspan="6" style="padding:20px; text-align:center; color:#94a3b8;">No patients with phone numbers found.</td></tr>'
+
+    shown = len(rows)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>WhatsApp Marketing</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 30px; }}
+            .container {{ max-width: 1050px; margin: auto; }}
+            .card {{ background: white; padding: 22px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08); margin-bottom: 18px; }}
+            h2 {{ color: #0f4c81; margin-top: 0; }}
+            .back-link {{ display: inline-block; margin-bottom: 15px; color: #0f4c81; text-decoration: none; font-weight: bold; }}
+            .stat {{ display:inline-block; background:#ecfdf5; color:#065f46; padding:6px 14px; border-radius:20px; font-size:13px; font-weight:700; margin-left:10px; }}
+            .tpl-grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(170px,1fr)); gap:8px; margin:10px 0 16px; }}
+            .tpl-btn {{ background:#f0f9ff; border:1px solid #bae6fd; color:#075985; padding:9px 10px; border-radius:8px; cursor:pointer; font-size:12px; font-weight:600; text-align:left; }}
+            .tpl-btn:hover {{ background:#e0f2fe; }}
+            textarea#mkt-msg {{ width:100%; min-height:110px; padding:12px; border:1px solid #cbd5e1; border-radius:8px; font-size:14px; font-family:inherit; resize:vertical; box-sizing:border-box; }}
+            .hint {{ font-size:12px; color:#64748b; margin:6px 0 12px; }}
+            .action-row {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }}
+            .btn {{ border:none; padding:9px 16px; border-radius:8px; font-weight:700; cursor:pointer; font-size:13px; color:white; text-decoration:none; display:inline-flex; align-items:center; gap:6px; }}
+            .btn-wa {{ background:#25D366; }} .btn-wa:hover {{ background:#1da851; }}
+            .btn-gray {{ background:#64748b; }} .btn-blue {{ background:#0f4c81; }}
+            .search-box {{ display:flex; gap:10px; margin-bottom:12px; }}
+            .search-box input {{ flex:1; padding:10px; border:1px solid #cbd5e1; border-radius:6px; font-size:14px; }}
+            .search-box button {{ background:#0f4c81; color:white; border:none; padding:10px 18px; border-radius:6px; font-weight:bold; cursor:pointer; }}
+            table {{ width:100%; border-collapse: collapse; }}
+            th {{ text-align: left; padding: 10px; background: #f1f5f9; font-size: 13px; color: #334155; }}
+            #mkt-progress {{ display:none; margin-top:10px; color:#15803d; font-weight:700; font-size:13px; }}
+            .sel-bar {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-size:13px; color:#475569; flex-wrap:wrap; gap:6px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
+            <div class="card">
+                <h2><i class="fa-brands fa-whatsapp" style="color:#25D366;"></i> WhatsApp Marketing &amp; Festival Greetings
+                    <span class="stat">{total_unique} patients with phone</span>
+                </h2>
+                <p style="color:#64748b; font-size:13px; margin:6px 0 14px;">All patient phone numbers collected in one place (deduplicated). Pick a festival template, edit the message, select recipients, and send via WhatsApp. Use <code style="background:#f1f5f9;padding:1px 5px;border-radius:4px;">{{name}}</code> in the message to insert each patient's name automatically.</p>
+
+                <div style="font-weight:700; font-size:13px; color:#0f4c81; margin-bottom:6px;">Quick Templates (click to load):</div>
+                <div class="tpl-grid">
+                    <button type="button" class="tpl-btn" onclick="applyTemplate('newyear')"><i class="fa-solid fa-sun"></i> Sinhala &amp; Tamil New Year</button>
+                    <button type="button" class="tpl-btn" onclick="applyTemplate('vesak')"><i class="fa-solid fa-spa"></i> Vesak</button>
+                    <button type="button" class="tpl-btn" onclick="applyTemplate('christmas')"><i class="fa-solid fa-tree"></i> Christmas</button>
+                    <button type="button" class="tpl-btn" onclick="applyTemplate('deepavali')"><i class="fa-solid fa-lightbulb"></i> Deepavali</button>
+                    <button type="button" class="tpl-btn" onclick="applyTemplate('eid')"><i class="fa-solid fa-moon"></i> Eid</button>
+                    <button type="button" class="tpl-btn" onclick="applyTemplate('offer')"><i class="fa-solid fa-tag"></i> Special Offer / Checkup</button>
+                </div>
+
+                <textarea id="mkt-msg" placeholder="Type your message here... Use {{name}} to insert the patient's name."></textarea>
+                <div class="hint">Tip: WhatsApp opens one chat at a time. "Send to Selected" opens each recipient's chat in turn (allow pop-ups when asked). You can also copy all numbers or export CSV to use with any bulk WhatsApp service.</div>
+
+                <div class="action-row">
+                    <button type="button" class="btn btn-wa" onclick="sendBulk()"><i class="fa-brands fa-whatsapp"></i> Send to Selected (<span id="mkt-count">0</span>)</button>
+                    <button type="button" class="btn btn-gray" onclick="copyNumbers()"><i class="fa-regular fa-copy"></i> Copy Numbers</button>
+                    <button type="button" class="btn btn-blue" onclick="exportCSV()"><i class="fa-solid fa-file-csv"></i> Export CSV</button>
+                </div>
+                <div id="mkt-progress"></div>
+            </div>
+
+            <div class="card">
+                <form class="search-box" method="get" action="/marketing">
+                    <input type="text" name="q" value="{html.escape(q)}" placeholder="Search by patient name, phone, or ID...">
+                    <button type="submit"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
+                </form>
+                <div class="sel-bar">
+                    <label style="cursor:pointer;"><input type="checkbox" id="mkt-selall" checked onchange="selectAll(this)" style="width:15px;height:15px;vertical-align:middle;margin:0 4px 0 0;"> Select all ({shown} shown)</label>
+                    <span>Showing {shown} of {total_unique} unique numbers</span>
+                </div>
+                <div style="overflow-x:auto;">
+                <table>
+                    <thead><tr><th style="text-align:center;"><i class="fa-solid fa-check"></i></th><th>Ref</th><th>Name</th><th>Phone</th><th>Registered</th><th style="text-align:right;">Action</th></tr></thead>
+                    <tbody>
+                        {patient_rows_html}
+                    </tbody>
+                </table>
+                </div>
+            </div>
+        </div>
+        <script>
+        var TEMPLATES = {{
+            newyear: "Happy Sinhala & Tamil New Year! {{name}}\\n\\nFrom all of us at Medistar Medical Laboratory. Wishing you and your family a prosperous year ahead. For all your health checkups, visit us or call.\\n\\nThank you!",
+            vesak: "Vesak Greetings! {{name}}\\n\\nMay the blessings of Vesak bring you peace, good health and happiness.\\n— Medistar Medical Laboratory",
+            christmas: "Merry Christmas! {{name}}\\n\\nWishing you joy, peace and good health this festive season.\\n— Medistar Medical Laboratory",
+            deepavali: "Happy Deepavali! {{name}}\\n\\nWishing you and your family a festival of lights filled with joy and good health.\\n— Medistar Medical Laboratory",
+            eid: "Eid Mubarak! {{name}}\\n\\nWishing you and your family a blessed Eid filled with joy and good health.\\n— Medistar Medical Laboratory",
+            offer: "Special Health Checkup Offer! {{name}}\\n\\nMedistar Medical Laboratory is offering a special discount on full body checkup packages this month. Visit us or call to book your appointment.\\n\\nThank you!"
+        }};
+        function applyTemplate(k){{ document.getElementById('mkt-msg').value = TEMPLATES[k] || ''; }}
+        function updateCount(){{ document.getElementById('mkt-count').textContent = document.querySelectorAll('.mkt-pick:checked').length; }}
+        function selectAll(el){{ Array.prototype.forEach.call(document.querySelectorAll('.mkt-pick'), function(c){{ c.checked = el.checked; }}); updateCount(); }}
+        function normalizePhone(p){{
+            var d = (p || '').replace(/\\D/g, '');
+            if (d.indexOf('0') === 0 && d.length === 10) return '+94' + d.substring(1);
+            if (d.indexOf('94') === 0 && d.length >= 11) return '+' + d;
+            if (d.length === 9 && d.indexOf('7') === 0) return '+94' + d;
+            if (d.length >= 10) return '+' + d;
+            return '';
+        }}
+        function buildMsg(name){{ return (document.getElementById('mkt-msg').value || '').replace(/\\{{name\\}}/g, name || ''); }}
+        function openOneChat(link){{
+            var phone = normalizePhone(link.getAttribute('data-phone'));
+            var tr = link.closest ? link.closest('tr') : null;
+            var cb = tr ? tr.querySelector('.mkt-pick') : null;
+            var name = cb ? cb.getAttribute('data-name') : '';
+            if (!phone){{ alert('Invalid phone number'); return; }}
+            window.open('https://wa.me/' + phone.replace('+', '') + '?text=' + encodeURIComponent(buildMsg(name)), '_blank');
+        }}
+        function copyNumbers(){{
+            var nums = Array.prototype.map.call(document.querySelectorAll('.mkt-pick:checked'), function(c){{ return c.value; }});
+            if (!nums.length){{ alert('No patients selected'); return; }}
+            if (navigator.clipboard && navigator.clipboard.writeText){{
+                navigator.clipboard.writeText(nums.join(', ')).then(function(){{ alert(nums.length + ' numbers copied!'); }});
+            }} else {{
+                prompt('Copy these numbers:', nums.join(', '));
+            }}
+        }}
+        function exportCSV(){{
+            var rows = Array.prototype.map.call(document.querySelectorAll('.mkt-pick:checked'), function(c){{
+                var name = (c.getAttribute('data-name') || '').replace(/"/g, '""');
+                return '"' + name + '","' + c.value + '"';
+            }});
+            if (!rows.length){{ alert('No patients selected'); return; }}
+            var csv = 'Name,Phone\\n' + rows.join('\\n');
+            var blob = new Blob([csv], {{ type: 'text/csv' }});
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'whatsapp_contacts.csv';
+            a.click();
+        }}
+        function sendBulk(){{
+            var picks = Array.prototype.slice.call(document.querySelectorAll('.mkt-pick:checked'));
+            if (!picks.length){{ alert('Select at least one patient first.'); return; }}
+            if (!(document.getElementById('mkt-msg').value || '').trim()){{ alert('Type a message first (or pick a template).'); return; }}
+            if (!confirm('Open WhatsApp chat for ' + picks.length + ' selected patient(s)? Allow pop-ups for this site when your browser asks.')) return;
+            var i = 0;
+            var prog = document.getElementById('mkt-progress');
+            prog.style.display = 'block';
+            function next(){{
+                if (i >= picks.length){{ prog.textContent = 'Done! Opened ' + picks.length + ' chat(s).'; return; }}
+                var c = picks[i++];
+                var phone = normalizePhone(c.value);
+                if (!phone){{ prog.textContent = 'Skipping invalid number (' + c.value + ')...'; setTimeout(next, 300); return; }}
+                var name = c.getAttribute('data-name') || '';
+                window.open('https://wa.me/' + phone.replace('+', '') + '?text=' + encodeURIComponent(buildMsg(name)), '_blank');
+                prog.textContent = 'Opening ' + i + ' / ' + picks.length + ' ...';
+                setTimeout(next, 1200);
+            }}
+            next();
+        }}
+        Array.prototype.forEach.call(document.querySelectorAll('.mkt-pick'), function(c){{ c.addEventListener('change', updateCount); }});
+        updateCount();
         </script>
     </body>
     </html>
