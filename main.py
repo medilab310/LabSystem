@@ -11294,11 +11294,11 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         if _cr and int(_cr["c"] or 0):
             _cr_note = html.escape(str(_cr["n"] or "").strip())
             critical_html = (
-                '<div class="critical-box" style="display:block;width:110px;max-width:110px;margin:3px 0 0 0;padding:2px 4px;'
-                'border:1.2px solid #c00000;border-radius:3px;color:#c00000;background:#fff;text-align:center;'
+                '<div class="critical-box" style="display:inline-block;white-space:nowrap;margin:8px 0 0 0;padding:2px 7px;'
+                'border:1.2px solid #c00000;border-radius:3px;color:#c00000;background:#fff;text-align:left;'
                 '-webkit-print-color-adjust:exact;print-color-adjust:exact;">'
-                + (f'<div style="font-size:7px;font-weight:800;line-height:1.2;">{_cr_note}</div>' if _cr_note else "")
-                + '<div style="font-size:6.5px;font-weight:700;line-height:1.2;">Please show this report to the doctor</div>'
+                + (f'<div style="font-size:7.5px;font-weight:800;line-height:1.3;white-space:nowrap;">{_cr_note}</div>' if _cr_note else "")
+                + '<div style="font-size:7px;font-weight:700;line-height:1.3;white-space:nowrap;">Please show this report to the doctor</div>'
                 + '</div>'
             )
     except Exception:
