@@ -357,6 +357,7 @@ PUBLIC_PATH_PREFIXES = (
     "/logout",
     "/public-report/",
     "/shared-report/",
+    "/marketing-media/",
     "/static/",
     "/letterhead.png",
     "/logo.png",
@@ -2890,6 +2891,14 @@ def init_db():
             cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN hide_abst INTEGER DEFAULT 0")
     except Exception:
         pass
+
+    # Critical-result flag + short wording, printed as a boxed alert with a red
+    # seal above the QR code (replaces the manual rubber-stamp).
+    for _crit_col, _crit_def in (("is_critical", "INTEGER DEFAULT 0"), ("critical_note", "TEXT")):
+        try:
+            cursor.execute(f"ALTER TABLE patient_assigned_tests ADD COLUMN {_crit_col} {_crit_def}")
+        except Exception:
+            pass
 
     # Tombstone table for explicitly-deleted standard-test parameters.
     #
@@ -8142,6 +8151,45 @@ def test_entry_page(patient_id: int, test_id: int):
         </div>
         """
         
+    # ---- Critical result alert box (printed above the QR on the report) ----
+    _crit_flag, _crit_text = 0, ""
+    try:
+        cursor.execute(
+            "SELECT COALESCE(is_critical, 0) AS c, COALESCE(critical_note, '') AS n FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?",
+            (patient_id, test_id)
+        )
+        _crit_row = cursor.fetchone()
+        if _crit_row:
+            _crit_flag = int(_crit_row["c"] or 0)
+            _crit_text = str(_crit_row["n"] or "")
+    except Exception:
+        _crit_flag, _crit_text = 0, ""
+    _crit_phrases = ["Critical value - inform doctor immediately", "Repeat sample confirmed", "Urgent - contact physician", "Panic value"]
+    _crit_chips = "".join(
+        "<button type='button' class='crit-chip' onclick=\"var i=document.getElementById('crit-note');i.value=this.textContent;i.dispatchEvent(new Event('input'));\" "
+        "style='border:1px solid #fca5a5;background:#fff;color:#b91c1c;border-radius:14px;padding:2px 9px;font-size:11px;cursor:pointer;'>" + html.escape(p) + "</button>"
+        for p in _crit_phrases
+    )
+    critical_box_html = f"""
+        <div style="background:#fef2f2; border:1px solid #fca5a5; border-radius:8px; padding:12px 16px; margin-bottom:16px;">
+            <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:13.5px; font-weight:700; color:#b91c1c;">
+                <input type="checkbox" id="crit-flag"{" checked" if _crit_flag else ""} style="width:17px; height:17px; margin:0;" onchange="critSave();">
+                <span><i class="fa-solid fa-triangle-exclamation"></i> Critical Result (prints red CRITICAL seal + note above QR)</span>
+                <span id="crit-saved" style="display:none; margin-left:auto; color:#15803d; font-size:12px;"></span>
+            </label>
+            <input type="text" id="crit-note" maxlength="120" value="{html.escape(_crit_text, quote=True)}" placeholder="Short wording e.g. Critical value - inform doctor immediately" style="width:100%; box-sizing:border-box; margin-top:8px;" oninput="clearTimeout(window._critT);window._critT=setTimeout(critSave,700);">
+            <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:6px;">{_crit_chips}</div>
+        </div>
+        <script>
+        function critSave(){{
+            var f=document.getElementById('crit-flag'),n=document.getElementById('crit-note'),b=document.getElementById('crit-saved');
+            fetch('/set-critical/{patient_id}/{test_id}',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'flag='+(f.checked?1:0)+'&note='+encodeURIComponent(n.value)}})
+            .then(function(r){{b.textContent=r.ok?'\u2714 Saved':'Could not save';b.style.display='inline';}})
+            .catch(function(){{b.textContent='Could not save';b.style.display='inline';}});
+        }}
+        </script>
+    """
+
     # ---- Culture & Sensitivity: "Hide ABST" toggle ----
     # Only surfaced for culture/sensitivity tests, identified by test name
     # (this database has no separate test-type flag to key off).
@@ -8350,6 +8398,7 @@ def test_entry_page(patient_id: int, test_id: int):
                 <h2>{t_name} - Report</h2>
                 
                 <form action="/save-specific-test/{patient_id}/{test_id}" method="post">
+                    {critical_box_html}
                     {abst_toggle_html}
                     {param_form_html}
                     {save_action_html}
@@ -9441,6 +9490,31 @@ async def set_abst_visibility(patient_id: int, test_id: int, request: Request):
             pass
         cursor.execute("UPDATE patient_assigned_tests SET hide_abst = ? WHERE patient_id = ? AND test_id = ?",
                        (flag, patient_id, test_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return HTMLResponse("ok")
+
+
+@app.post("/set-critical/{patient_id}/{test_id}")
+async def set_critical(patient_id: int, test_id: int, request: Request):
+    """Saves the critical-result flag + short wording instantly (works even when locked)."""
+    if not user_can(request, "can_edit_results"):
+        return HTMLResponse("forbidden", status_code=403)
+    form_data = await request.form()
+    flag = 1 if str(form_data.get("flag", "0")) == "1" else 0
+    note = re.sub(r"\s+", " ", str(form_data.get("note", "") or "")).strip()[:120]
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        for col, ddl in (("is_critical", "INTEGER DEFAULT 0"), ("critical_note", "TEXT")):
+            try:
+                cursor.execute(f"ALTER TABLE patient_assigned_tests ADD COLUMN {col} {ddl}")
+                conn.commit()
+            except Exception:
+                pass
+        cursor.execute("UPDATE patient_assigned_tests SET is_critical = ?, critical_note = ? WHERE patient_id = ? AND test_id = ?",
+                       (flag, note, patient_id, test_id))
         conn.commit()
     finally:
         conn.close()
@@ -11209,6 +11283,26 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         hide_abst_flag = bool(_abst_row and int(_abst_row["h"] or 0))
     except Exception:
         hide_abst_flag = False
+    # Critical-result alert (box + red seal) printed above the QR code.
+    critical_html = ""
+    try:
+        cursor.execute(
+            "SELECT COALESCE(is_critical, 0) AS c, COALESCE(critical_note, '') AS n FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ? LIMIT 1",
+            (patient_id, test_id)
+        )
+        _cr = cursor.fetchone()
+        if _cr and int(_cr["c"] or 0):
+            _cr_note = html.escape(str(_cr["n"] or "").strip())
+            critical_html = (
+                '<div class="critical-box" style="display:inline-block;max-width:210px;margin:0 0 4px 0;padding:3px 6px;'
+                'border:1.2px solid #c00000;border-radius:3px;color:#c00000;background:#fff;text-align:center;'
+                '-webkit-print-color-adjust:exact;print-color-adjust:exact;">'
+                '<div style="font-size:9px;font-weight:800;letter-spacing:1.5px;border:1.2px solid #c00000;border-radius:2px;padding:0 5px;display:inline-block;transform:rotate(-3deg);">CRITICAL</div>'
+                + (f'<div style="font-size:7.5px;font-weight:700;line-height:1.25;margin-top:2px;">{_cr_note}</div>' if _cr_note else "")
+                + '</div>'
+            )
+    except Exception:
+        critical_html = ""
     in_abst_section = False
 
     if params:
@@ -11622,11 +11716,11 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
                unreadable jammed-together text. These scoped rules give
                them a clean bordered grid in screen view AND print view.
                Only affects tables inside the notes block. */
-            .report-test-note table, .test-category-note table, .interpretation-note table {{ display: table !important; width: 100%; border-collapse: collapse !important; margin: 6px 0; table-layout: auto; border: 1px solid #000 !important; break-inside: avoid; page-break-inside: avoid; }}
+            .report-test-note table, .test-category-note table, .interpretation-note table {{ display: table !important; width: 100%; border-collapse: collapse !important; margin: 6px 0; table-layout: auto; border: 0.4px solid #666 !important; break-inside: avoid; page-break-inside: avoid; }}
             .report-test-note thead, .test-category-note thead {{ display: table-header-group; }}
             .report-test-note tbody, .test-category-note tbody {{ display: table-row-group; }}
             .report-test-note tr, .test-category-note tr {{ display: table-row; break-inside: avoid; page-break-inside: avoid; }}
-            .report-test-note th, .report-test-note td, .test-category-note th, .test-category-note td {{ display: table-cell; border: 1px solid #000 !important; padding: 3px 6px; text-align: left; vertical-align: top; color: #000; line-height: 1.3; overflow-wrap: anywhere; }}
+            .report-test-note th, .report-test-note td, .test-category-note th, .test-category-note td {{ display: table-cell; border: 0.4px solid #666 !important; padding: 3px 6px; text-align: left; vertical-align: top; color: #000; line-height: 1.3; overflow-wrap: anywhere; }}
             .report-test-note th, .test-category-note th {{ font-weight: bold; background: #f2f2f2; }}
 
             .end-report-text {{ text-align: center; font-size: 7px !important; font-weight: bold; color: #000; margin: 4px 0; letter-spacing: 0.7px; }}
@@ -11936,7 +12030,8 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
             <div class="report-bottom-fixed">
                 <div class="bottom-section">
                     <div class="qr-container">
-                        <img src="{qr_url}" alt="QR Code">
+                        {critical_html}
+                        <img src="{qr_url}" alt="QR Code" style="display:block;">
                     </div>
                     <div class="sig-wrapper-new">
                         <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" style="{sig_img_inline_style}" onerror="this.style.display='none';">
@@ -13047,6 +13142,10 @@ async def marketing_upload(request: Request, file: UploadFile = File(...)):
         conn.commit()
         media_id = cur.lastrowid
         base = str(request.base_url).rstrip("/")
+        # WhatsApp/Meta must fetch the image over public HTTPS; behind a proxy
+        # base_url can come back as http://, so upgrade it for non-local hosts.
+        if base.startswith("http://") and not any(h in base for h in ("localhost", "127.0.0.1")):
+            base = "https://" + base[len("http://"):]
         return JSONResponse({"ok": True, "url": f"{base}/marketing-media/{media_id}", "id": media_id})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
