@@ -2894,7 +2894,7 @@ def init_db():
 
     # Critical-result flag + short wording, printed as a boxed alert with a red
     # seal above the QR code (replaces the manual rubber-stamp).
-    for _crit_col, _crit_def in (("is_critical", "INTEGER DEFAULT 0"), ("critical_note", "TEXT")):
+    for _crit_col, _crit_def in (("is_critical", "INTEGER DEFAULT 0"), ("critical_note", "TEXT"), ("critical_show_doctor", "INTEGER DEFAULT 1")):
         try:
             cursor.execute(f"ALTER TABLE patient_assigned_tests ADD COLUMN {_crit_col} {_crit_def}")
         except Exception:
@@ -8152,18 +8152,19 @@ def test_entry_page(patient_id: int, test_id: int):
         """
         
     # ---- Critical result alert box (printed above the QR on the report) ----
-    _crit_flag, _crit_text = 0, ""
+    _crit_flag, _crit_text, _crit_doc = 0, "", 1
     try:
         cursor.execute(
-            "SELECT COALESCE(is_critical, 0) AS c, COALESCE(critical_note, '') AS n FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?",
+            "SELECT COALESCE(is_critical, 0) AS c, COALESCE(critical_note, '') AS n, COALESCE(critical_show_doctor, 1) AS d FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ?",
             (patient_id, test_id)
         )
         _crit_row = cursor.fetchone()
         if _crit_row:
             _crit_flag = int(_crit_row["c"] or 0)
             _crit_text = str(_crit_row["n"] or "")
+            _crit_doc = int(_crit_row["d"]) if _crit_row["d"] is not None else 1
     except Exception:
-        _crit_flag, _crit_text = 0, ""
+        _crit_flag, _crit_text, _crit_doc = 0, "", 1
     _crit_phrases = ["Critical value - inform doctor immediately", "Repeat sample confirmed", "Urgent - contact physician", "Panic value"]
     _crit_chips = "".join(
         "<button type='button' class='crit-chip' onclick=\"var i=document.getElementById('crit-note');i.value=this.textContent;i.dispatchEvent(new Event('input'));\" "
@@ -8174,16 +8175,20 @@ def test_entry_page(patient_id: int, test_id: int):
         <div style="background:#fef2f2; border:1px solid #fca5a5; border-radius:8px; padding:12px 16px; margin-bottom:16px;">
             <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:13.5px; font-weight:700; color:#b91c1c;">
                 <input type="checkbox" id="crit-flag"{" checked" if _crit_flag else ""} style="width:17px; height:17px; margin:0;" onchange="critSave();">
-                <span><i class="fa-solid fa-triangle-exclamation"></i> Critical Result (prints red CRITICAL seal + note above QR)</span>
+                <span><i class="fa-solid fa-triangle-exclamation"></i> Critical Result (prints a red alert box below the QR)</span>
                 <span id="crit-saved" style="display:none; margin-left:auto; color:#15803d; font-size:12px;"></span>
             </label>
             <input type="text" id="crit-note" maxlength="120" value="{html.escape(_crit_text, quote=True)}" placeholder="Short wording e.g. Critical value - inform doctor immediately" style="width:100%; box-sizing:border-box; margin-top:8px;" oninput="clearTimeout(window._critT);window._critT=setTimeout(critSave,700);">
             <div style="margin-top:6px; display:flex; flex-wrap:wrap; gap:6px;">{_crit_chips}</div>
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px; font-size:12.5px; font-weight:600; color:#b91c1c;">
+                <input type="checkbox" id="crit-doc"{" checked" if _crit_doc else ""} style="width:15px; height:15px; margin:0;" onchange="critSave();">
+                <span>Add line: "Please show this report to the doctor"</span>
+            </label>
         </div>
         <script>
         function critSave(){{
             var f=document.getElementById('crit-flag'),n=document.getElementById('crit-note'),b=document.getElementById('crit-saved');
-            fetch('/set-critical/{patient_id}/{test_id}',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'flag='+(f.checked?1:0)+'&note='+encodeURIComponent(n.value)}})
+            fetch('/set-critical/{patient_id}/{test_id}',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'flag='+(f.checked?1:0)+'&doc='+(document.getElementById('crit-doc').checked?1:0)+'&note='+encodeURIComponent(n.value)}})
             .then(function(r){{b.textContent=r.ok?'\u2714 Saved':'Could not save';b.style.display='inline';}})
             .catch(function(){{b.textContent='Could not save';b.style.display='inline';}});
         }}
@@ -9504,17 +9509,18 @@ async def set_critical(patient_id: int, test_id: int, request: Request):
     form_data = await request.form()
     flag = 1 if str(form_data.get("flag", "0")) == "1" else 0
     note = re.sub(r"\s+", " ", str(form_data.get("note", "") or "")).strip()[:120]
+    show_doc = 0 if str(form_data.get("doc", "1")) == "0" else 1
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        for col, ddl in (("is_critical", "INTEGER DEFAULT 0"), ("critical_note", "TEXT")):
+        for col, ddl in (("is_critical", "INTEGER DEFAULT 0"), ("critical_note", "TEXT"), ("critical_show_doctor", "INTEGER DEFAULT 1")):
             try:
                 cursor.execute(f"ALTER TABLE patient_assigned_tests ADD COLUMN {col} {ddl}")
                 conn.commit()
             except Exception:
                 pass
-        cursor.execute("UPDATE patient_assigned_tests SET is_critical = ?, critical_note = ? WHERE patient_id = ? AND test_id = ?",
-                       (flag, note, patient_id, test_id))
+        cursor.execute("UPDATE patient_assigned_tests SET is_critical = ?, critical_note = ?, critical_show_doctor = ? WHERE patient_id = ? AND test_id = ?",
+                       (flag, note, show_doc, patient_id, test_id))
         conn.commit()
     finally:
         conn.close()
@@ -11287,18 +11293,18 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
     critical_html = ""
     try:
         cursor.execute(
-            "SELECT COALESCE(is_critical, 0) AS c, COALESCE(critical_note, '') AS n FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ? LIMIT 1",
+            "SELECT COALESCE(is_critical, 0) AS c, COALESCE(critical_note, '') AS n, COALESCE(critical_show_doctor, 1) AS d FROM patient_assigned_tests WHERE patient_id = ? AND test_id = ? LIMIT 1",
             (patient_id, test_id)
         )
         _cr = cursor.fetchone()
         if _cr and int(_cr["c"] or 0):
             _cr_note = html.escape(str(_cr["n"] or "").strip())
             critical_html = (
-                '<div class="critical-box" style="display:inline-block;white-space:nowrap;margin:8px 0 0 0;padding:2px 7px;'
+                '<div class="critical-box" style="display:inline-block;white-space:nowrap;margin:14px 0 0 0;padding:2px 7px;'
                 'border:1.2px solid #c00000;border-radius:3px;color:#c00000;background:#fff;text-align:left;'
                 '-webkit-print-color-adjust:exact;print-color-adjust:exact;">'
                 + (f'<div style="font-size:7.5px;font-weight:800;line-height:1.3;white-space:nowrap;">{_cr_note}</div>' if _cr_note else "")
-                + '<div style="font-size:7px;font-weight:700;line-height:1.3;white-space:nowrap;">Please show this report to the doctor</div>'
+                + ('<div style="font-size:7px;font-weight:700;line-height:1.3;white-space:nowrap;">Please show this report to the doctor</div>' if (_cr["d"] is None or int(_cr["d"])) else "")
                 + '</div>'
             )
     except Exception:
