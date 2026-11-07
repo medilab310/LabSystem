@@ -9476,7 +9476,7 @@ async def save_test_results(request: Request):
 @app.post("/set-abst-visibility/{patient_id}/{test_id}")
 async def set_abst_visibility(patient_id: int, test_id: int, request: Request):
     """Saves the 'Hide ABST' flag immediately (works even when the test is locked)."""
-    if not user_can(get_current_user(request), "can_edit_results"):
+    if not user_can(request, "can_edit_results"):
         return HTMLResponse("forbidden", status_code=403)
     form_data = await request.form()
     flag = 1 if str(form_data.get("hide", "0")) == "1" else 0
@@ -11294,11 +11294,11 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         if _cr and int(_cr["c"] or 0):
             _cr_note = html.escape(str(_cr["n"] or "").strip())
             critical_html = (
-                '<div class="critical-box" style="display:inline-block;max-width:210px;margin:0 0 4px 0;padding:3px 6px;'
+                '<div class="critical-box" style="display:block;width:110px;max-width:110px;margin:3px 0 0 0;padding:2px 4px;'
                 'border:1.2px solid #c00000;border-radius:3px;color:#c00000;background:#fff;text-align:center;'
                 '-webkit-print-color-adjust:exact;print-color-adjust:exact;">'
-                '<div style="font-size:9px;font-weight:800;letter-spacing:1.5px;border:1.2px solid #c00000;border-radius:2px;padding:0 5px;display:inline-block;transform:rotate(-3deg);">CRITICAL</div>'
-                + (f'<div style="font-size:7.5px;font-weight:700;line-height:1.25;margin-top:2px;">{_cr_note}</div>' if _cr_note else "")
+                + (f'<div style="font-size:7px;font-weight:800;line-height:1.2;">{_cr_note}</div>' if _cr_note else "")
+                + '<div style="font-size:6.5px;font-weight:700;line-height:1.2;">Please show this report to the doctor</div>'
                 + '</div>'
             )
     except Exception:
@@ -12030,8 +12030,8 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
             <div class="report-bottom-fixed">
                 <div class="bottom-section">
                     <div class="qr-container">
-                        {critical_html}
                         <img src="{qr_url}" alt="QR Code" style="display:block;">
+                        {critical_html}
                     </div>
                     <div class="sig-wrapper-new">
                         <img src="{signature_img_url}" alt="MLT Signature" class="sig-img-new" style="{sig_img_inline_style}" onerror="this.style.display='none';">
@@ -12991,7 +12991,6 @@ def whatsapp_marketing_page(request: Request, q: str = ""):
         function buildMsg(name){{
             var base = (document.getElementById('mkt-msg').value || '').replace(/\\{{name\\}}/g, name || '');
             var imgUrl = (typeof mktImageUrl !== 'undefined') ? mktImageUrl : '';
-            if (imgUrl) {{ base += '\\n\\n[Image/Poster] ' + imgUrl; }}
             return base;
         }}
         function openOneChat(link){{
