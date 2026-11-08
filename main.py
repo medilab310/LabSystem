@@ -5051,6 +5051,7 @@ def add_patient_page(request: Request, saved_id: int = None):
         success_banner = f"""
         <div style="background: #d4edda; color: #155724; padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #c3e6cb; font-weight: bold; font-size: 15px; text-align: center;">
             ✓ Patient Saved Successfully! Reference No: #{saved_id}
+            {('<a href="/billing?pid=' + str(saved_id) + '" style="display:inline-block;margin-left:12px;padding:4px 12px;border-radius:5px;background:#155724;color:#fff;text-decoration:none;font-size:13px;">Go to Billing &rarr;</a>') if user_can(request, "cashier_billing") else ""}
         </div>
         """
 
@@ -9624,6 +9625,7 @@ def _bill_load(cur, pid):
         "cancel_reason": str(acc["cancel_reason"] or "") if acc else "",
         "tests": tests,
         "payments": payments,
+        "wa_phone": _wa_phone_digits(p["phone"]),
         "barcode": _code128b_data_uri(ref) or "",
         "now": now_colombo().strftime("%A, %b %d, %Y - %I:%M %p"),
     })
@@ -10448,6 +10450,11 @@ _BILLING_JS = r"""
     $('btnPrint').addEventListener('click', printBill);
     $('btnSave').addEventListener('click', function () { save(true); });
     $('btnClear').addEventListener('click', clearAll);
+    $('btnWa').addEventListener('click', function () {
+      if (!S.bill) { toast('Select a patient first.', 'err'); return; }
+      if (!S.bill.wa_phone) { toast('This patient has no valid mobile number for WhatsApp.', 'err'); return; }
+      window.open('/billing/whatsapp/' + S.bill.pid, '_blank');
+    });
     $('btnCancel').addEventListener('click', function () { openModal('cancel'); });
     $('btnRefund').addEventListener('click', function () { openModal('refund'); });
     $('mNo').addEventListener('click', closeModal);
@@ -10577,6 +10584,7 @@ _BILLING_COUNTER_HTML = """
       <button id="btnClear" type="button" class="cb-btn clear"><i class="fa-solid fa-trash"></i> CLEAR (F9)</button>
     </div>
     <div class="cb-sec">
+      <button id="btnWa" type="button" class="cb-sbtn" style="border:1.5px solid #16a34a;color:#16a34a"><i class="fa-brands fa-whatsapp"></i> WhatsApp Bill</button>
       <button id="btnRefund" type="button" class="cb-sbtn blue" style="display:none"><i class="fa-solid fa-rotate-left"></i> Refund over-payment</button>
       <button id="btnCancel" type="button" class="cb-sbtn red" style="display:none"><i class="fa-solid fa-ban"></i> Cancel Bill</button>
     </div>
@@ -10684,7 +10692,8 @@ def _render_billing_register(request: Request, q: str, status: str, date_from, d
             f'<td class="r">{r["gross"]:,.2f}</td><td class="r">{r["discount"]:,.2f}</td><td class="r">{r["net"]:,.2f}</td>'
             f'<td class="r">{r["paid"]:,.2f}</td><td class="r">{bal}</td><td>{_status_badge(r["status"])}</td>'
             f'<td class="cb-act"><a href="/billing?pid={r["pid"]}">Open</a>'
-            f'<a href="/billing/receipt/{r["pid"]}" target="_blank">Receipt</a></td></tr>')
+            f'<a href="/billing/receipt/{r["pid"]}" target="_blank">Receipt</a>'
+            f'<a href="/billing/whatsapp/{r["pid"]}" target="_blank" title="Send bill by WhatsApp">WhatsApp</a></td></tr>')
     if not body:
         body = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:26px">No bills match this filter.</td></tr>'
 
@@ -10832,6 +10841,46 @@ def billing_page(request: Request, view: str = "counter", pid: int = 0, q: str =
     return HTMLResponse(_render_billing_counter(request, pid))
 
 
+# ---------------------------- WHATSAPP BILL ------------------------
+def _bill_whatsapp_text(b: dict) -> str:
+    greet = _wa_greeting("", b["name"])
+    lines = [greet, "", f"Thank you for choosing {_BILLING_LAB_NAME.title()} {_BILLING_LAB_SUB.title()}.",
+             f"Your bill - {b['ref']} ({b['now']})", ""]
+    for t in b["tests"]:
+        lines.append(f"- {t['name']}: Rs. {t['price']:,.2f}")
+    lines.append("")
+    if b["discount"] > 0:
+        lines.append(f"Sub Total: Rs. {b['gross']:,.2f}")
+        lines.append(f"Discount: Rs. {b['discount']:,.2f}")
+    lines.append(f"*Total: Rs. {b['net']:,.2f}*")
+    lines.append(f"Paid: Rs. {b['paid']:,.2f}")
+    if b["due"] > 0.005:
+        lines.append(f"*Balance Due: Rs. {b['due']:,.2f}*")
+    elif b["due"] <= 0.005:
+        lines.append("Status: FULLY PAID")
+    lines += ["", "Thank You! Visit Again."]
+    return "\n".join(lines)
+
+
+@app.get("/billing/whatsapp/{pid}")
+def billing_whatsapp(pid: int, request: Request):
+    """Opens WhatsApp with the bill typed out, addressed to the patient's number."""
+    if not user_can(request, "cashier_billing"):
+        return render_locked_page("Cashier Billing")
+    conn, cur = _billing_conn()
+    try:
+        b = _bill_load(cur, pid)
+    finally:
+        conn.close()
+    if not b:
+        return HTMLResponse("<h3>Bill not found.</h3>", status_code=404)
+    if not b["wa_phone"]:
+        return HTMLResponse("<h3>This patient has no valid phone number for WhatsApp.</h3>"
+                            "<p>Add a mobile number in the patient details and try again.</p>", status_code=400)
+    return RedirectResponse(url=f"https://wa.me/{b['wa_phone']}?text={quote(_bill_whatsapp_text(b), safe='')}",
+                            status_code=302)
+
+
 # ---------------------------- RECEIPT ------------------------------
 _RECEIPT_CSS = r"""
 *{box-sizing:border-box;}
@@ -10925,7 +10974,9 @@ def billing_receipt(pid: int, request: Request, payment_id: int = 0, size: str =
     bar = (f'<div class="bar"><span>Paper:</span>'
            f'<a class="{"on" if size == "thermal" else ""}" href="{base}size=thermal">80mm Roll</a>'
            f'<a class="{"on" if size == "a5" else ""}" href="{base}size=a5">A5</a>'
-           f'<button onclick="window.print()">Print</button><button onclick="window.close()">Close</button></div>')
+           f'<button onclick="window.print()">Print</button>'
+           + (f'<a href="/billing/whatsapp/{pid}" target="_blank">WhatsApp</a>' if b["wa_phone"] else "")
+           + '<button onclick="window.close()">Close</button></div>')
     auto = "<script>window.addEventListener('load',function(){setTimeout(function(){window.focus();window.print();},350);});</script>" if autoprint else ""
     return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Receipt {esc(b["ref"])}</title>
