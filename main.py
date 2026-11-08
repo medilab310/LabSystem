@@ -375,6 +375,7 @@ UI_INJECTION_SKIP_PREFIXES = (
     "/report-download/",
     "/report-view/",
     "/report-letterhead-preview/",
+    "/billing/receipt/",
 )
 
 
@@ -604,6 +605,7 @@ PERMISSIONS = {
     "can_edit_results":  "Edit Results",
     "can_edit_patients": "Edit Patient Details",
     "can_manage_users":  "Manage Users (Granular)",
+    "cashier_billing":   "Cashier Billing (Take Payments)",
 }
 
 # -------------------------------------------------------------
@@ -1168,6 +1170,7 @@ _SHELL_NAV = [
         ("dashboard", "Dashboard", "fa-house", "/dashboard", None, None),
         ("register", "Register Patient", "fa-user-plus", "/add-patient", "add_patient", None),
         ("results", "Test Results & Print", "fa-print", "/patients-dashboard", None, None),
+        ("billing", "Billing", "fa-cash-register", "/billing", "cashier_billing", None),
         ("entry", "Result Entry", "fa-file-pen", "/select-patient", None, None),
         ("cancel", "Cancel Bills", "fa-ban", "/patients-dashboard?tab=cancel_bills", None, "can_cancel_bills"),
     ]),
@@ -1196,6 +1199,7 @@ _SHELL_MATCH = [
     ("results", ("/patients-dashboard", "/patient-results", "/patient-tests", "/test-entry")),
     ("entry", ("/select-patient", "/add-test-entry")),
     ("register", ("/add-patient",)),
+    ("billing", ("/billing",)),
     ("share", ("/share-reports",)),
     ("marketing", ("/marketing",)),
     ("packages", ("/manage-packages", "/edit-package")),
@@ -1448,6 +1452,7 @@ _SHELL_SKIP_EXACT = {"/", "/login", "/logout", "/dashboard", "/favicon.ico"}
 _SHELL_SKIP_PREFIXES = (
     "/public-report", "/shared-report", "/static", "/docs", "/openapi.json", "/redoc",
     "/print-report", "/report-view", "/report-download", "/report-letterhead-preview", "/api/",
+    "/billing/receipt",
 )
 
 def _shell_can(user: dict, perm, flag) -> bool:
@@ -1581,6 +1586,7 @@ def _shell_quick_actions_html(user: dict) -> str:
     items = [
         ("blue", "fa-user-plus", "Register Patient", "/add-patient", "add_patient", None),
         ("green", "fa-print", "Test Results & Print", "/patients-dashboard", None, None),
+        ("orange", "fa-cash-register", "Billing", "/billing", "cashier_billing", None),
         ("purple", "fa-chart-line", "Reports & Analytics", "/reports", "reports", "can_view_reports"),
         ("orange", "fa-flask", "Manage Tests", "/manage-tests", "manage_tests", None),
         ("green", "fa-sack-dollar", "Sales & Finance", "/reports/sales-analytics", "reports", "can_view_reports"),
@@ -2939,6 +2945,7 @@ def init_db():
         cursor.execute("ALTER TABLE patient_assigned_tests ADD COLUMN comment TEXT")
 
     _ensure_package_tables(cursor)
+    _ensure_billing_tables(cursor)
 
     conn.commit()
     conn.close()
@@ -9321,6 +9328,26 @@ def cancel_invoice(invoice_id: int, request: Request):
         return HTMLResponse("<h3>Patient/Bill not found!</h3>", status_code=404)
 
     cursor.execute("UPDATE patients SET is_cancelled = 1 WHERE id = ?", (invoice_id,))
+    # Cashier Billing: if money was already collected on this bill, record the
+    # matching refund so the Daily Cash Summary stays correct. Best-effort -
+    # never blocks the cancellation itself.
+    try:
+        cursor.execute(
+            "SELECT COALESCE(SUM(CASE WHEN kind = 'refund' THEN -amount ELSE amount END), 0) "
+            "FROM bill_payments WHERE patient_id = ?", (invoice_id,))
+        _paid_so_far = _money(cursor.fetchone()[0])
+        if _paid_so_far > 0.005:
+            cursor.execute(
+                "SELECT method FROM bill_payments WHERE patient_id = ? AND kind = 'payment' ORDER BY id DESC LIMIT 1",
+                (invoice_id,))
+            _lm = cursor.fetchone()
+            cursor.execute(
+                "INSERT INTO bill_payments (patient_id, kind, amount, method, remarks, cashier, paid_at) "
+                "VALUES (?, 'refund', ?, ?, 'Refund on cancelled bill (Cancel Bills tab)', ?, ?)",
+                (invoice_id, _paid_so_far, (_lm[0] if _lm and _lm[0] else "Cash"),
+                 _billing_user(request), now_colombo().isoformat(timespec="seconds")))
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -9332,6 +9359,1578 @@ def cancel_invoice(invoice_id: int, request: Request):
         url=f"/patients-dashboard?tab=cancel_bills&msg={quote(success_msg, safe='')}",
         status_code=303
     )
+
+# =============================================================
+# CASHIER / BILLING MODULE  (Basic package)
+# -------------------------------------------------------------
+# A separate tab (/billing) that lives inside THIS system and uses the
+# SAME database: patients registered in "Register Patient" are simply
+# searched and selected here - nothing is typed twice.
+#
+#   * Cashier Counter      - patient + tests + payment + live receipt
+#   * Bill Register        - ledger of every bill with its pay status
+#   * Daily Cash Summary   - one-day collections / refunds / dues
+#
+# Features: Cash Received, Balance / Change, Partial Payments, Due
+# Payments, Discounts, Bill Cancel / Refund, Daily Cash Summary and
+# Cashier user login (permission "cashier_billing" in Manage Users).
+#
+# Additive only: two new tables (bill_accounts, bill_payments). Existing
+# tables, routes and the Patient Registration page are NOT changed.
+# A bill = one patient visit; its amount is the sum of that patient's
+# assigned tests (price_override first, else the normal test price).
+# =============================================================
+_BILLING_READY = False
+_BILLING_METHODS = ("Cash", "Card", "Bank Transfer")
+_BILLING_LAB_NAME = "MEDISTAR"
+_BILLING_LAB_SUB = "MEDICAL LABORATORY"
+
+
+def _ensure_billing_tables(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bill_accounts (
+            patient_id INTEGER PRIMARY KEY,
+            discount REAL DEFAULT 0,
+            discount_note TEXT,
+            updated_by TEXT,
+            updated_at TEXT,
+            cancel_reason TEXT,
+            cancelled_by TEXT,
+            cancelled_at TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bill_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            kind TEXT DEFAULT 'payment',
+            amount REAL NOT NULL,
+            tendered REAL,
+            change_given REAL,
+            method TEXT,
+            remarks TEXT,
+            cashier TEXT,
+            paid_at TEXT
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bill_payments_patient ON bill_payments(patient_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bill_payments_paid_at ON bill_payments(paid_at)")
+    # Bills registered BEFORE this module went live have no payment records.
+    # They are treated as settled ("Legacy") so thousands of old visits do
+    # not suddenly show up as unpaid. Set once, on the first start.
+    cursor.execute(
+        "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('billing_go_live', ?)",
+        (now_colombo().date().isoformat(),),
+    )
+
+
+def _billing_conn():
+    """Connection + cursor with the billing tables guaranteed (once per process)."""
+    global _BILLING_READY
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if not _BILLING_READY:
+        _ensure_billing_tables(cur)
+        conn.commit()
+        _BILLING_READY = True
+    return conn, cur
+
+
+def _billing_go_live(cur) -> str:
+    try:
+        cur.execute("SELECT value FROM app_settings WHERE key = 'billing_go_live'")
+        row = cur.fetchone()
+        if row and row[0]:
+            return str(row[0])[:10]
+    except Exception:
+        pass
+    return now_colombo().date().isoformat()
+
+
+def _money(x) -> float:
+    try:
+        return round(float(x or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bill_ref(pid) -> str:
+    return f"MED-{int(pid):04d}"
+
+
+def _fmt_dt(s) -> str:
+    try:
+        return datetime.fromisoformat(str(s)).strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        return str(s or "")
+
+
+def _billing_user(request: Request) -> str:
+    try:
+        sess = _get_session(request.cookies.get("session_token"))
+        if sess and sess.get("username"):
+            return str(sess.get("username"))
+    except Exception:
+        pass
+    return (request.cookies.get("username", "") or "").strip() or "unknown"
+
+
+def _billing_can_cancel(request: Request) -> bool:
+    return user_can(request, "can_cancel_bills") or user_can(request, "reports")
+
+
+def _billing_deny():
+    return JSONResponse({"ok": False, "error": "You do not have permission to use Cashier Billing."}, status_code=403)
+
+
+def _bill_status(gross, discount, paid, live=True) -> dict:
+    gross = _money(gross)
+    discount = min(max(_money(discount), 0.0), gross)
+    net = round(gross - discount, 2)
+    paid = _money(paid)
+    due = round(net - paid, 2)
+    if not live:
+        status = "Legacy"
+    elif gross <= 0 and paid <= 0:
+        status = "No Tests"
+    elif due > 0.005:
+        status = "Partial" if paid > 0.005 else "Pending"
+    elif due < -0.005:
+        status = "Overpaid"
+    else:
+        status = "Paid"
+    return {"gross": gross, "discount": discount, "net": net, "paid": paid, "due": due, "status": status}
+
+
+def _billing_agg(cur, id_sql, id_params, go_live):
+    """Bill totals for the patients picked by `id_sql` (a SELECT id ...).
+    Aggregates are limited to those ids, so it stays fast on a big database."""
+    sql = f"""
+        SELECT p.id AS pid, p.title, p.name, p.phone, p.created_at, p.manual_bill_no,
+               p.age_years, p.age_months, p.age_days, p.gender,
+               COALESCE(g.gross, 0) AS gross,
+               COALESCE(ba.discount, 0) AS discount,
+               COALESCE(pay.paid, 0) AS paid,
+               CASE WHEN substr(p.created_at, 1, 10) >= ? OR ba.patient_id IS NOT NULL
+                         OR pay.pid IS NOT NULL THEN 1 ELSE 0 END AS live
+        FROM patients p
+        LEFT JOIN (SELECT pat.patient_id AS pid, SUM(COALESCE(pat.price_override, t.price, 0)) AS gross
+                   FROM patient_assigned_tests pat JOIN tests t ON t.id = pat.test_id
+                   WHERE pat.patient_id IN ({id_sql}) GROUP BY pat.patient_id) g ON g.pid = p.id
+        LEFT JOIN (SELECT patient_id AS pid,
+                          SUM(CASE WHEN kind = 'refund' THEN -amount ELSE amount END) AS paid
+                   FROM bill_payments WHERE patient_id IN ({id_sql}) GROUP BY patient_id) pay ON pay.pid = p.id
+        LEFT JOIN bill_accounts ba ON ba.patient_id = p.id
+        WHERE p.id IN ({id_sql})
+        ORDER BY p.id DESC
+    """
+    cur.execute(sql, [go_live] + list(id_params) * 3)
+    out = []
+    for r in cur.fetchall():
+        st = _bill_status(r["gross"], r["discount"], r["paid"], bool(r["live"]))
+        st.update({
+            "pid": r["pid"],
+            "ref": _bill_ref(r["pid"]),
+            "manual_bill_no": str(r["manual_bill_no"] or ""),
+            "name": f"{(r['title'] or '').strip()} {(r['name'] or '').strip()}".strip(),
+            "phone": str(r["phone"] or ""),
+            "gender": str(r["gender"] or ""),
+            "age": format_age_components(r["age_years"], r["age_months"], r["age_days"]),
+            "created": _fmt_dt(r["created_at"]),
+            "created_raw": str(r["created_at"] or ""),
+        })
+        out.append(st)
+    return out
+
+
+_BILL_ACTIVE_SQL = "(is_cancelled IS NULL OR is_cancelled = 0)"
+
+
+def _billing_kpi(cur) -> dict:
+    today = now_colombo().date().isoformat()
+    go_live = _billing_go_live(cur)
+    cur.execute(f"SELECT COUNT(*) FROM patients WHERE {_BILL_ACTIVE_SQL} AND substr(created_at, 1, 10) = ?", (today,))
+    bills = int(cur.fetchone()[0] or 0)
+    cur.execute(
+        "SELECT COALESCE(SUM(CASE WHEN kind = 'refund' THEN -amount ELSE amount END), 0) "
+        "FROM bill_payments WHERE substr(paid_at, 1, 10) = ?", (today,))
+    income = _money(cur.fetchone()[0])
+    pend_n, pend_amt = _billing_pending(cur, go_live)
+    return {"bills": bills, "income": income, "pending": pend_n, "pending_amount": pend_amt}
+
+
+def _billing_pending(cur, go_live):
+    id_sql = (f"SELECT id FROM patients WHERE {_BILL_ACTIVE_SQL} AND (substr(created_at, 1, 10) >= ? "
+              "OR id IN (SELECT patient_id FROM bill_accounts) OR id IN (SELECT patient_id FROM bill_payments))")
+    rows = _billing_agg(cur, id_sql, [go_live], go_live)
+    due_rows = [r for r in rows if r["status"] in ("Pending", "Partial")]
+    return len(due_rows), _money(sum(r["due"] for r in due_rows))
+
+
+def _bill_load(cur, pid):
+    """Full bill (patient, tests, payments, totals) as a JSON-safe dict."""
+    cur.execute("""
+        SELECT p.id, p.title, p.name, p.age_years, p.age_months, p.age_days, p.gender, p.phone,
+               COALESCE(d.name, p.doctor, '') AS doctor,
+               COALESCE(p.center, p.collecting_center, 'Main Branch') AS center,
+               p.created_at, p.manual_bill_no, COALESCE(p.is_cancelled, 0) AS is_cancelled
+        FROM patients p LEFT JOIN doctors d ON d.code = p.doctor
+        WHERE p.id = ?
+    """, (pid,))
+    p = cur.fetchone()
+    if not p:
+        return None
+    cur.execute("""
+        SELECT pat.id AS row_id, pat.test_id, t.test_name, COALESCE(t.department, '') AS dept,
+               COALESCE(pat.price_override, t.price, 0) AS price, pat.saved_at, pat.result
+        FROM patient_assigned_tests pat JOIN tests t ON t.id = pat.test_id
+        WHERE pat.patient_id = ? ORDER BY pat.id
+    """, (pid,))
+    tests = []
+    for r in cur.fetchall():
+        locked = bool(r["saved_at"]) or bool(str(r["result"] or "").strip())
+        tests.append({"row_id": r["row_id"], "test_id": r["test_id"], "name": r["test_name"],
+                      "dept": r["dept"], "price": _money(r["price"]), "locked": locked})
+    cur.execute("SELECT id, kind, amount, tendered, change_given, method, remarks, cashier, paid_at "
+                "FROM bill_payments WHERE patient_id = ? ORDER BY id", (pid,))
+    payments, paid = [], 0.0
+    for r in cur.fetchall():
+        amt = _money(r["amount"])
+        paid += -amt if r["kind"] == "refund" else amt
+        payments.append({"id": r["id"], "kind": r["kind"] or "payment", "amount": amt,
+                         "tendered": _money(r["tendered"]), "change": _money(r["change_given"]),
+                         "method": r["method"] or "", "remarks": r["remarks"] or "",
+                         "cashier": r["cashier"] or "", "at": _fmt_dt(r["paid_at"])})
+    cur.execute("SELECT discount, discount_note, cancel_reason FROM bill_accounts WHERE patient_id = ?", (pid,))
+    acc = cur.fetchone()
+    discount = _money(acc["discount"]) if acc else 0.0
+    gross = _money(sum(t["price"] for t in tests))
+    live = (str(p["created_at"] or "")[:10] >= _billing_go_live(cur)) or bool(acc) or bool(payments)
+    st = _bill_status(gross, discount, paid, live)
+    ref = _bill_ref(pid)
+    st.update({
+        "ok": True,
+        "pid": pid,
+        "ref": ref,
+        "manual_bill_no": str(p["manual_bill_no"] or ""),
+        "name": f"{(p['title'] or '').strip()} {(p['name'] or '').strip()}".strip(),
+        "age": format_age_components(p["age_years"], p["age_months"], p["age_days"]),
+        "gender": str(p["gender"] or ""),
+        "phone": str(p["phone"] or ""),
+        "doctor": str(p["doctor"] or ""),
+        "center": str(p["center"] or ""),
+        "registered": _fmt_dt(p["created_at"]),
+        "cancelled": bool(p["is_cancelled"]),
+        "cancel_reason": str(acc["cancel_reason"] or "") if acc else "",
+        "tests": tests,
+        "payments": payments,
+        "barcode": _code128b_data_uri(ref) or "",
+        "now": now_colombo().strftime("%A, %b %d, %Y - %I:%M %p"),
+    })
+    return st
+
+
+def _bill_save_discount(cur, pid, discount, note, user, now_iso):
+    cur.execute("SELECT patient_id FROM bill_accounts WHERE patient_id = ?", (pid,))
+    if cur.fetchone():
+        cur.execute("UPDATE bill_accounts SET discount = ?, discount_note = ?, updated_by = ?, updated_at = ? "
+                    "WHERE patient_id = ?", (discount, note, user, now_iso, pid))
+    else:
+        cur.execute("INSERT INTO bill_accounts (patient_id, discount, discount_note, updated_by, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)", (pid, discount, note, user, now_iso))
+
+
+def _json_err(msg, code=400):
+    return JSONResponse({"ok": False, "error": msg}, status_code=code)
+
+
+# ---------------------------- JSON API -----------------------------
+@app.get("/api/billing/patients")
+def api_billing_patients(request: Request, q: str = ""):
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    conn, cur = _billing_conn()
+    try:
+        go_live = _billing_go_live(cur)
+        q = (q or "").strip()
+        sql = f"SELECT id FROM patients WHERE {_BILL_ACTIVE_SQL}"
+        params = []
+        if q:
+            like = f"%{q}%"
+            cond = "(name LIKE ? OR phone LIKE ? OR manual_bill_no LIKE ? OR CAST(id AS TEXT) LIKE ?"
+            params += [like, like, like, like]
+            m = re.match(r"^(?:MED-?)?0*(\d+)$", q, re.I)
+            if m:
+                cond += " OR id = ?"
+                params.append(int(m.group(1)))
+            sql += " AND " + cond + ")"
+        sql += " ORDER BY id DESC LIMIT 12"
+        rows = _billing_agg(cur, sql, params, go_live)
+        return {"ok": True, "patients": rows}
+    finally:
+        conn.close()
+
+
+@app.get("/api/billing/bill/{pid}")
+def api_billing_bill(pid: int, request: Request):
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    conn, cur = _billing_conn()
+    try:
+        bill = _bill_load(cur, pid)
+        if not bill:
+            return _json_err("Patient not found.", 404)
+        bill["can_cancel"] = _billing_can_cancel(request)
+        return bill
+    finally:
+        conn.close()
+
+
+@app.get("/api/billing/tests")
+def api_billing_tests(request: Request, q: str = ""):
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    conn, cur = _billing_conn()
+    try:
+        like = f"%{(q or '').strip()}%"
+        cur.execute("SELECT id, test_name, COALESCE(price, 0) AS price, COALESCE(department, '') AS dept "
+                    "FROM tests WHERE test_name LIKE ? ORDER BY test_name LIMIT 40", (like,))
+        return {"ok": True, "tests": [{"id": r["id"], "name": r["test_name"], "price": _money(r["price"]),
+                                       "dept": r["dept"]} for r in cur.fetchall()]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/billing/kpi")
+def api_billing_kpi(request: Request):
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    conn, cur = _billing_conn()
+    try:
+        return {"ok": True, **_billing_kpi(cur)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/billing/add-test")
+async def api_billing_add_test(request: Request):
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    try:
+        data = await request.json()
+        pid, test_id = int(data.get("patient_id")), int(data.get("test_id"))
+    except Exception:
+        return _json_err("Invalid request.")
+    conn, cur = _billing_conn()
+    try:
+        bill = _bill_load(cur, pid)
+        if not bill:
+            return _json_err("Patient not found.", 404)
+        if bill["cancelled"]:
+            return _json_err("This bill is cancelled.")
+        cur.execute("SELECT id FROM tests WHERE id = ?", (test_id,))
+        if not cur.fetchone():
+            return _json_err("Test not found.", 404)
+        if any(t["test_id"] == test_id for t in bill["tests"]):
+            return _json_err("That test is already on this bill.")
+        cur.execute("INSERT INTO patient_assigned_tests (patient_id, test_id, assigned_date) "
+                    "VALUES (?, ?, datetime('now'))", (pid, test_id))
+        conn.commit()
+        bill = _bill_load(cur, pid)
+        bill["can_cancel"] = _billing_can_cancel(request)
+        return bill
+    finally:
+        conn.close()
+
+
+@app.post("/api/billing/remove-test")
+async def api_billing_remove_test(request: Request):
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    try:
+        data = await request.json()
+        pid, row_id = int(data.get("patient_id")), int(data.get("row_id"))
+    except Exception:
+        return _json_err("Invalid request.")
+    conn, cur = _billing_conn()
+    try:
+        bill = _bill_load(cur, pid)
+        if not bill:
+            return _json_err("Patient not found.", 404)
+        if bill["cancelled"]:
+            return _json_err("This bill is cancelled.")
+        target = next((t for t in bill["tests"] if t["row_id"] == row_id), None)
+        if not target:
+            return _json_err("Test not found on this bill.", 404)
+        if target["locked"]:
+            return _json_err("Results are already entered for this test, so it cannot be removed from the bill.")
+        if len(bill["tests"]) <= 1:
+            return _json_err("A bill needs at least one test. Use Cancel Bill to cancel the whole bill.")
+        cur.execute("DELETE FROM patient_assigned_tests WHERE id = ? AND patient_id = ?", (row_id, pid))
+        conn.commit()
+        bill = _bill_load(cur, pid)
+        bill["can_cancel"] = _billing_can_cancel(request)
+        return bill
+    finally:
+        conn.close()
+
+
+@app.post("/api/billing/pay")
+async def api_billing_pay(request: Request):
+    """Save the discount and take a payment (full, partial, or none = due)."""
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    try:
+        data = await request.json()
+        pid = int(data.get("patient_id"))
+    except Exception:
+        return _json_err("Invalid request.")
+    discount = _money(data.get("discount"))
+    tendered = _money(data.get("tendered"))
+    method = str(data.get("method") or "Cash")
+    if method not in _BILLING_METHODS:
+        method = "Cash"
+    remarks = " ".join(str(data.get("remarks") or "").split())[:200]
+    conn, cur = _billing_conn()
+    try:
+        bill = _bill_load(cur, pid)
+        if not bill:
+            return _json_err("Patient not found.", 404)
+        if bill["cancelled"]:
+            return _json_err("This bill is cancelled.")
+        if bill["gross"] <= 0:
+            return _json_err("This bill has no chargeable tests.")
+        if discount < 0 or discount > bill["gross"] + 0.005:
+            return _json_err("Discount cannot be negative or more than the bill total.")
+        if tendered < 0:
+            return _json_err("Cash received cannot be negative.")
+        net = round(bill["gross"] - discount, 2)
+        due = round(net - bill["paid"], 2)
+        user, now_iso = _billing_user(request), now_colombo().isoformat(timespec="seconds")
+        if tendered > 0.005 and due <= 0.005:
+            return _json_err("This bill is already fully paid - nothing more to collect.")
+        applied = round(min(tendered, max(due, 0.0)), 2)
+        change = round(tendered - applied, 2) if method == "Cash" else 0.0
+        if method != "Cash":
+            tendered = applied
+        if abs(discount - bill["discount"]) > 0.004:
+            _bill_save_discount(cur, pid, discount, "", user, now_iso)
+        payment_id = None
+        if applied > 0.005:
+            cur.execute("INSERT INTO bill_payments (patient_id, kind, amount, tendered, change_given, method, "
+                        "remarks, cashier, paid_at) VALUES (?, 'payment', ?, ?, ?, ?, ?, ?, ?)",
+                        (pid, applied, tendered, change, method, remarks, user, now_iso))
+            payment_id = cur.lastrowid
+        conn.commit()
+        bill = _bill_load(cur, pid)
+        bill["can_cancel"] = _billing_can_cancel(request)
+        if payment_id:
+            msg = "Payment saved." if bill["due"] <= 0.005 else f"Partial payment saved - Rs. {bill['due']:,.2f} still due."
+        else:
+            msg = f"Saved as DUE - Rs. {bill['due']:,.2f} to be paid later."
+        return {"ok": True, "message": msg, "payment_id": payment_id, "bill": bill, "kpi": _billing_kpi(cur)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/billing/refund")
+async def api_billing_refund(request: Request):
+    """Pay back an over-payment (e.g. after a test was removed from the bill)."""
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    if not _billing_can_cancel(request):
+        return _json_err("You do not have permission to issue refunds.", 403)
+    try:
+        data = await request.json()
+        pid = int(data.get("patient_id"))
+    except Exception:
+        return _json_err("Invalid request.")
+    amount = _money(data.get("amount"))
+    method = str(data.get("method") or "Cash")
+    if method not in _BILLING_METHODS:
+        method = "Cash"
+    reason = " ".join(str(data.get("reason") or "").split())[:200]
+    if len(reason) < 3:
+        return _json_err("Please enter a reason for the refund.")
+    conn, cur = _billing_conn()
+    try:
+        bill = _bill_load(cur, pid)
+        if not bill:
+            return _json_err("Patient not found.", 404)
+        refundable = round(-bill["due"], 2)
+        if refundable <= 0.005:
+            return _json_err("There is no over-payment to refund on this bill.")
+        if amount <= 0 or amount > refundable + 0.005:
+            return _json_err(f"Refund must be between 0.01 and {refundable:,.2f}.")
+        cur.execute("INSERT INTO bill_payments (patient_id, kind, amount, method, remarks, cashier, paid_at) "
+                    "VALUES (?, 'refund', ?, ?, ?, ?, ?)",
+                    (pid, amount, method, "Refund: " + reason, _billing_user(request),
+                     now_colombo().isoformat(timespec="seconds")))
+        conn.commit()
+        bill = _bill_load(cur, pid)
+        bill["can_cancel"] = True
+        return {"ok": True, "message": f"Refund of Rs. {amount:,.2f} recorded.", "bill": bill, "kpi": _billing_kpi(cur)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/billing/cancel")
+async def api_billing_cancel(request: Request):
+    """Cancel a bill (reason is mandatory). Money already paid is refunded."""
+    if not user_can(request, "cashier_billing"):
+        return _billing_deny()
+    if not _billing_can_cancel(request):
+        return _json_err("You do not have permission to cancel bills.", 403)
+    try:
+        data = await request.json()
+        pid = int(data.get("patient_id"))
+    except Exception:
+        return _json_err("Invalid request.")
+    reason = " ".join(str(data.get("reason") or "").split())[:200]
+    if len(reason) < 3:
+        return _json_err("A reason is required to cancel a bill.")
+    refund = bool(data.get("refund", True))
+    conn, cur = _billing_conn()
+    try:
+        bill = _bill_load(cur, pid)
+        if not bill:
+            return _json_err("Patient not found.", 404)
+        if bill["cancelled"]:
+            return _json_err("This bill is already cancelled.")
+        user, now_iso = _billing_user(request), now_colombo().isoformat(timespec="seconds")
+        refunded = 0.0
+        if refund and bill["paid"] > 0.005:
+            refunded = round(bill["paid"], 2)
+            # Refund goes back the same way the last payment came in (Cash / Card / Bank).
+            refund_method = (bill["payments"][-1]["method"] if bill["payments"] else "") or "Cash"
+            cur.execute("INSERT INTO bill_payments (patient_id, kind, amount, method, remarks, cashier, paid_at) "
+                        "VALUES (?, 'refund', ?, ?, ?, ?, ?)",
+                        (pid, refunded, refund_method, "Refund on cancelled bill: " + reason, user, now_iso))
+        cur.execute("SELECT patient_id FROM bill_accounts WHERE patient_id = ?", (pid,))
+        if cur.fetchone():
+            cur.execute("UPDATE bill_accounts SET cancel_reason = ?, cancelled_by = ?, cancelled_at = ? "
+                        "WHERE patient_id = ?", (reason, user, now_iso, pid))
+        else:
+            cur.execute("INSERT INTO bill_accounts (patient_id, discount, cancel_reason, cancelled_by, cancelled_at) "
+                        "VALUES (?, 0, ?, ?, ?)", (pid, reason, user, now_iso))
+        cur.execute("UPDATE patients SET is_cancelled = 1 WHERE id = ?", (pid,))
+        conn.commit()
+        msg = f"Bill {bill['ref']} cancelled."
+        if refunded:
+            msg += f" Rs. {refunded:,.2f} refunded."
+        return {"ok": True, "message": msg, "kpi": _billing_kpi(cur)}
+    finally:
+        conn.close()
+
+
+# ---------------------------- PAGE STYLES --------------------------
+_BILLING_CSS = r"""
+.cb{max-width:1560px;margin:0 auto;color:var(--text);font-family:'Inter','Segoe UI',system-ui,sans-serif;}
+.cb *{box-sizing:border-box;}
+.cb a{text-decoration:none;}
+.cb-head h1{margin:0;font-size:30px;font-weight:800;letter-spacing:-.3px;color:var(--text);}
+.cb-head p{margin:4px 0 14px;color:var(--text);opacity:.85;font-size:15.5px;}
+.cb-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px;}
+.cb-tab{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:999px;font-weight:700;font-size:13.5px;color:var(--text);background:var(--card);border:1px solid var(--border);transition:.15s;}
+.cb-tab:hover{border-color:var(--primary);}
+.cb-tab.on{background:var(--primary);border-color:var(--primary);color:#fff;}
+[data-theme="dark"] .cb-tab.on{color:#06223a;}
+.cb-card{background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:18px 20px;min-width:0;}
+.cb-card h2{margin:0 0 14px;font-size:15.5px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;color:var(--text);}
+.cb-hrow{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;}
+.cb-hrow h2{margin:0;}
+.cb-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr) minmax(290px,350px);gap:18px;align-items:start;}
+.cb-patient{grid-column:1;grid-row:1;}
+.cb-tests{grid-column:2;grid-row:1;}
+.cb-receipt{grid-column:3;grid-row:1 / span 3;}
+.cb-pay{grid-column:1 / span 2;grid-row:2;border:2px solid #1e88e5;}
+.cb-actions{grid-column:1 / span 2;grid-row:3;}
+.cb-kpis{grid-column:1 / -1;grid-row:4;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;}
+@media (max-width:1240px){
+  .cb-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);}
+  .cb-patient{grid-column:1;grid-row:1;} .cb-tests{grid-column:2;grid-row:1;}
+  .cb-pay{grid-column:1 / -1;grid-row:2;} .cb-actions{grid-column:1 / -1;grid-row:3;}
+  .cb-receipt{grid-column:1 / -1;grid-row:4;max-width:420px;} .cb-kpis{grid-row:5;}
+}
+@media (max-width:820px){
+  .cb-grid{grid-template-columns:minmax(0,1fr);}
+  .cb-patient,.cb-tests,.cb-pay,.cb-actions,.cb-receipt,.cb-kpis{grid-column:1;grid-row:auto;max-width:none;}
+  .cb-kpis{grid-template-columns:1fr;}
+}
+.cb-in{width:100%;height:44px;border:1px solid var(--border);border-radius:10px;padding:0 12px;font-size:15px;background:var(--card);color:var(--text);outline:none;font-family:inherit;}
+.cb-in:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-soft);}
+textarea.cb-in{height:auto;padding:10px 12px;resize:vertical;}
+.cb-search{position:relative;margin-bottom:12px;}
+.cb-search>i{position:absolute;left:13px;top:14px;color:var(--muted);}
+.cb-search .cb-in{padding-left:38px;}
+.cb-results{position:absolute;left:0;right:0;top:48px;z-index:30;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 34px rgba(0,0,0,.22);max-height:360px;overflow:auto;display:none;}
+.cb-res{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;cursor:pointer;border-bottom:1px solid var(--border);}
+.cb-res:last-child{border-bottom:0;}
+.cb-res:hover,.cb-res.hl{background:var(--primary-soft);}
+.cb-res b{font-size:14.5px;display:block;}
+.cb-res small{color:var(--muted);font-size:12px;}
+.cb-res .rt{text-align:right;white-space:nowrap;font-size:12.5px;}
+.cb-empty{color:var(--muted);font-size:14px;padding:6px 0;line-height:1.5;}
+.cb-pname{font-size:19px;font-weight:800;line-height:1.3;}
+.cb-pname span{font-size:15.5px;font-weight:500;}
+.cb-pl{font-size:15.5px;margin-top:5px;}
+.cb-pl i{width:18px;color:var(--primary);opacity:.8;}
+.cb-recent-h{font-size:12.5px;font-weight:800;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);margin:6px 0 6px;}
+.cb-badge{display:inline-block;padding:3px 11px;border-radius:999px;font-size:11.5px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;}
+.cb-badge.paid{background:#dcfce7;color:#166534;}
+.cb-badge.partial{background:#fef3c7;color:#92400e;}
+.cb-badge.pending{background:#fee2e2;color:#991b1b;}
+.cb-badge.overpaid{background:#dbeafe;color:#1e40af;}
+.cb-badge.legacy,.cb-badge.notests{background:#e5e7eb;color:#374151;}
+.cb-badge.cancelled{background:#1f2937;color:#fff;}
+.cb-add{background:#1e6fe8;color:#fff;border:0;border-radius:9px;padding:0 16px;height:40px;font-weight:700;font-size:14.5px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;font-family:inherit;}
+.cb-add:hover{background:#1558bd;}
+.cb-addpop{display:none;margin:0 0 12px;border:1px solid var(--border);border-radius:12px;padding:10px;background:var(--bg);}
+.cb-addlist{max-height:230px;overflow:auto;margin-top:8px;}
+.cb-addrow{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px;}
+.cb-addrow:hover{background:var(--primary-soft);}
+.cb-addrow small{color:var(--muted);}
+.cb-ttable{width:100%;border-collapse:collapse;}
+.cb-ttable th{background:var(--bg);text-align:left;padding:10px 10px;font-size:15px;font-weight:800;}
+.cb-ttable th:last-child,.cb-ttable td.pr{text-align:right;}
+.cb-ttable td{padding:11px 10px;border-bottom:1px solid var(--border);font-size:15.5px;}
+.cb-ttable td small{display:block;color:var(--muted);font-size:11.5px;}
+.cb-ttable tr.tot td{font-weight:800;font-size:17px;border-bottom:0;}
+.cb-trash{background:none;border:0;cursor:pointer;color:#64748b;font-size:15px;padding:4px 7px;margin-left:8px;border-radius:7px;}
+.cb-trash:hover{background:#fee2e2;color:#b91c1c;}
+.cb-trash.lock{cursor:not-allowed;opacity:.55;}
+.cb-total{text-align:center;font-size:36px;font-weight:800;margin:0 0 4px;letter-spacing:-.5px;}
+.cb-totsub{text-align:center;color:var(--muted);font-size:13.5px;margin-bottom:16px;}
+.cb-payrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;align-items:end;margin-bottom:14px;}
+.cb-lbl{display:block;font-size:13px;font-weight:800;text-transform:uppercase;margin-bottom:6px;letter-spacing:.2px;}
+.cb-lbl em{font-style:normal;font-weight:500;text-transform:none;}
+.cb-ig{display:flex;}
+.cb-ig .cb-in{border-radius:10px 0 0 10px;text-align:right;font-size:22px;font-weight:700;height:56px;}
+.cb-ig.sm .cb-in{height:48px;font-size:19px;}
+.cb-unit{display:flex;align-items:center;justify-content:center;min-width:56px;padding:0 14px;background:var(--primary-soft);border:1px solid var(--border);border-left:0;border-radius:0 10px 10px 0;font-weight:800;font-size:18px;color:var(--text);font-family:inherit;}
+button.cb-unit{cursor:pointer;}
+.cb-bal{height:56px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;background:#86efac;border:2px solid #22c55e;color:#14532d;box-shadow:0 0 14px rgba(34,197,94,.28);}
+.cb-bal.due{background:#fde68a;border-color:#f59e0b;color:#78350f;box-shadow:0 0 14px rgba(245,158,11,.28);}
+.cb-bal.zero{background:var(--primary-soft);border-color:var(--border);color:var(--text);box-shadow:none;}
+.cb-bal.refund{background:#bfdbfe;border-color:#3b82f6;color:#1e3a8a;box-shadow:none;}
+.cb-row2{display:grid;grid-template-columns:minmax(190px,260px) minmax(0,1fr);gap:16px;align-items:end;}
+@media (max-width:640px){.cb-row2{grid-template-columns:1fr;}}
+.cb-hint{margin-top:12px;font-size:13.5px;border-radius:9px;padding:9px 12px;background:var(--primary-soft);display:none;}
+.cb-hint.warn{background:#fef3c7;color:#92400e;display:block;}
+.cb-hint.info{display:block;}
+.cb-hist{margin-top:14px;border-top:1px dashed var(--border);padding-top:10px;display:none;}
+.cb-hist h3{margin:0 0 6px;font-size:12.5px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);}
+.cb-hrow2{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:6px 0;font-size:13.5px;border-bottom:1px solid var(--border);}
+.cb-hrow2:last-child{border-bottom:0;}
+.cb-hrow2 small{color:var(--muted);display:block;}
+.cb-hrow2 a{color:var(--primary);font-weight:700;margin-left:10px;}
+.cb-hrow2 .neg{color:#b91c1c;font-weight:800;}
+.cb-abtns{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;}
+@media (max-width:640px){.cb-abtns{grid-template-columns:1fr;}}
+.cb-btn{height:58px;border:0;border-radius:12px;color:#fff;font-weight:800;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;font-family:inherit;box-shadow:0 4px 12px rgba(0,0,0,.18);transition:.12s;}
+.cb-btn:hover{transform:translateY(-1px);filter:brightness(1.07);}
+.cb-btn:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+.cb-btn.print{background:#0b66f0;} .cb-btn.save{background:#16a34a;} .cb-btn.clear{background:#6b7280;}
+.cb-sec{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;}
+.cb-sbtn{height:38px;padding:0 16px;border-radius:9px;font-weight:700;font-size:13.5px;cursor:pointer;background:transparent;font-family:inherit;display:inline-flex;align-items:center;gap:7px;}
+.cb-sbtn.red{border:1.5px solid #dc2626;color:#dc2626;} .cb-sbtn.red:hover{background:#dc2626;color:#fff;}
+.cb-sbtn.blue{border:1.5px solid #2563eb;color:#2563eb;} .cb-sbtn.blue:hover{background:#2563eb;color:#fff;}
+.cb-kpi{background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);padding:16px 22px;display:block;color:var(--text);}
+.cb-kpi:hover{border-color:var(--primary);}
+.cb-kpi span{display:block;font-size:19px;font-weight:700;}
+.cb-kpi b{display:block;font-size:34px;font-weight:800;margin-top:4px;line-height:1.15;}
+.cb-kpi small{color:var(--muted);font-size:12.5px;}
+/* receipt preview roll */
+.cb-rollwrap{padding:0 6px 10px;}
+.cb-rollbar{height:11px;background:#8f969e;border-radius:7px;position:relative;z-index:2;}
+.cb-roll{background:#fff;color:#111;margin:-3px 8px 0;padding:16px 16px 26px;box-shadow:0 10px 26px rgba(0,0,0,.2);position:relative;font-size:14px;line-height:1.5;font-family:'Inter',system-ui,sans-serif;}
+.cb-roll::after{content:"";position:absolute;left:0;right:0;bottom:-7px;height:8px;background:radial-gradient(circle at 4px -1px,transparent 4px,#fff 4.5px) repeat-x;background-size:8px 8px;}
+.cb-roll .r-t{text-align:center;font-size:23px;font-weight:800;letter-spacing:.3px;line-height:1.15;}
+.cb-roll .r-s{text-align:center;font-weight:800;font-size:15px;margin-bottom:8px;}
+.cb-roll .r-bar{display:block;width:100%;height:38px;margin:6px 0 8px;}
+.cb-roll .r-c{text-align:center;}
+.cb-roll .r-b{text-align:center;font-weight:800;font-size:16px;}
+.cb-roll hr{border:0;border-top:1.5px dashed #9aa0a6;margin:9px 0;}
+.cb-roll .r-l{display:flex;justify-content:space-between;gap:8px;}
+.cb-roll .r-l.b{font-weight:800;font-size:15.5px;}
+.cb-roll .r-neg{color:#b91c1c;}
+.cb-roll .r-end{text-align:center;font-weight:800;margin-top:6px;}
+.cb-roll .r-x{text-align:center;color:#b91c1c;font-weight:800;border:2px solid #b91c1c;padding:2px;margin:6px 0;}
+/* modal + toast */
+.cb-mbg{position:fixed;inset:0;background:rgba(10,20,50,.55);display:none;align-items:center;justify-content:center;z-index:300;padding:14px;}
+.cb-mbg.on{display:flex;}
+.cb-modal{width:min(480px,100%);background:var(--card);color:var(--text);border-radius:16px;padding:22px;box-shadow:0 24px 60px rgba(0,0,0,.35);}
+.cb-modal h3{margin:0 0 6px;font-size:19px;}
+.cb-modal p{margin:0 0 14px;color:var(--muted);font-size:13.5px;}
+.cb-modal .cb-lbl{margin-top:12px;}
+.cb-mfoot{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;}
+.cb-mfoot button{height:42px;padding:0 20px;border-radius:10px;font-weight:700;font-size:14.5px;cursor:pointer;border:0;font-family:inherit;}
+.cb-mfoot .no{background:var(--primary-soft);color:var(--text);} .cb-mfoot .yes{background:#dc2626;color:#fff;} .cb-mfoot .ok{background:#2563eb;color:#fff;}
+.cb-chk{display:flex;gap:9px;align-items:center;margin-top:12px;font-size:14px;font-weight:600;}
+.cb-chk input{width:17px;height:17px;}
+.cb-toast{position:fixed;right:22px;bottom:22px;z-index:400;min-width:240px;max-width:380px;padding:13px 18px;border-radius:12px;color:#fff;font-weight:700;font-size:14.5px;box-shadow:0 12px 30px rgba(0,0,0,.3);display:none;}
+.cb-toast.ok{background:#15803d;} .cb-toast.err{background:#b91c1c;} .cb-toast.on{display:block;}
+.cb-cancelled{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:10px;padding:10px 14px;margin-top:12px;font-weight:700;font-size:14px;}
+/* register + summary */
+.cb-filter{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px;}
+.cb-filter label{font-size:12px;font-weight:800;text-transform:uppercase;display:block;margin-bottom:4px;}
+.cb-filter .cb-in{height:40px;width:auto;min-width:150px;}
+.cb-fbtn{height:40px;padding:0 18px;border-radius:10px;border:0;background:var(--primary);color:#fff;font-weight:700;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:7px;}
+[data-theme="dark"] .cb-fbtn{color:#06223a;}
+.cb-chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;}
+.cb-chip{padding:6px 14px;border-radius:999px;background:var(--card);border:1px solid var(--border);color:var(--text);font-size:13px;font-weight:700;}
+.cb-chip.on{background:var(--primary-soft);border-color:var(--primary);}
+.cb-wrap{overflow-x:auto;}
+.cb-table{width:100%;border-collapse:collapse;min-width:900px;}
+.cb-table th{background:var(--bg);text-align:left;padding:11px 12px;font-size:12.5px;text-transform:uppercase;letter-spacing:.3px;white-space:nowrap;}
+.cb-table td{padding:11px 12px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle;}
+.cb-table .r{text-align:right;white-space:nowrap;}
+.cb-table tr:hover td{background:var(--primary-soft);}
+.cb-table tfoot td{font-weight:800;background:var(--bg);border-bottom:0;}
+.cb-table td small{color:var(--muted);display:block;font-size:11.5px;}
+.cb-act a{display:inline-block;padding:5px 11px;border-radius:8px;font-size:12.5px;font-weight:700;border:1px solid var(--border);color:var(--primary);margin-right:5px;}
+.cb-act a:hover{background:var(--primary);color:#fff;}
+.cb-note{color:var(--muted);font-size:12.5px;margin-top:10px;}
+.cb-sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px;margin-bottom:18px;}
+.cb-sum .cb-kpi b{font-size:28px;}
+.cb-sum .g b{color:#16a34a;} .cb-sum .r b{color:#dc2626;} .cb-sum .a b{color:#d97706;}
+.cb-two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;margin-bottom:18px;}
+@media (max-width:900px){.cb-two{grid-template-columns:1fr;}}
+.cb-pos{color:#15803d;font-weight:700;} .cb-neg2{color:#b91c1c;font-weight:700;}
+@media print{
+  .ms-header,.ms-sidebar,.ms-crumb,.ms-scrim,.cb-tabs,.cb-filter,.cb-noprint,.cb-toast{display:none !important;}
+  .ms-layout{display:block !important;} .ms-main{padding:0 !important;}
+  .cb-card,.cb-kpi{box-shadow:none !important;}
+}
+"""
+
+
+# ---------------------------- COUNTER SCRIPT -----------------------
+_BILLING_JS = r"""
+(function () {
+  'use strict';
+  var INIT = window.CB_INIT || {};
+  var S = { bill: null, mode: 'rs', busy: false, canCancel: !!INIT.canCancel, hl: -1, found: [] };
+  var $ = function (id) { return document.getElementById(id); };
+  var timers = {};
+
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function fmt(n) { return Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+  function num(v) { var n = parseFloat(String(v == null ? '' : v).replace(/,/g, '')); return isFinite(n) ? n : 0; }
+  function r2(n) { return Math.round((n + 1e-9) * 100) / 100; }
+  function debounce(key, fn, ms) { clearTimeout(timers[key]); timers[key] = setTimeout(fn, ms); }
+  function badge(st) { return '<span class="cb-badge ' + String(st).toLowerCase().replace(/\s+/g, '') + '">' + esc(st) + '</span>'; }
+
+  function api(url, opt) {
+    return fetch(url, opt).then(function (r) {
+      if (r.status === 401) { window.location.href = '/login'; return { ok: false, error: 'Please log in again.' }; }
+      return r.json().catch(function () { return { ok: false, error: 'Server error' }; }).then(function (d) {
+        if (!r.ok && d.ok === undefined) { d.ok = false; d.error = d.detail || 'Request failed'; }
+        return d;
+      });
+    }).catch(function () { return { ok: false, error: 'Network error - please try again.' }; });
+  }
+  function post(url, body) { return api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); }
+
+  function toast(msg, kind) {
+    var t = $('cbToast'); t.textContent = msg; t.className = 'cb-toast on ' + (kind || 'ok');
+    clearTimeout(timers.toast); timers.toast = setTimeout(function () { t.className = 'cb-toast'; }, 3800);
+  }
+
+  /* ---------- calculations ---------- */
+  function calc() {
+    var b = S.bill; if (!b) return null;
+    var raw = num($('cbDisc').value), disc;
+    if (S.mode === 'pct') disc = r2(b.gross * Math.min(Math.max(raw, 0), 100) / 100);
+    else disc = Math.min(Math.max(raw, 0), b.gross);
+    disc = r2(disc);
+    var net = r2(b.gross - disc), due = r2(net - b.paid), cash = Math.max(num($('cbCash').value), 0);
+    var change = (due > 0 && cash > due) ? r2(cash - due) : 0;
+    var remain = due > 0 ? r2(Math.max(due - cash, 0)) : 0;
+    return { gross: b.gross, disc: disc, net: net, paid: b.paid, due: due, cash: cash, change: change, remain: remain };
+  }
+
+  /* ---------- renderers ---------- */
+  function renderPatient() {
+    var b = S.bill, el = $('cbPatient');
+    if (!b) { el.innerHTML = '<div class="cb-empty">Search and select a registered patient. Patients entered in <b>Register Patient</b> are already here - nothing needs to be typed again.</div><div class="cb-recent-h">Recent registrations</div><div id="cbRecent"></div>'; renderRecent(); return; }
+    var st = b.cancelled ? 'Cancelled' : b.status;
+    el.innerHTML =
+      '<div class="cb-pname">' + esc(b.name) + ' <span>(Patient ID: ' + esc(b.ref) + ')</span> ' + badge(st) + '</div>' +
+      '<div class="cb-pl">Age: ' + esc(b.age || '-') + '</div>' +
+      '<div class="cb-pl">Gender: ' + esc(b.gender || '-') + '</div>' +
+      '<div class="cb-pl">Reference Doctor: ' + esc(b.doctor || '-') + '</div>' +
+      (b.phone ? '<div class="cb-pl">Phone: ' + esc(b.phone) + '</div>' : '') +
+      (b.manual_bill_no ? '<div class="cb-pl">Manual Bill No: ' + esc(b.manual_bill_no) + '</div>' : '') +
+      '<div class="cb-pl" style="color:var(--muted);font-size:13px">Registered: ' + esc(b.registered) + '</div>' +
+      (b.cancelled ? '<div class="cb-cancelled">This bill was cancelled' + (b.cancel_reason ? ': ' + esc(b.cancel_reason) : '') + '</div>' : '') +
+      (b.status === 'Legacy' && !b.cancelled ? '<div class="cb-hint info" style="display:block">Registered before billing started - treated as settled. Taking a payment here will start a payment record for it.</div>' : '');
+  }
+
+  function renderRecent() {
+    var host = $('cbRecent'); if (!host) return;
+    api('/api/billing/patients?q=').then(function (d) {
+      if (!d.ok || S.bill) return;
+      host = $('cbRecent'); if (!host) return;
+      if (!d.patients.length) { host.innerHTML = '<div class="cb-empty">No patients registered yet.</div>'; return; }
+      host.innerHTML = d.patients.slice(0, 6).map(function (p) {
+        return '<div class="cb-res" data-pid="' + p.pid + '"><div><b>' + esc(p.name) + '</b><small>' + esc(p.ref) + ' &middot; ' + esc(p.created) + '</small></div><div class="rt">' + badge(p.status) + '<br>Rs. ' + fmt(p.net) + '</div></div>';
+      }).join('');
+    });
+  }
+
+  function renderTests() {
+    var b = S.bill, el = $('cbTests');
+    if (!b) { el.innerHTML = '<div class="cb-empty">Select a patient to see the tests on the bill.</div>'; return; }
+    var rows = b.tests.map(function (t) {
+      var trash = t.locked
+        ? '<button class="cb-trash lock" title="Results already entered - cannot remove" data-lock="1"><i class="fa-solid fa-lock"></i></button>'
+        : '<button class="cb-trash" title="Remove from bill" data-rm="' + t.row_id + '"><i class="fa-solid fa-trash-can"></i></button>';
+      return '<tr><td>' + esc(t.name) + (t.dept ? '<small>' + esc(t.dept) + '</small>' : '') + '</td><td class="pr">Rs. ' + fmt(t.price) + (b.cancelled ? '' : trash) + '</td></tr>';
+    }).join('');
+    el.innerHTML = '<table class="cb-ttable"><thead><tr><th>Selected Tests</th><th></th></tr></thead><tbody>' + (rows || '<tr><td colspan="2" class="cb-empty">No tests on this bill.</td></tr>') +
+      '</tbody><tfoot><tr class="tot"><td>Total Amount</td><td class="pr">Rs. ' + fmt(b.gross) + '</td></tr></tfoot></table>';
+    $('cbAddBtn').style.display = b.cancelled ? 'none' : '';
+  }
+
+  function renderPay() {
+    var b = S.bill, c = calc();
+    var ctl = ['cbDisc', 'cbCash', 'cbMethod', 'cbRemarks', 'cbMode'];
+    ctl.forEach(function (id) { $(id).disabled = !b || b.cancelled; });
+    if (!c) {
+      $('cbTotal').textContent = 'TOTAL AMOUNT: Rs. 0.00'; $('cbTotSub').textContent = 'Select a patient to start billing.';
+      $('cbPaidSo').textContent = '0.00'; $('cbBalLbl').textContent = 'BALANCE / CHANGE';
+      $('cbBal').className = 'cb-bal zero'; $('cbBal').textContent = 'Rs. 0.00'; $('cbHint').className = 'cb-hint'; $('cbHist').style.display = 'none';
+      $('btnCancel').style.display = 'none'; $('btnRefund').style.display = 'none';
+      ['btnSave', 'btnPrint'].forEach(function (id) { $(id).disabled = true; });
+      return;
+    }
+    $('cbTotal').textContent = 'TOTAL AMOUNT: Rs. ' + fmt(c.net);
+    var sub = 'Bill total Rs. ' + fmt(c.gross) + (c.disc > 0 ? '  -  Discount Rs. ' + fmt(c.disc) : '');
+    if (c.paid > 0) sub += '  -  Already paid Rs. ' + fmt(c.paid) + '  -  Balance due Rs. ' + fmt(Math.max(c.due, 0));
+    $('cbTotSub').textContent = sub;
+    $('cbPaidSo').textContent = fmt(c.paid);
+    var bal = $('cbBal'), lbl = $('cbBalLbl'), hint = $('cbHint');
+    hint.className = 'cb-hint';
+    if (b.cancelled) { lbl.textContent = 'CANCELLED'; bal.className = 'cb-bal zero'; bal.textContent = 'Rs. 0.00'; }
+    else if (c.due < -0.005) { lbl.textContent = 'REFUNDABLE'; bal.className = 'cb-bal refund'; bal.textContent = 'Rs. ' + fmt(-c.due); hint.className = 'cb-hint info'; hint.textContent = 'This bill is over-paid by Rs. ' + fmt(-c.due) + '. Use Refund to pay it back.'; }
+    else if (c.due <= 0.005) { lbl.textContent = 'FULLY PAID'; bal.className = 'cb-bal zero'; bal.textContent = 'Rs. 0.00'; }
+    else if (c.cash >= c.due - 0.005) { lbl.textContent = c.change > 0 ? 'CHANGE TO RETURN' : 'BALANCE / CHANGE'; bal.className = 'cb-bal'; bal.textContent = 'Rs. ' + fmt(c.change); }
+    else {
+      lbl.textContent = 'BALANCE DUE'; bal.className = 'cb-bal due'; bal.textContent = 'Rs. ' + fmt(c.remain);
+      hint.className = 'cb-hint warn';
+      hint.textContent = c.cash > 0 ? 'Partial payment: Rs. ' + fmt(c.cash) + ' will be received now and Rs. ' + fmt(c.remain) + ' will stay DUE.' : 'No cash entered: the bill will be saved as DUE (Rs. ' + fmt(c.due) + ').';
+    }
+    var done = b.cancelled;
+    $('btnSave').disabled = done || S.busy; $('btnPrint').disabled = false;
+    $('btnCancel').style.display = (S.canCancel && !b.cancelled) ? '' : 'none';
+    $('btnRefund').style.display = (S.canCancel && !b.cancelled && c.due < -0.005) ? '' : 'none';
+    // payment history
+    var h = $('cbHist');
+    if (b.payments.length) {
+      h.style.display = 'block';
+      $('cbHistBody').innerHTML = b.payments.map(function (p) {
+        var neg = p.kind === 'refund';
+        return '<div class="cb-hrow2"><div>' + esc(p.method) + ' &middot; ' + esc(p.at) + '<small>by ' + esc(p.cashier) + (p.remarks ? ' &middot; ' + esc(p.remarks) : '') + '</small></div><div><span class="' + (neg ? 'neg' : '') + '">' + (neg ? '- ' : '') + 'Rs. ' + fmt(p.amount) + '</span><a href="/billing/receipt/' + b.pid + '?payment_id=' + p.id + '&autoprint=1" target="_blank" title="Reprint receipt"><i class="fa-solid fa-print"></i></a></div></div>';
+      }).join('');
+    } else { h.style.display = 'none'; }
+  }
+
+  function renderReceipt() {
+    var b = S.bill, c = calc(), el = $('cbRoll');
+    if (!b) { el.innerHTML = '<div class="r-t">' + esc(window.CB_LAB || 'MEDISTAR') + '</div><div class="r-s">' + esc(window.CB_LAB_SUB || '') + '</div><div class="r-c" style="color:#6b7280;padding:30px 0">Receipt preview appears here once a patient is selected.</div>'; return; }
+    var L = function (a, v, cls) { return '<div class="r-l ' + (cls || '') + '"><span>' + a + '</span><span>' + v + '</span></div>'; };
+    var h = '<div class="r-t">' + esc(window.CB_LAB || 'MEDISTAR') + '</div><div class="r-s">' + esc(window.CB_LAB_SUB || '') + '</div>';
+    if (b.barcode) h += '<img class="r-bar" alt="" src="' + b.barcode + '">';
+    h += '<div class="r-b">Bill: ' + esc(b.ref) + '</div><div class="r-c">' + esc(b.now) + '</div>';
+    if (b.cancelled) h += '<div class="r-x">CANCELLED</div>';
+    h += '<hr><div>Patient: ' + esc(b.name) + '</div><hr>';
+    b.tests.forEach(function (t) { h += L(esc(t.name), 'Rs. ' + fmt(t.price)); });
+    h += '<hr>';
+    if (c.disc > 0) { h += L('Sub Total:', 'Rs. ' + fmt(c.gross)); h += L('Discount:', '- Rs. ' + fmt(c.disc), 'r-neg'); }
+    h += L('Total:', 'Rs. ' + fmt(c.net), 'b') + '<hr>';
+    if (c.paid > 0) h += L('Paid Earlier:', 'Rs. ' + fmt(c.paid));
+    if (c.due > 0.005) {
+      if (c.cash > 0) h += L('Cash Received:', 'Rs. ' + fmt(c.cash));
+      if (c.cash >= c.due - 0.005) h += L('Change Due:', 'Rs. ' + fmt(c.change), 'b');
+      else h += L('Balance Due:', 'Rs. ' + fmt(c.remain), 'b');
+    } else if (c.due < -0.005) h += L('Refundable:', 'Rs. ' + fmt(-c.due), 'b');
+    else h += L('Status:', 'FULLY PAID', 'b');
+    h += '<hr><div class="r-end">Thank You!<br>Visit Again.</div>';
+    el.innerHTML = h;
+  }
+
+  function renderAll() { renderPatient(); renderTests(); renderPay(); renderReceipt(); }
+
+  function setKpi(k) {
+    if (!k) return;
+    $('kBills').textContent = k.bills; $('kIncome').textContent = 'Rs. ' + Number(Math.round(k.income)).toLocaleString('en-US'); $('kPending').textContent = k.pending;
+    $('kPendingSub').textContent = k.pending ? 'Rs. ' + fmt(k.pending_amount) + ' outstanding' : 'All settled';
+  }
+
+  function resetCash() {
+    var c = calc();
+    $('cbCash').value = (c && c.due > 0.005) ? c.due.toFixed(2) : '';
+  }
+
+  /* ---------- patient selection ---------- */
+  function selectPatient(pid) {
+    $('cbResults').style.display = 'none';
+    api('/api/billing/bill/' + pid).then(function (d) {
+      if (!d.ok) { toast(d.error || 'Could not load the bill.', 'err'); return; }
+      S.bill = d; S.canCancel = !!d.can_cancel;
+      $('cbSearch').value = ''; $('cbDisc').value = d.discount > 0 ? (S.mode === 'pct' ? r2(d.discount / d.gross * 100) : d.discount.toFixed(2)) : '';
+      $('cbRemarks').value = '';
+      resetCash(); renderAll();
+      try { history.replaceState(null, '', '/billing?pid=' + pid); } catch (e) {}
+      $('cbCash').focus(); $('cbCash').select();
+    });
+  }
+
+  function showResults(list) {
+    var box = $('cbResults'); S.found = list; S.hl = -1;
+    if (!list.length) { box.innerHTML = '<div class="cb-empty" style="padding:12px 14px">No matching patient.</div>'; box.style.display = 'block'; return; }
+    box.innerHTML = list.map(function (p) {
+      return '<div class="cb-res" data-pid="' + p.pid + '"><div><b>' + esc(p.name) + '</b><small>' + esc(p.ref) + (p.phone ? ' &middot; ' + esc(p.phone) : '') + ' &middot; ' + esc(p.created) + '</small></div><div class="rt">' + badge(p.status) + '<br>Rs. ' + fmt(p.net) + (p.due > 0.005 && p.status !== 'Legacy' ? '<br><span style="color:#b91c1c">due ' + fmt(p.due) + '</span>' : '') + '</div></div>';
+    }).join('');
+    box.style.display = 'block';
+  }
+
+  /* ---------- actions ---------- */
+  function openBlank() {
+    var w = null;
+    try { w = window.open('', 'cbreceipt', 'width=480,height=780'); if (w) w.document.write('<p style="font-family:sans-serif;padding:24px">Preparing receipt...</p>'); } catch (e) { w = null; }
+    return w;
+  }
+  function goReceipt(w, payId) {
+    var url = '/billing/receipt/' + S.bill.pid + '?autoprint=1' + (payId ? '&payment_id=' + payId : '');
+    if (w) { w.location.href = url; return; }
+    var f = document.createElement('iframe'); f.style.cssText = 'position:fixed;width:0;height:0;border:0;right:0;bottom:0'; f.src = url; document.body.appendChild(f);
+    setTimeout(function () { try { document.body.removeChild(f); } catch (e) {} }, 60000);
+  }
+
+  function printBill() {
+    if (!S.bill) { toast('Select a patient first.', 'err'); return; }
+    var c = calc();
+    if (c.cash > 0.005 && c.due > 0.005) toast('Printing the saved bill. Use SAVE & PRINT to include the cash you entered.', 'ok');
+    goReceipt(openBlank(), null);
+  }
+
+  function save(printAfter) {
+    if (S.busy) return;
+    if (!S.bill) { toast('Select a patient first.', 'err'); return; }
+    var b = S.bill, c = calc();
+    if (b.cancelled) { toast('This bill is cancelled.', 'err'); return; }
+    if (c.due <= 0.005 && c.cash > 0.005 && Math.abs(c.disc - b.discount) < 0.005) { toast('This bill is already fully paid.', 'err'); return; }
+    if (c.due <= 0.005 && Math.abs(c.disc - b.discount) < 0.005) { toast('Nothing to save - the bill is fully paid.', 'ok'); if (printAfter) printBill(); return; }
+    if (c.due <= 0.005) c.cash = 0;
+    if (c.due > 0.005 && c.cash <= 0.005 && !window.confirm('No cash received.\nSave this bill as DUE (Rs. ' + fmt(c.due) + ')?')) return;
+    S.busy = true; $('btnSave').disabled = true;
+    var w = printAfter ? openBlank() : null;
+    post('/api/billing/pay', { patient_id: b.pid, discount: c.disc, tendered: c.cash, method: $('cbMethod').value, remarks: $('cbRemarks').value }).then(function (d) {
+      S.busy = false;
+      if (!d.ok) { if (w) { try { w.close(); } catch (e) {} } toast(d.error || 'Could not save the payment.', 'err'); renderPay(); return; }
+      S.bill = d.bill; setKpi(d.kpi);
+      $('cbDisc').value = d.bill.discount > 0 ? (S.mode === 'pct' ? r2(d.bill.discount / d.bill.gross * 100) : d.bill.discount.toFixed(2)) : '';
+      $('cbRemarks').value = ''; resetCash(); renderAll(); toast(d.message, 'ok');
+      if (printAfter) goReceipt(w, d.payment_id);
+    });
+  }
+
+  function clearAll() {
+    S.bill = null; $('cbDisc').value = ''; $('cbCash').value = ''; $('cbRemarks').value = ''; $('cbSearch').value = '';
+    $('cbMethod').selectedIndex = 0; $('cbAddPop').style.display = 'none'; renderAll();
+    try { history.replaceState(null, '', '/billing'); } catch (e) {}
+    $('cbSearch').focus();
+  }
+
+  /* ---------- modal (cancel / refund) ---------- */
+  var modalMode = null;
+  function openModal(mode) {
+    var b = S.bill, c = calc(); if (!b) return; modalMode = mode;
+    $('mReason').value = ''; $('mErr').textContent = '';
+    if (mode === 'cancel') {
+      $('mTitle').textContent = 'Cancel Bill ' + b.ref;
+      $('mText').textContent = 'The whole bill is removed from sales reports. A reason is required.';
+      $('mAmtBox').style.display = 'none';
+      $('mChkBox').style.display = b.paid > 0.005 ? 'flex' : 'none';
+      $('mChkTxt').textContent = 'Refund the Rs. ' + fmt(b.paid) + ' already paid to the patient';
+      $('mChk').checked = true; $('mYes').className = 'yes'; $('mYes').textContent = 'Cancel Bill';
+    } else {
+      $('mTitle').textContent = 'Refund over-payment';
+      $('mText').textContent = 'Pay back the extra money collected on ' + b.ref + '.';
+      $('mAmtBox').style.display = 'block'; $('mChkBox').style.display = 'none';
+      $('mAmt').value = (-c.due).toFixed(2); $('mYes').className = 'ok'; $('mYes').textContent = 'Record Refund';
+    }
+    $('cbModal').className = 'cb-mbg on'; $('mReason').focus();
+  }
+  function closeModal() { $('cbModal').className = 'cb-mbg'; modalMode = null; }
+  function confirmModal() {
+    var b = S.bill, reason = $('mReason').value.trim();
+    if (reason.length < 3) { $('mErr').textContent = 'Please enter a reason.'; return; }
+    $('mYes').disabled = true;
+    var req = modalMode === 'cancel'
+      ? post('/api/billing/cancel', { patient_id: b.pid, reason: reason, refund: $('mChk').checked })
+      : post('/api/billing/refund', { patient_id: b.pid, reason: reason, amount: num($('mAmt').value), method: $('mMethod').value });
+    req.then(function (d) {
+      $('mYes').disabled = false;
+      if (!d.ok) { $('mErr').textContent = d.error || 'Failed.'; return; }
+      var wasCancel = modalMode === 'cancel';
+      closeModal(); setKpi(d.kpi); toast(d.message, 'ok');
+      if (wasCancel) clearAll(); else { S.bill = d.bill; resetCash(); renderAll(); }
+    });
+  }
+
+  /* ---------- add / remove test ---------- */
+  function loadTests() {
+    var q = $('cbTestQ').value.trim();
+    api('/api/billing/tests?q=' + encodeURIComponent(q)).then(function (d) {
+      if (!d.ok) return;
+      $('cbTestList').innerHTML = d.tests.length ? d.tests.map(function (t) {
+        return '<div class="cb-addrow" data-tid="' + t.id + '"><span>' + esc(t.name) + '<br><small>' + esc(t.dept) + '</small></span><b>Rs. ' + fmt(t.price) + '</b></div>';
+      }).join('') : '<div class="cb-empty">No test found.</div>';
+    });
+  }
+  function afterTestChange(d) {
+    if (!d.ok) { toast(d.error || 'Failed.', 'err'); return; }
+    S.bill = d; resetCash(); renderAll();
+  }
+
+  /* ---------- wire up ---------- */
+  document.addEventListener('DOMContentLoaded', function () {
+    $('cbSearch').addEventListener('input', function () {
+      var q = this.value.trim();
+      debounce('s', function () { api('/api/billing/patients?q=' + encodeURIComponent(q)).then(function (d) { if (d.ok) showResults(d.patients); }); }, 220);
+    });
+    $('cbSearch').addEventListener('focus', function () {
+      if (!S.bill && !this.value) api('/api/billing/patients?q=').then(function (d) { if (d.ok && document.activeElement === $('cbSearch')) showResults(d.patients); });
+    });
+    $('cbSearch').addEventListener('keydown', function (e) {
+      var items = $('cbResults').querySelectorAll('.cb-res');
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault(); if (!items.length) return;
+        S.hl = (S.hl + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+        items.forEach(function (it, i) { it.classList.toggle('hl', i === S.hl); });
+      } else if (e.key === 'Enter') {
+        e.preventDefault(); var it = items[S.hl >= 0 ? S.hl : 0]; if (it) selectPatient(it.getAttribute('data-pid'));
+      } else if (e.key === 'Escape') { $('cbResults').style.display = 'none'; }
+    });
+    document.addEventListener('click', function (e) {
+      var r = e.target.closest ? e.target.closest('.cb-res') : null;
+      if (r && r.getAttribute('data-pid')) { selectPatient(r.getAttribute('data-pid')); return; }
+      if (!e.target.closest || !e.target.closest('.cb-search')) $('cbResults').style.display = 'none';
+      var rm = e.target.closest ? e.target.closest('[data-rm]') : null;
+      if (rm && S.bill) {
+        if (window.confirm('Remove this test from the bill?')) post('/api/billing/remove-test', { patient_id: S.bill.pid, row_id: parseInt(rm.getAttribute('data-rm'), 10) }).then(afterTestChange);
+        return;
+      }
+      var lk = e.target.closest ? e.target.closest('[data-lock]') : null;
+      if (lk) { toast('Results are already entered for this test - it cannot be removed.', 'err'); return; }
+      var ar = e.target.closest ? e.target.closest('[data-tid]') : null;
+      if (ar && S.bill) post('/api/billing/add-test', { patient_id: S.bill.pid, test_id: parseInt(ar.getAttribute('data-tid'), 10) }).then(function (d) { afterTestChange(d); if (d.ok) toast('Test added to the bill.', 'ok'); });
+    });
+    $('cbAddBtn').addEventListener('click', function () {
+      if (!S.bill) { toast('Select a patient first.', 'err'); return; }
+      var p = $('cbAddPop'); var open = p.style.display === 'block';
+      p.style.display = open ? 'none' : 'block'; if (!open) { $('cbTestQ').value = ''; loadTests(); $('cbTestQ').focus(); }
+    });
+    $('cbTestQ').addEventListener('input', function () { debounce('t', loadTests, 220); });
+    $('cbCash').addEventListener('input', function () { renderPay(); renderReceipt(); });
+    $('cbDisc').addEventListener('input', function () { if (S.bill) { resetCash(); renderPay(); renderReceipt(); } });
+    $('cbMode').addEventListener('click', function () {
+      var c = calc(); S.mode = S.mode === 'rs' ? 'pct' : 'rs';
+      this.textContent = S.mode === 'rs' ? 'Rs.' : '%';
+      if (c) $('cbDisc').value = c.disc > 0 ? (S.mode === 'pct' ? r2(c.disc / c.gross * 100) : c.disc.toFixed(2)) : '';
+      renderPay(); renderReceipt();
+    });
+    $('cbCash').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); save(true); } });
+    $('cbCash').addEventListener('focus', function () { this.select(); });
+    $('btnPrint').addEventListener('click', printBill);
+    $('btnSave').addEventListener('click', function () { save(true); });
+    $('btnClear').addEventListener('click', clearAll);
+    $('btnCancel').addEventListener('click', function () { openModal('cancel'); });
+    $('btnRefund').addEventListener('click', function () { openModal('refund'); });
+    $('mNo').addEventListener('click', closeModal);
+    $('mYes').addEventListener('click', confirmModal);
+    $('btnFull').addEventListener('click', function () { resetCash(); renderPay(); renderReceipt(); $('cbCash').focus(); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'F12') { e.preventDefault(); printBill(); }
+      else if (e.key === 'F10') { e.preventDefault(); save(true); }
+      else if (e.key === 'F9') { e.preventDefault(); clearAll(); }
+      else if (e.key === 'Escape' && modalMode) closeModal();
+    });
+    setKpi(INIT.kpi); renderAll();
+    if (INIT.pid) selectPatient(INIT.pid); else $('cbSearch').focus();
+  });
+})();
+"""
+
+
+# ---------------------------- PAGES --------------------------------
+def _billing_tabs_html(active: str) -> str:
+    tabs = [
+        ("counter", "Cashier Counter", "fa-cash-register", "/billing"),
+        ("register", "Bill Register", "fa-book", "/billing?view=register"),
+        ("summary", "Daily Cash Summary", "fa-scale-balanced", "/billing?view=summary"),
+    ]
+    return '<div class="cb-tabs">' + "".join(
+        f'<a class="cb-tab{" on" if k == active else ""}" href="{href}"><i class="fa-solid {ic}"></i> {label}</a>'
+        for k, label, ic, href in tabs) + "</div>"
+
+
+def _billing_page_shell(title: str, subtitle: str, active: str, inner: str, extra_head: str = "") -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(title)}</title>
+<style>{_BILLING_CSS}</style>
+{extra_head}
+</head>
+<body>
+<div class="cb">
+  <div class="cb-head"><h1>{html.escape(title)}</h1><p>{html.escape(subtitle)}</p></div>
+  {_billing_tabs_html(active)}
+  {inner}
+</div>
+</body>
+</html>"""
+
+
+_BILLING_COUNTER_HTML = """
+<div class="cb-grid">
+  <section class="cb-card cb-patient">
+    <h2>Patient Selection Card</h2>
+    <div class="cb-search">
+      <i class="fa-solid fa-magnifying-glass"></i>
+      <input id="cbSearch" class="cb-in" type="text" autocomplete="off" placeholder="Search Patient Name / Patient ID / Phone...">
+      <div id="cbResults" class="cb-results"></div>
+    </div>
+    <div id="cbPatient"></div>
+  </section>
+
+  <section class="cb-card cb-tests">
+    <div class="cb-hrow"><h2>Test Selection Card</h2>
+      <button id="cbAddBtn" type="button" class="cb-add"><i class="fa-solid fa-plus"></i> Add Test</button></div>
+    <div id="cbAddPop" class="cb-addpop">
+      <input id="cbTestQ" class="cb-in" type="text" autocomplete="off" placeholder="Search test name...">
+      <div id="cbTestList" class="cb-addlist"></div>
+    </div>
+    <div id="cbTests"></div>
+  </section>
+
+  <aside class="cb-card cb-receipt">
+    <h2>Receipt Preview</h2>
+    <div class="cb-rollwrap"><div class="cb-rollbar"></div><div class="cb-roll" id="cbRoll"></div></div>
+  </aside>
+
+  <section class="cb-card cb-pay">
+    <h2>Cashier Payment Section Card</h2>
+    <div class="cb-total" id="cbTotal">TOTAL AMOUNT: Rs. 0.00</div>
+    <div class="cb-totsub" id="cbTotSub"></div>
+
+    <div class="cb-payrow">
+      <div>
+        <label class="cb-lbl" for="cbDisc">Discount <em>(optional)</em></label>
+        <div class="cb-ig sm"><input id="cbDisc" class="cb-in" type="number" min="0" step="0.01" placeholder="0.00" inputmode="decimal"><button id="cbMode" type="button" class="cb-unit" title="Switch between Rs. and %">Rs.</button></div>
+      </div>
+      <div>
+        <label class="cb-lbl">Already Paid</label>
+        <div class="cb-ig sm"><input id="cbPaidSo" class="cb-in" type="text" value="0.00" readonly tabindex="-1"><span class="cb-unit">Rs.</span></div>
+      </div>
+    </div>
+
+    <div class="cb-payrow">
+      <div style="grid-column:span 1">
+        <label class="cb-lbl" for="cbCash">Cash Received <em>(editable)</em> &nbsp;<a href="#" id="btnFull" style="font-size:12px;font-weight:700;color:var(--primary);text-transform:none">Pay full amount</a></label>
+        <div class="cb-ig"><input id="cbCash" class="cb-in" type="number" min="0" step="0.01" placeholder="0.00" inputmode="decimal"><span class="cb-unit">Rs.</span></div>
+      </div>
+      <div>
+        <label class="cb-lbl" id="cbBalLbl">Balance / Change</label>
+        <div id="cbBal" class="cb-bal zero">Rs. 0.00</div>
+      </div>
+    </div>
+
+    <div class="cb-row2">
+      <div>
+        <label class="cb-lbl" for="cbMethod">Payment Method</label>
+        <select id="cbMethod" class="cb-in">
+          <option value="Cash">&#128181; Cash</option>
+          <option value="Card">&#128179; Card</option>
+          <option value="Bank Transfer">&#127974; Bank Transfer</option>
+        </select>
+      </div>
+      <div>
+        <label class="cb-lbl" for="cbRemarks">Remarks</label>
+        <input id="cbRemarks" class="cb-in" type="text" maxlength="200" placeholder="Payment received">
+      </div>
+    </div>
+    <div id="cbHint" class="cb-hint"></div>
+    <div id="cbHist" class="cb-hist"><h3>Payments on this bill</h3><div id="cbHistBody"></div></div>
+  </section>
+
+  <section class="cb-card cb-actions">
+    <div class="cb-abtns">
+      <button id="btnPrint" type="button" class="cb-btn print"><i class="fa-solid fa-print"></i> PRINT BILL (F12)</button>
+      <button id="btnSave" type="button" class="cb-btn save"><i class="fa-solid fa-floppy-disk"></i> SAVE &amp; PRINT (F10)</button>
+      <button id="btnClear" type="button" class="cb-btn clear"><i class="fa-solid fa-trash"></i> CLEAR (F9)</button>
+    </div>
+    <div class="cb-sec">
+      <button id="btnRefund" type="button" class="cb-sbtn blue" style="display:none"><i class="fa-solid fa-rotate-left"></i> Refund over-payment</button>
+      <button id="btnCancel" type="button" class="cb-sbtn red" style="display:none"><i class="fa-solid fa-ban"></i> Cancel Bill</button>
+    </div>
+  </section>
+
+  <div class="cb-kpis">
+    <a class="cb-kpi" href="/billing?view=register"><span>Today's Bills:</span><b id="kBills">0</b></a>
+    <a class="cb-kpi" href="/billing?view=summary"><span>Today's Income:</span><b id="kIncome">Rs. 0</b></a>
+    <a class="cb-kpi" href="/billing?view=register&status=Pending"><span>Pending Bills:</span><b id="kPending">0</b><small id="kPendingSub"></small></a>
+  </div>
+</div>
+
+<div id="cbModal" class="cb-mbg">
+  <div class="cb-modal">
+    <h3 id="mTitle"></h3><p id="mText"></p>
+    <div id="mAmtBox" style="display:none">
+      <label class="cb-lbl" for="mAmt">Refund amount (Rs.)</label>
+      <input id="mAmt" class="cb-in" type="number" min="0" step="0.01">
+      <label class="cb-lbl" for="mMethod">Refund method</label>
+      <select id="mMethod" class="cb-in"><option>Cash</option><option>Card</option><option>Bank Transfer</option></select>
+    </div>
+    <label class="cb-lbl" for="mReason">Reason <em>(required)</em></label>
+    <textarea id="mReason" class="cb-in" rows="3" maxlength="200" placeholder="Why is this being done?"></textarea>
+    <label class="cb-chk" id="mChkBox"><input type="checkbox" id="mChk" checked><span id="mChkTxt"></span></label>
+    <div id="mErr" style="color:#dc2626;font-weight:700;font-size:13px;margin-top:10px"></div>
+    <div class="cb-mfoot"><button type="button" id="mNo" class="no">Back</button><button type="button" id="mYes" class="yes">Confirm</button></div>
+  </div>
+</div>
+<div id="cbToast" class="cb-toast"></div>
+"""
+
+
+def _render_billing_counter(request: Request, pid: int) -> str:
+    conn, cur = _billing_conn()
+    try:
+        kpi = _billing_kpi(cur)
+    finally:
+        conn.close()
+    init = {"pid": pid or 0, "kpi": kpi, "canCancel": _billing_can_cancel(request)}
+    import json as _json
+    script = (
+        "<script>window.CB_INIT=" + _json.dumps(init).replace("</", "<\\/") + ";"
+        "window.CB_LAB=" + _json.dumps(_BILLING_LAB_NAME) + ";window.CB_LAB_SUB=" + _json.dumps(_BILLING_LAB_SUB) + ";</script>"
+        "<script>" + _BILLING_JS + "</script>"
+    )
+    return _billing_page_shell("Cashier / Billing", "Generate Bills, Receive Payments & Print Receipts",
+                               "counter", _BILLING_COUNTER_HTML + script)
+
+
+def _status_badge(status: str) -> str:
+    return f'<span class="cb-badge {re.sub(r"[^a-z]", "", status.lower())}">{html.escape(status)}</span>'
+
+
+def _valid_day(s):
+    s = (s or "").strip()
+    return s if re.match(r"^\d{4}-\d{2}-\d{2}$", s) else ""
+
+
+def _render_billing_register(request: Request, q: str, status: str, date_from, date_to) -> str:
+    today = now_colombo().date().isoformat()
+    status = status if status in ("Pending", "Partial", "Paid", "Overpaid", "Legacy") else ""
+    if date_from is None and date_to is None and not status and not q:
+        date_from = date_to = today
+    df, dt = _valid_day(date_from), _valid_day(date_to)
+    conn, cur = _billing_conn()
+    try:
+        go_live = _billing_go_live(cur)
+        sql, params = f"SELECT id FROM patients WHERE {_BILL_ACTIVE_SQL}", []
+        if df:
+            sql += " AND substr(created_at, 1, 10) >= ?"; params.append(df)
+        if dt:
+            sql += " AND substr(created_at, 1, 10) <= ?"; params.append(dt)
+        if q:
+            like = f"%{q}%"
+            cond, qp = "(name LIKE ? OR phone LIKE ? OR manual_bill_no LIKE ? OR CAST(id AS TEXT) LIKE ?", [like] * 4
+            m = re.match(r"^(?:MED-?)?0*(\d+)$", q, re.I)
+            if m:
+                cond += " OR id = ?"; qp.append(int(m.group(1)))
+            sql += " AND " + cond + ")"; params += qp
+        if status == "Legacy":
+            sql += (" AND substr(created_at, 1, 10) < ? AND id NOT IN (SELECT patient_id FROM bill_accounts) "
+                    "AND id NOT IN (SELECT patient_id FROM bill_payments)")
+            params.append(go_live)
+        elif not (df or dt or q):
+            sql += (" AND (substr(created_at, 1, 10) >= ? OR id IN (SELECT patient_id FROM bill_accounts) "
+                    "OR id IN (SELECT patient_id FROM bill_payments))")
+            params.append(go_live)
+        sql += " ORDER BY id DESC LIMIT 400"
+        rows = _billing_agg(cur, sql, params, go_live)
+    finally:
+        conn.close()
+    if status:
+        rows = [r for r in rows if r["status"] == status]
+
+    body, tg, td, tn, tp, tb = "", 0.0, 0.0, 0.0, 0.0, 0.0
+    for r in rows:
+        live = r["status"] != "Legacy"
+        if live:
+            tg += r["gross"]; td += r["discount"]; tn += r["net"]; tp += r["paid"]; tb += max(r["due"], 0)
+        bal = f'<span class="cb-neg2">{r["due"]:,.2f}</span>' if (live and r["due"] > 0.005) else (f'{r["due"]:,.2f}' if live else "&ndash;")
+        body += (
+            f'<tr><td><b>{html.escape(r["ref"])}</b>' + (f'<small>Manual: {html.escape(r["manual_bill_no"])}</small>' if r["manual_bill_no"] else "") + "</td>"
+            f'<td>{html.escape(r["created"])}</td>'
+            f'<td><b>{html.escape(r["name"])}</b><small>{html.escape(r["phone"])}</small></td>'
+            f'<td class="r">{r["gross"]:,.2f}</td><td class="r">{r["discount"]:,.2f}</td><td class="r">{r["net"]:,.2f}</td>'
+            f'<td class="r">{r["paid"]:,.2f}</td><td class="r">{bal}</td><td>{_status_badge(r["status"])}</td>'
+            f'<td class="cb-act"><a href="/billing?pid={r["pid"]}">Open</a>'
+            f'<a href="/billing/receipt/{r["pid"]}" target="_blank">Receipt</a></td></tr>')
+    if not body:
+        body = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:26px">No bills match this filter.</td></tr>'
+
+    def chip(label, href, on):
+        return f'<a class="cb-chip{" on" if on else ""}" href="{href}">{label}</a>'
+    chips = "".join([
+        chip("Today", "/billing?view=register", not status and df == today and dt == today and not q),
+        chip("Pending", "/billing?view=register&status=Pending", status == "Pending"),
+        chip("Partial", "/billing?view=register&status=Partial", status == "Partial"),
+        chip("Paid", "/billing?view=register&status=Paid", status == "Paid"),
+        chip("Legacy", "/billing?view=register&status=Legacy", status == "Legacy"),
+        chip("All recent", "/billing?view=register&date_from=&date_to=", not status and not df and not dt and not q),
+    ])
+    sel = lambda v: " selected" if status == v else ""
+    inner = f"""
+    <div class="cb-card">
+      <form class="cb-filter" method="get" action="/billing">
+        <input type="hidden" name="view" value="register">
+        <div><label>Search</label><input class="cb-in" type="text" name="q" value="{html.escape(q)}" placeholder="Name / phone / bill no" style="min-width:220px"></div>
+        <div><label>From</label><input class="cb-in" type="date" name="date_from" value="{html.escape(df)}"></div>
+        <div><label>To</label><input class="cb-in" type="date" name="date_to" value="{html.escape(dt)}"></div>
+        <div><label>Status</label><select class="cb-in" name="status"><option value="">All</option>
+          <option{sel('Pending')}>Pending</option><option{sel('Partial')}>Partial</option><option{sel('Paid')}>Paid</option>
+          <option{sel('Overpaid')}>Overpaid</option><option{sel('Legacy')}>Legacy</option></select></div>
+        <button class="cb-fbtn" type="submit"><i class="fa-solid fa-filter"></i> Filter</button>
+      </form>
+      <div class="cb-chips">{chips}</div>
+      <div class="cb-wrap"><table class="cb-table">
+        <thead><tr><th>Bill No</th><th>Date &amp; Time</th><th>Patient</th><th class="r">Gross</th><th class="r">Discount</th>
+          <th class="r">Net</th><th class="r">Paid</th><th class="r">Balance</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>{body}</tbody>
+        <tfoot><tr><td colspan="3">Totals ({len(rows)} bills)</td><td class="r">{tg:,.2f}</td><td class="r">{td:,.2f}</td>
+          <td class="r">{tn:,.2f}</td><td class="r">{tp:,.2f}</td><td class="r">{tb:,.2f}</td><td colspan="2"></td></tr></tfoot>
+      </table></div>
+      <div class="cb-note">Cancelled bills are not listed (see Cancel Bills). Bills registered before {html.escape(go_live)} have no payment records and show as <b>Legacy</b> (treated as settled, not counted in totals).{' Showing the latest 400 matches.' if len(rows) >= 400 else ''}</div>
+    </div>"""
+    return _billing_page_shell("Bill Register", "Every bill with its payment status - open any bill to take a payment or reprint.", "register", inner)
+
+
+def _render_billing_summary(request: Request, day: str) -> str:
+    today = now_colombo().date().isoformat()
+    day = _valid_day(day) or today
+    conn, cur = _billing_conn()
+    try:
+        go_live = _billing_go_live(cur)
+        bills = _billing_agg(cur, f"SELECT id FROM patients WHERE {_BILL_ACTIVE_SQL} AND substr(created_at, 1, 10) = ?", [day], go_live)
+        cur.execute("SELECT COALESCE(method, ''), kind, COALESCE(SUM(amount), 0), COUNT(*) FROM bill_payments "
+                    "WHERE substr(paid_at, 1, 10) = ? GROUP BY method, kind", (day,))
+        by_method = {}
+        collected = refunded = 0.0
+        for m, kind, amt, n in cur.fetchall():
+            d = by_method.setdefault(m or "Other", {"in": 0.0, "out": 0.0, "n": 0})
+            if kind == "refund":
+                d["out"] += float(amt); refunded += float(amt)
+            else:
+                d["in"] += float(amt); collected += float(amt)
+            d["n"] += int(n)
+        cur.execute("SELECT COALESCE(cashier, 'unknown'), "
+                    "COALESCE(SUM(CASE WHEN kind = 'refund' THEN 0 ELSE amount END), 0), "
+                    "COALESCE(SUM(CASE WHEN kind = 'refund' THEN amount ELSE 0 END), 0), COUNT(*) "
+                    "FROM bill_payments WHERE substr(paid_at, 1, 10) = ? GROUP BY cashier ORDER BY 2 DESC", (day,))
+        by_cashier = cur.fetchall()
+        cur.execute("SELECT bp.id, bp.patient_id, bp.kind, bp.amount, bp.method, bp.cashier, bp.paid_at, bp.remarks, "
+                    "p.title, p.name FROM bill_payments bp LEFT JOIN patients p ON p.id = bp.patient_id "
+                    "WHERE substr(bp.paid_at, 1, 10) = ? ORDER BY bp.id DESC LIMIT 300", (day,))
+        txns = cur.fetchall()
+        pend_n, pend_amt = _billing_pending(cur, go_live)
+    finally:
+        conn.close()
+    gross = sum(b["gross"] for b in bills if b["status"] != "Legacy")
+    disc = sum(b["discount"] for b in bills if b["status"] != "Legacy")
+    net = sum(b["net"] for b in bills if b["status"] != "Legacy")
+    cash_in = by_method.get("Cash", {}).get("in", 0.0) - by_method.get("Cash", {}).get("out", 0.0)
+
+    def card(label, val, cls="", sub=""):
+        return f'<div class="cb-kpi {cls}"><span>{label}</span><b>{val}</b>' + (f'<small>{sub}</small>' if sub else "") + "</div>"
+    cards = "".join([
+        card("Bills Created", str(len(bills))),
+        card("Billed (Net)", f"Rs. {net:,.2f}", "", f"Gross {gross:,.2f} &minus; Discount {disc:,.2f}"),
+        card("Discounts Given", f"Rs. {disc:,.2f}", "a"),
+        card("Collected", f"Rs. {collected:,.2f}", "g"),
+        card("Refunded", f"Rs. {refunded:,.2f}", "r"),
+        card("Net Collection", f"Rs. {collected - refunded:,.2f}", "g"),
+        card("Cash in Drawer", f"Rs. {cash_in:,.2f}", "g", "Cash payments minus cash refunds"),
+        card("Outstanding Dues", f"Rs. {pend_amt:,.2f}", "r", f"{pend_n} unpaid / partly paid bills (all days)"),
+    ])
+    m_rows = "".join(
+        f'<tr><td>{html.escape(m)}</td><td class="r">{v["n"]}</td><td class="r">{v["in"]:,.2f}</td><td class="r">{v["out"]:,.2f}</td><td class="r"><b>{v["in"] - v["out"]:,.2f}</b></td></tr>'
+        for m, v in sorted(by_method.items())) or '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">No payments on this day.</td></tr>'
+    c_rows = "".join(
+        f'<tr><td>{html.escape(str(r[0]))}</td><td class="r">{int(r[3])}</td><td class="r">{float(r[1]):,.2f}</td><td class="r">{float(r[2]):,.2f}</td><td class="r"><b>{float(r[1]) - float(r[2]):,.2f}</b></td></tr>'
+        for r in by_cashier) or '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px">No cashier activity.</td></tr>'
+    t_rows = ""
+    for r in txns:
+        is_ref = r["kind"] == "refund"
+        nm = f'{(r["title"] or "").strip()} {(r["name"] or "").strip()}'.strip() or "-"
+        try:
+            tm = datetime.fromisoformat(str(r["paid_at"])).strftime("%I:%M %p")
+        except Exception:
+            tm = ""
+        t_rows += (f'<tr><td>{html.escape(tm)}</td><td><a href="/billing?pid={r["patient_id"]}"><b>{_bill_ref(r["patient_id"])}</b></a></td>'
+                   f'<td>{html.escape(nm)}</td><td>{html.escape(str(r["method"] or ""))}</td><td>{html.escape(str(r["cashier"] or ""))}</td>'
+                   f'<td>{html.escape(str(r["remarks"] or ""))}</td>'
+                   f'<td class="r {"cb-neg2" if is_ref else "cb-pos"}">{"- " if is_ref else "+ "}{float(r["amount"]):,.2f}</td></tr>')
+    if not t_rows:
+        t_rows = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:22px">No transactions on this day.</td></tr>'
+    nice_day = day
+    try:
+        nice_day = datetime.fromisoformat(day).strftime("%A, %d %B %Y")
+    except Exception:
+        pass
+    inner = f"""
+    <div class="cb-card" style="margin-bottom:18px">
+      <form class="cb-filter" method="get" action="/billing" style="margin:0">
+        <input type="hidden" name="view" value="summary">
+        <div><label>Date</label><input class="cb-in" type="date" name="day" value="{day}"></div>
+        <button class="cb-fbtn" type="submit"><i class="fa-solid fa-calendar-day"></i> Show</button>
+        <a class="cb-chip" href="/billing?view=summary">Today</a>
+        <button class="cb-fbtn cb-noprint" type="button" onclick="window.print()" style="margin-left:auto"><i class="fa-solid fa-print"></i> Print Summary</button>
+      </form>
+      <div style="font-weight:800;font-size:17px;margin-top:12px">{html.escape(nice_day)}</div>
+    </div>
+    <div class="cb-sum">{cards}</div>
+    <div class="cb-two">
+      <div class="cb-card"><h2>By Payment Method</h2><div class="cb-wrap"><table class="cb-table" style="min-width:0">
+        <thead><tr><th>Method</th><th class="r">Txns</th><th class="r">Received</th><th class="r">Refunded</th><th class="r">Net</th></tr></thead><tbody>{m_rows}</tbody></table></div></div>
+      <div class="cb-card"><h2>By Cashier</h2><div class="cb-wrap"><table class="cb-table" style="min-width:0">
+        <thead><tr><th>Cashier</th><th class="r">Txns</th><th class="r">Received</th><th class="r">Refunded</th><th class="r">Net</th></tr></thead><tbody>{c_rows}</tbody></table></div></div>
+    </div>
+    <div class="cb-card"><h2>All Transactions</h2><div class="cb-wrap"><table class="cb-table">
+      <thead><tr><th>Time</th><th>Bill</th><th>Patient</th><th>Method</th><th>Cashier</th><th>Remarks</th><th class="r">Amount (Rs.)</th></tr></thead><tbody>{t_rows}</tbody></table></div></div>"""
+    return _billing_page_shell("Daily Cash Summary", "Collections, refunds, discounts and dues for one day.", "summary", inner)
+
+
+@app.get("/billing", response_class=HTMLResponse)
+def billing_page(request: Request, view: str = "counter", pid: int = 0, q: str = "", status: str = "",
+                 date_from: Optional[str] = None, date_to: Optional[str] = None, day: str = ""):
+    if not user_can(request, "cashier_billing"):
+        return render_locked_page("Cashier Billing")
+    view = (view or "counter").lower()
+    if view == "register":
+        return HTMLResponse(_render_billing_register(request, (q or "").strip(), status, date_from, date_to))
+    if view == "summary":
+        return HTMLResponse(_render_billing_summary(request, day))
+    return HTMLResponse(_render_billing_counter(request, pid))
+
+
+# ---------------------------- RECEIPT ------------------------------
+_RECEIPT_CSS = r"""
+*{box-sizing:border-box;}
+body{margin:0;background:#e5e7eb;font-family:'Inter','Segoe UI',Arial,sans-serif;color:#000;}
+.bar{display:flex;gap:8px;justify-content:center;align-items:center;padding:10px;background:#0d47a1;color:#fff;font-size:13px;flex-wrap:wrap;}
+.bar a,.bar button{background:#fff;color:#0d47a1;border:0;border-radius:6px;padding:6px 12px;font-weight:700;font-size:13px;text-decoration:none;cursor:pointer;font-family:inherit;}
+.bar a.on{background:#ffc83d;}
+.rc{background:#fff;margin:14px auto;padding:14px 14px 18px;font-size:12.5px;line-height:1.45;position:relative;}
+.rc.thermal{width:80mm;} .rc.a5{width:148mm;padding:12mm;font-size:14px;}
+.t{text-align:center;font-size:22px;font-weight:800;line-height:1.1;}
+.s{text-align:center;font-weight:800;font-size:13px;margin-bottom:6px;}
+.bc{display:block;width:100%;height:34px;margin:4px 0 6px;}
+.c{text-align:center;} .b{text-align:center;font-weight:800;font-size:14px;}
+hr{border:0;border-top:1.5px dashed #777;margin:7px 0;}
+.l{display:flex;justify-content:space-between;gap:8px;} .l.bold{font-weight:800;font-size:14px;}
+.l span:first-child{flex:1;}
+.neg{color:#b91c1c;}
+.end{text-align:center;font-weight:800;margin-top:6px;}
+.x{text-align:center;color:#b91c1c;font-weight:800;font-size:18px;border:2.5px solid #b91c1c;padding:3px;margin:6px 0;transform:rotate(-3deg);}
+.paid{text-align:center;font-weight:800;border:2px solid #15803d;color:#15803d;padding:2px;margin:6px 0;}
+.due{text-align:center;font-weight:800;border:2px solid #b45309;color:#b45309;padding:2px;margin:6px 0;}
+@media print{
+  body{background:#fff;} .bar{display:none;} .rc{margin:0 auto;box-shadow:none;}
+  @page{margin:4mm;}
+}
+"""
+
+
+@app.get("/billing/receipt/{pid}", response_class=HTMLResponse)
+def billing_receipt(pid: int, request: Request, payment_id: int = 0, size: str = "thermal", autoprint: int = 0):
+    if not user_can(request, "cashier_billing"):
+        return render_locked_page("Cashier Billing")
+    conn, cur = _billing_conn()
+    try:
+        b = _bill_load(cur, pid)
+    finally:
+        conn.close()
+    if not b:
+        return HTMLResponse("<h3>Bill not found.</h3>", status_code=404)
+    size = "a5" if size == "a5" else "thermal"
+    esc = html.escape
+    pay = next((p for p in b["payments"] if p["id"] == payment_id), None) if payment_id else None
+
+    def L(a, v, cls=""):
+        return f'<div class="l {cls}"><span>{a}</span><span>{v}</span></div>'
+    out = [f'<div class="t">{esc(_BILLING_LAB_NAME)}</div><div class="s">{esc(_BILLING_LAB_SUB)}</div>']
+    if b["barcode"]:
+        out.append(f'<img class="bc" alt="" src="{b["barcode"]}">')
+    out.append(f'<div class="b">Bill: {esc(b["ref"])}</div>')
+    if b["manual_bill_no"]:
+        out.append(f'<div class="c">Manual Bill No: {esc(b["manual_bill_no"])}</div>')
+    out.append(f'<div class="c">{esc(pay["at"] if pay else b["now"])}</div>')
+    if b["cancelled"]:
+        out.append('<div class="x">CANCELLED</div>')
+    out.append(f'<hr><div>Patient: <b>{esc(b["name"])}</b></div>')
+    meta = " / ".join(x for x in (b["age"], b["gender"]) if x)
+    if meta:
+        out.append(f'<div>Age / Sex: {esc(meta)}</div>')
+    if b["doctor"]:
+        out.append(f'<div>Ref. By: {esc(b["doctor"])}</div>')
+    out.append("<hr>")
+    for t in b["tests"]:
+        out.append(L(esc(t["name"]), f'Rs. {t["price"]:,.2f}'))
+    out.append("<hr>")
+    if b["discount"] > 0:
+        out.append(L("Sub Total:", f'Rs. {b["gross"]:,.2f}'))
+        out.append(L("Discount:", f'- Rs. {b["discount"]:,.2f}', "neg"))
+    out.append(L("Total:", f'Rs. {b["net"]:,.2f}', "bold") + "<hr>")
+    if pay and pay["kind"] == "payment":
+        out.append(L(f'Paid ({esc(pay["method"])}):', f'Rs. {pay["amount"]:,.2f}'))
+        if pay["method"] == "Cash" and pay["tendered"] > 0:
+            out.append(L("Cash Received:", f'Rs. {pay["tendered"]:,.2f}'))
+            out.append(L("Change Due:", f'Rs. {pay["change"]:,.2f}'))
+    elif pay and pay["kind"] == "refund":
+        out.append(L(f'Refund ({esc(pay["method"])}):', f'Rs. {pay["amount"]:,.2f}', "neg"))
+    out.append(L("Total Paid:", f'Rs. {b["paid"]:,.2f}'))
+    if b["cancelled"]:
+        pass
+    elif b["due"] > 0.005:
+        out.append(L("Balance Due:", f'Rs. {b["due"]:,.2f}', "bold"))
+        out.append(f'<div class="due">{"PARTIALLY PAID" if b["paid"] > 0.005 else "PAYMENT PENDING"}</div>')
+    elif b["due"] < -0.005:
+        out.append(L("Refundable:", f'Rs. {-b["due"]:,.2f}', "bold"))
+    else:
+        out.append('<div class="paid">FULLY PAID</div>')
+    cashier = pay["cashier"] if pay else _billing_user(request)
+    out.append(f'<hr><div class="c" style="font-size:11px">Cashier: {esc(cashier)}</div>')
+    out.append('<div class="end">Thank You!<br>Visit Again.</div>')
+
+    base = f"/billing/receipt/{pid}?" + (f"payment_id={payment_id}&" if payment_id else "")
+    bar = (f'<div class="bar"><span>Paper:</span>'
+           f'<a class="{"on" if size == "thermal" else ""}" href="{base}size=thermal">80mm Roll</a>'
+           f'<a class="{"on" if size == "a5" else ""}" href="{base}size=a5">A5</a>'
+           f'<button onclick="window.print()">Print</button><button onclick="window.close()">Close</button></div>')
+    auto = "<script>window.addEventListener('load',function(){setTimeout(function(){window.focus();window.print();},350);});</script>" if autoprint else ""
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Receipt {esc(b["ref"])}</title>
+<style>{_RECEIPT_CSS}</style></head><body>{bar}<div class="rc {size}">{"".join(out)}</div>{auto}</body></html>""")
+
 
 # =============================================================
 # 2. SAVE TEST RESULTS ROUTE (Fixed with Comment Support)
