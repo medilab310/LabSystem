@@ -5049,7 +5049,7 @@ def add_patient_page(request: Request, saved_id: int = None):
     success_banner = ""
     if saved_id:
         success_banner = f"""
-        <div style="background: #d4edda; color: #155724; padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; border: 1px solid #c3e6cb; font-weight: bold; font-size: 15px; text-align: center;">
+        <div class="ok-banner">
             ✓ Patient Saved Successfully! Reference No: #{saved_id}
             {('<a href="/billing?pid=' + str(saved_id) + '" style="display:inline-block;margin-left:12px;padding:4px 12px;border-radius:5px;background:#155724;color:#fff;text-decoration:none;font-size:13px;">Go to Billing &rarr;</a>') if user_can(request, "cashier_billing") else ""}
         </div>
@@ -5105,52 +5105,160 @@ def add_patient_page(request: Request, saved_id: int = None):
     <head>
         <title>Lab System - New Patient</title>
         <style>
-            body {{ font-family: Arial, sans-serif; background: #f4f7fb; padding: 15px; }}
-            .form-card {{ 
-                background: white; 
-                padding: 20px 25px; 
-                border-radius: 10px; 
-                width: 520px; 
-                min-width: 380px; 
-                min-height: 520px;
-                max-width: 95vw; 
-                margin: auto; 
-                box-shadow: 0 4px 15px rgba(0,0,0,0.1); 
-                resize: both; 
-                overflow: auto; 
-                border: 2px solid #cbd5e1;
-            }}
-            .form-card h2 {{ color: #0f4c81; margin-top: 0; margin-bottom: 12px; font-size: 20px; display: flex; justify-content: space-between; align-items: center; }}
-            .ref-badge {{ background: #e2e8f0; color: #1e293b; padding: 5px 10px; border-radius: 6px; font-size: 15px; font-weight: bold; }}
-            .form-group {{ margin-bottom: 12px; }}
-            .form-group label {{ display: block; margin-bottom: 4px; color: #333; font-weight: bold; font-size: 13px; }}
-            .form-group input, .form-group select {{ width: 100%; padding: 9px; border: 1px solid #cbd5e1; border-radius: 5px; box-sizing: border-box; font-size: 14px; }}
-            .row-group {{ display: flex; gap: 10px; }}
-            .col-title {{ flex: 1; }}
-            .col-name {{ flex: 3; }}
-            .age-row {{ display: flex; gap: 8px; }}
-            .age-row input {{ flex: 1; }}
-            .btn-save {{ background: #27ae60; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 10px; }}
-            .back-link {{ display: inline-block; margin-bottom: 10px; color: #0f4c81; text-decoration: none; font-weight: bold; font-size: 13px; }}
-            .test-search {{ margin-bottom: 6px; padding: 7px; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 4px; width: 100%; box-sizing: border-box; }}
-            .test-box {{ border: 1px solid #cbd5e1; padding: 10px; max-height: 220px; overflow-y: auto; border-radius: 5px; background: #fafafa; }}
-            .sel-box {{ margin-top: 8px; border: 1px solid #bfdbfe; background: #eff6ff; border-radius: 6px; padding: 8px 10px; }}
-            .sel-head {{ display: flex; justify-content: space-between; font-size: 13px; font-weight: bold; color: #0f4c81; margin-bottom: 4px; }}
-            .sel-item {{ display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; border-top: 1px dashed #bfdbfe; }}
-            .sel-item .nm {{ flex: 1; }}
-            .sel-item button {{ border: none; background: #fee2e2; color: #b91c1c; border-radius: 4px; cursor: pointer; font-weight: bold; padding: 0 7px; }}
-            .grp-head {{ font-size: 12px; font-weight: bold; color: #0f4c81; text-transform: uppercase; letter-spacing: .4px; margin: 6px 0; padding-bottom: 3px; border-bottom: 1px solid #e2e8f0; }}
-            .pkg-item {{ background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 5px 8px; }}
-            .sel-pkg {{ margin: 4px 0 2px; border: 1px solid #fcd34d; background: #fffbeb; border-radius: 6px; padding: 5px 8px; }}
-            .sel-pkg .ph {{ display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: bold; color: #92400e; }}
-            .sel-pkg .ph .nm {{ flex: 1; }}
-            .sel-pkg .ph button {{ border: none; background: #fee2e2; color: #b91c1c; border-radius: 4px; cursor: pointer; font-weight: bold; padding: 0 7px; }}
-            .sel-pkg .pt {{ font-size: 12.5px; color: #475569; padding: 2px 0 2px 22px; border-top: 1px dashed #fde68a; }}
-            .sel-pkg .pt em {{ color: #94a3b8; font-size: 11px; }}
-            .sel-sub {{ font-size: 11px; font-weight: bold; color: #64748b; text-transform: uppercase; margin: 6px 0 2px; }}
+
+body {{ font-family: 'Inter','Segoe UI',Arial,sans-serif; font-size: 14px; padding: 2px 0 18px; color: var(--text,#1e293b); }}
+.form-card {{
+    background: var(--card,#fff); color: var(--text,#1e293b);
+    padding: 18px 22px 20px; border-radius: 14px;
+    width: 640px; min-width: 0; min-height: 0; max-width: 100%; margin: 0 auto;
+    box-shadow: var(--shadow,0 8px 28px rgba(15,76,129,.13));
+    border: 1px solid var(--border,#dbe4ef);
+    position: relative; overflow: visible; resize: none;
+}}
+.form-card::before {{
+    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 5px;
+    border-radius: 16px 16px 0 0;
+    background: linear-gradient(90deg, var(--primary,#0f4c81), #22b8cf);
+}}
+.form-card h2 {{
+    color: var(--text,#0f2744); margin: 0 0 14px; padding-bottom: 10px;
+    border-bottom: 1px solid var(--border,#e2e8f0);
+    font-size: 20px; font-weight: 800; letter-spacing: -.2px;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
+}}
+.ref-badge {{
+    background: var(--primary-soft,#e8f1fb); color: var(--primary,#0f4c81);
+    border: 1px solid var(--border,#cbd5e1); padding: 4px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 800; letter-spacing: .2px;
+}}
+.back-link {{ display: inline-block; margin-bottom: 12px; color: var(--primary,#0f4c81); text-decoration: none; font-weight: 700; font-size: 13.5px; }}
+.back-link:hover {{ text-decoration: underline; }}
+.form-group {{ margin-bottom: 11px; }}
+.form-group label {{
+    display: block; margin-bottom: 4px; color: var(--text,#334155);
+    font-weight: 800; font-size: 11.5px; text-transform: uppercase; letter-spacing: .35px;
+}}
+.form-group input, .form-group select {{
+    width: 100%; padding: 8px 11px; border: 1px solid var(--border,#cbd5e1); border-radius: 9px;
+    box-sizing: border-box; font-size: 14px; height: 40px; font-family: inherit;
+    background: var(--card,#fff); color: var(--text,#1e293b); outline: none; transition: border-color .15s, box-shadow .15s;
+}}
+.form-group input::placeholder {{ color: var(--muted,#94a3b8); }}
+.form-group input:focus, .form-group select:focus, .test-search:focus {{
+    border-color: var(--primary,#0f4c81); box-shadow: 0 0 0 3px var(--primary-soft,rgba(15,76,129,.15));
+}}
+.row-group {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+.row-group > div {{ min-width: 150px; }}
+.col-title {{ flex: 1; min-width: 90px !important; }}
+.col-name {{ flex: 3; }}
+.age-row {{ display: flex; gap: 8px; }}
+.age-row input {{ flex: 1; }}
+.btn-save {{
+    background: linear-gradient(135deg,#16a34a,#22c55e); color: #fff; border: 0; padding: 12px; width: 100%;
+    border-radius: 11px; font-size: 16px; font-weight: 800; letter-spacing: .3px; cursor: pointer; margin-top: 4px;
+    box-shadow: 0 5px 14px rgba(22,163,74,.32); font-family: inherit; transition: transform .12s, filter .12s;
+}}
+.btn-save:hover {{ transform: translateY(-1px); filter: brightness(1.06); }}
+.test-search {{
+    margin-bottom: 6px; padding: 8px 11px; font-size: 14px; height: 38px; border: 1px solid var(--border,#cbd5e1);
+    border-radius: 9px; width: 100%; box-sizing: border-box; outline: none; font-family: inherit;
+    background: var(--card,#fff); color: var(--text,#1e293b);
+}}
+.test-box {{
+    border: 1px solid var(--border,#cbd5e1); padding: 6px 8px; max-height: 190px; overflow-y: auto;
+    border-radius: 12px; background: var(--bg,#f8fafc);
+}}
+.test-item {{ padding: 5px 8px !important; border-radius: 7px; margin-bottom: 2px !important; font-size: 13.5px !important; transition: background .12s; }}
+.test-item:hover {{ background: var(--primary-soft,#eaf2fb); }}
+.grp-head {{
+    font-size: 12px; font-weight: 800; color: var(--primary,#0f4c81); text-transform: uppercase;
+    letter-spacing: .5px; margin: 6px 2px 4px; padding-bottom: 3px; border-bottom: 1px solid var(--border,#e2e8f0);
+}}
+.pkg-item {{ background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; color: #78350f; }}
+[data-theme="dark"] .pkg-item {{ background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.35); color: #fde68a; }}
+.sel-box {{ margin-top: 8px; border: 1px solid var(--border,#bfdbfe); background: var(--primary-soft,#eff6ff); border-radius: 10px; padding: 7px 11px; max-height: 150px; overflow-y: auto; }}
+.sel-head {{ display: flex; justify-content: space-between; font-size: 13px; font-weight: 800; color: var(--primary,#0f4c81); margin-bottom: 4px; align-items: center; }}
+.sel-head .clr {{ border: 0; background: transparent; color: #dc2626; font-weight: 700; font-size: 12px; cursor: pointer; text-decoration: underline; padding: 0; }}
+.sel-item {{ display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; border-top: 1px dashed var(--border,#bfdbfe); }}
+.sel-item .nm {{ flex: 1; }}
+.sel-item button, .sel-pkg .ph button {{ border: 0; background: #fee2e2; color: #b91c1c; border-radius: 6px; cursor: pointer; font-weight: 800; padding: 1px 9px; font-size: 15px; }}
+.sel-item button:hover, .sel-pkg .ph button:hover {{ background: #fecaca; }}
+.sel-pkg {{ margin: 6px 0 3px; border: 1px solid #fcd34d; background: #fffbeb; border-radius: 10px; padding: 7px 11px; color: #78350f; }}
+[data-theme="dark"] .sel-pkg {{ background: rgba(245,158,11,.12); border-color: rgba(245,158,11,.35); color: #fde68a; }}
+.sel-pkg .ph {{ display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 800; }}
+.sel-pkg .ph .nm {{ flex: 1; }}
+.sel-pkg .pt {{ font-size: 12.5px; color: var(--muted,#475569); padding: 3px 0 3px 22px; border-top: 1px dashed #fde68a; }}
+.sel-pkg .pt em {{ color: var(--muted,#94a3b8); font-size: 11px; }}
+.sel-sub {{ font-size: 11px; font-weight: 800; color: var(--muted,#64748b); text-transform: uppercase; margin: 8px 0 3px; letter-spacing: .4px; }}
+/* ---- standard look: soft medical pattern + side panels (wide screens) ---- */
+.reg-wrap {{
+    position: relative; display: grid; align-items: start; gap: 20px;
+    grid-template-columns: minmax(0,1fr) minmax(0,640px) minmax(0,1fr);
+    padding: 16px 12px; border-radius: 18px;
+    background: linear-gradient(135deg, var(--primary-soft,#eaf2fb), transparent 65%);
+}}
+.reg-wrap::before {{
+    content: ""; position: absolute; inset: 0; border-radius: 18px; pointer-events: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 96 96'><g fill='none' stroke='%230f4c81' stroke-opacity='.075' stroke-width='2' stroke-linecap='round'><path d='M48 32v20M38 42h20'/><circle cx='13' cy='15' r='5'/><path d='M74 70l7 7M81 70l-7 7'/><path d='M10 76q6-8 12 0t12 0'/><circle cx='80' cy='18' r='2'/></g></svg>");
+}}
+[data-theme="dark"] .reg-wrap::before {{
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 96 96'><g fill='none' stroke='%237dd3fc' stroke-opacity='.09' stroke-width='2' stroke-linecap='round'><path d='M48 32v20M38 42h20'/><circle cx='13' cy='15' r='5'/><path d='M74 70l7 7M81 70l-7 7'/><path d='M10 76q6-8 12 0t12 0'/><circle cx='80' cy='18' r='2'/></g></svg>");
+}}
+.reg-wrap > * {{ position: relative; z-index: 1; }}
+.reg-wrap .form-card {{ width: 100%; margin: 0; }}
+.reg-side {{
+    background: var(--card,#fff); border: 1px solid var(--border,#dbe4ef); border-radius: 14px;
+    padding: 14px 16px; box-shadow: var(--shadow,0 6px 20px rgba(15,76,129,.1)); color: var(--text,#1e293b);
+    font-size: 13px; max-width: 300px; width: 100%;
+}}
+.reg-left {{ justify-self: end; }}
+.reg-right {{ justify-self: start; }}
+.rs-brand {{ font-size: 19px; font-weight: 800; line-height: 1.15; color: var(--primary,#0f4c81); }}
+.rs-brand small {{ display: block; font-size: 11.5px; letter-spacing: 1.4px; color: var(--muted,#64748b); margin-top: 3px; }}
+.rs-stat {{ display: flex; align-items: baseline; gap: 10px; padding: 9px 0; border-top: 1px solid var(--border,#e2e8f0); margin-top: 10px; }}
+.rs-stat b {{ font-size: 26px; font-weight: 800; color: var(--text,#0f2744); }}
+.rs-stat span {{ color: var(--muted,#64748b); font-weight: 600; }}
+.rs-tip {{ border-top: 1px solid var(--border,#e2e8f0); padding-top: 10px; }}
+.rs-tip ul {{ margin: 6px 0 0; padding-left: 18px; color: var(--muted,#64748b); line-height: 1.55; }}
+.rs-h {{ font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .4px; color: var(--primary,#0f4c81); margin-bottom: 8px; display: flex; justify-content: space-between; }}
+#rsList {{ max-height: 460px; overflow-y: auto; }}
+.rs-row {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--border,#e2e8f0); }}
+.rs-row b {{ display: block; font-size: 13.5px; }}
+.rs-row small {{ color: var(--muted,#64748b); font-size: 11.5px; }}
+.rs-row a {{ color: var(--primary,#0f4c81); font-weight: 700; font-size: 12px; text-decoration: none; white-space: nowrap; }}
+.rs-row a:hover {{ text-decoration: underline; }}
+.rs-empty {{ color: var(--muted,#64748b); font-style: normal; }}
+@media (max-width: 1400px) {{
+    .reg-wrap {{ grid-template-columns: minmax(0,640px); justify-content: center; }}
+    .reg-side {{ display: none; }}
+}}
+@media (max-width: 600px) {{
+    .reg-wrap {{ padding: 0; background: none; display: block; }}
+    .reg-wrap::before {{ display: none; }}
+}}
+.ok-banner {{
+    background: #dcfce7; color: #166534; padding: 9px 12px; border-radius: 10px; margin-bottom: 12px;
+    border: 1px solid #bbf7d0; font-weight: 700; font-size: 14px; text-align: center;
+}}
+[data-theme="dark"] .ok-banner {{ background: rgba(34,197,94,.16); color: #bbf7d0; border-color: rgba(34,197,94,.4); }}
+@media (max-width: 600px) {{
+    .form-card {{ padding: 14px 12px 16px; border-radius: 12px; width: 100%; }}
+    .form-card h2 {{ font-size: 18px; }}
+    .row-group > div {{ flex: 1 1 100% !important; }}
+    .col-title {{ flex: 0 0 100% !important; }}
+    .form-group input, .form-group select, .test-search {{ font-size: 16px; height: 44px; }}  /* 16px stops iOS zoom-in */
+    .age-row {{ flex-wrap: nowrap; }}
+    .test-box {{ max-height: 170px; }}
+    .btn-save {{
+        position: sticky; bottom: 8px; z-index: 20; height: 50px;
+        box-shadow: 0 8px 22px rgba(0,0,0,.28);
+    }}
+}}
         </style>
     </head>
     <body>
+        <div class="reg-wrap">
+        <aside class="reg-side reg-left"><div class="rs-brand">MEDISTAR<small>MEDICAL LABORATORY</small></div><div class="rs-stat"><b id="rsCount">0</b><span>Registered today</span></div><div class="rs-stat"><b>#{next_id}</b><span>Next Ref No</span></div><div class="rs-tip"><b>Quick tips</b><ul><li>Type the phone number first - returning patients auto-fill.</li><li>Tick a package to add all its tests.</li><li>After saving, use Go to Billing to take the payment.</li></ul></div></aside>
         <div class="form-card">
             <a href="/dashboard" class="back-link">&larr; Back to Dashboard</a>
             <h2>
@@ -5231,13 +5339,15 @@ def add_patient_page(request: Request, saved_id: int = None):
                         {test_checkboxes}
                     </div>
                     <div class="sel-box">
-                        <div class="sel-head"><span>Selected Tests: <span id="selCount">0</span></span></div>
+                        <div class="sel-head"><span>Selected Tests: <span id="selCount">0</span></span><button type="button" class="clr" id="clearSel">Clear all</button></div>
                         <div id="selList"><em style="font-size:12px; color:#64748b;">No tests selected yet</em></div>
                     </div>
                 </div>
 
                 <button type="submit" class="btn-save">Save & Register Patient</button>
             </form>
+        </div>
+        <aside class="reg-side reg-right"><div class="rs-h"><span>Today's Registrations</span><span id="rsN"></span></div><div id="rsList"><em class="rs-empty">Loading...</em></div></aside>
         </div>
 
         <script>
@@ -5392,12 +5502,36 @@ def add_patient_page(request: Request, saved_id: int = None):
                 document.getElementById("selCount").textContent = unique.size;
             }}
             document.getElementById("testContainer").addEventListener("change", updateSelected);
+            document.getElementById("clearSel").onclick = () => {{ document.querySelectorAll('#testContainer input:checked').forEach(c => c.checked = false); updateSelected(); }};
 
             function confirmNoTests() {{
                 const n = document.querySelectorAll('#testContainer input[name="test_ids"]:checked, #testContainer input[name="package_ids"]:checked').length;
                 if (n === 0) return confirm("No tests are selected. Save this patient without any tests?");
                 return true;
             }}
+
+            
+(async function loadToday() {{
+    try {{
+        const r = await fetch('/api/registrations/today');
+        const d = await r.json();
+        if (!d.ok) return;
+        const cnt = document.getElementById('rsCount'); if (cnt) cnt.textContent = d.total;
+        const n = document.getElementById('rsN'); if (n) n.textContent = d.total;
+        const list = document.getElementById('rsList'); if (!list) return;
+        list.innerHTML = '';
+        if (!d.items.length) {{ list.innerHTML = '<em class="rs-empty">No patients registered yet today.</em>'; return; }}
+        d.items.forEach(p => {{
+            const row = document.createElement('div'); row.className = 'rs-row';
+            const left = document.createElement('div');
+            const b = document.createElement('b'); b.textContent = p.name;
+            const sm = document.createElement('small'); sm.textContent = p.ref + ' \u00b7 ' + p.time + ' \u00b7 ' + p.tests + ' test(s)';
+            left.appendChild(b); left.appendChild(sm); row.appendChild(left);
+            if (d.can_bill) {{ const a = document.createElement('a'); a.href = '/billing?pid=' + p.id; a.textContent = 'Billing \u2192'; row.appendChild(a); }}
+            list.appendChild(row);
+        }});
+    }} catch (e) {{}}
+}})();
 
             window.onload = function() {{ autoSelectGender(); updateSelected(); }};
         </script>
@@ -9384,6 +9518,7 @@ def cancel_invoice(invoice_id: int, request: Request):
 _BILLING_READY = False
 _BILLING_METHODS = ("Cash", "Card", "Bank Transfer")
 _BILLING_LAB_NAME = "MEDISTAR"
+_BILLING_PREFIX = "MED"   # bill number prefix, e.g. MED-0012 (lab 2 uses PRI)
 _BILLING_LAB_SUB = "MEDICAL LABORATORY"
 
 
@@ -9448,6 +9583,20 @@ def _billing_go_live(cur) -> str:
     return now_colombo().date().isoformat()
 
 
+def _billing_wa_digits(raw) -> str:
+    """Sri Lankan style number -> international digits for wa.me ('' if unusable)."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("94") and len(digits) == 11:
+        return digits
+    if digits.startswith("0") and len(digits) == 10:
+        return "94" + digits[1:]
+    if len(digits) == 9:
+        return "94" + digits
+    return digits if len(digits) >= 10 else ""
+
+
 def _money(x) -> float:
     try:
         return round(float(x or 0), 2)
@@ -9456,7 +9605,7 @@ def _money(x) -> float:
 
 
 def _bill_ref(pid) -> str:
-    return f"MED-{int(pid):04d}"
+    return f"{_BILLING_PREFIX}-{int(pid):04d}"
 
 
 def _fmt_dt(s) -> str:
@@ -9625,7 +9774,7 @@ def _bill_load(cur, pid):
         "cancel_reason": str(acc["cancel_reason"] or "") if acc else "",
         "tests": tests,
         "payments": payments,
-        "wa_phone": _wa_phone_digits(p["phone"]),
+        "wa_phone": _billing_wa_digits(p["phone"]),
         "barcode": _code128b_data_uri(ref) or "",
         "now": now_colombo().strftime("%A, %b %d, %Y - %I:%M %p"),
     })
@@ -9661,7 +9810,7 @@ def api_billing_patients(request: Request, q: str = ""):
             like = f"%{q}%"
             cond = "(name LIKE ? OR phone LIKE ? OR manual_bill_no LIKE ? OR CAST(id AS TEXT) LIKE ?"
             params += [like, like, like, like]
-            m = re.match(r"^(?:MED-?)?0*(\d+)$", q, re.I)
+            m = re.match(r"^(?:" + re.escape(_BILLING_PREFIX) + r"-?)?0*(\d+)$", q, re.I)
             if m:
                 cond += " OR id = ?"
                 params.append(int(m.group(1)))
@@ -10240,9 +10389,9 @@ _BILLING_JS = r"""
 
   function renderReceipt() {
     var b = S.bill, c = calc(), el = $('cbRoll');
-    if (!b) { el.innerHTML = '<div class="r-t">' + esc(window.CB_LAB || 'MEDISTAR') + '</div><div class="r-s">' + esc(window.CB_LAB_SUB || '') + '</div><div class="r-c" style="color:#6b7280;padding:30px 0">Receipt preview appears here once a patient is selected.</div>'; return; }
+    if (!b) { el.innerHTML = '<div class="r-t">' + esc(window.CB_LAB || '') + '</div><div class="r-s">' + esc(window.CB_LAB_SUB || '') + '</div><div class="r-c" style="color:#6b7280;padding:30px 0">Receipt preview appears here once a patient is selected.</div>'; return; }
     var L = function (a, v, cls) { return '<div class="r-l ' + (cls || '') + '"><span>' + a + '</span><span>' + v + '</span></div>'; };
-    var h = '<div class="r-t">' + esc(window.CB_LAB || 'MEDISTAR') + '</div><div class="r-s">' + esc(window.CB_LAB_SUB || '') + '</div>';
+    var h = '<div class="r-t">' + esc(window.CB_LAB || '') + '</div><div class="r-s">' + esc(window.CB_LAB_SUB || '') + '</div>';
     if (b.barcode) h += '<img class="r-bar" alt="" src="' + b.barcode + '">';
     h += '<div class="r-b">Bill: ' + esc(b.ref) + '</div><div class="r-c">' + esc(b.now) + '</div>';
     if (b.cancelled) h += '<div class="r-x">CANCELLED</div>';
@@ -10660,7 +10809,7 @@ def _render_billing_register(request: Request, q: str, status: str, date_from, d
         if q:
             like = f"%{q}%"
             cond, qp = "(name LIKE ? OR phone LIKE ? OR manual_bill_no LIKE ? OR CAST(id AS TEXT) LIKE ?", [like] * 4
-            m = re.match(r"^(?:MED-?)?0*(\d+)$", q, re.I)
+            m = re.match(r"^(?:" + re.escape(_BILLING_PREFIX) + r"-?)?0*(\d+)$", q, re.I)
             if m:
                 cond += " OR id = ?"; qp.append(int(m.group(1)))
             sql += " AND " + cond + ")"; params += qp
@@ -10841,9 +10990,39 @@ def billing_page(request: Request, view: str = "counter", pid: int = 0, q: str =
     return HTMLResponse(_render_billing_counter(request, pid))
 
 
+# ------------------- TODAY'S REGISTRATIONS (registration side panel) -----
+@app.get("/api/registrations/today")
+def api_registrations_today(request: Request):
+    current_user = get_current_user(request)
+    if not user_has_access(current_user, "add_patient"):
+        return JSONResponse({"ok": False}, status_code=403)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        today = now_colombo().date().isoformat()
+        cur.execute(f"SELECT COUNT(*) FROM patients WHERE {_BILL_ACTIVE_SQL} AND substr(created_at, 1, 10) = ?", (today,))
+        total = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            f"SELECT p.id, p.title, p.name, p.created_at, "
+            f"(SELECT COUNT(*) FROM patient_assigned_tests a WHERE a.patient_id = p.id) AS n "
+            f"FROM patients p WHERE {_BILL_ACTIVE_SQL.replace('is_cancelled', 'p.is_cancelled')} "
+            f"AND substr(p.created_at, 1, 10) = ? ORDER BY p.id DESC LIMIT 30", (today,))
+        items = []
+        for r in cur.fetchall():
+            try:
+                tm = datetime.fromisoformat(str(r["created_at"])).strftime("%I:%M %p")
+            except Exception:
+                tm = ""
+            items.append({"id": r["id"], "ref": _bill_ref(r["id"]), "time": tm, "tests": int(r["n"] or 0),
+                          "name": f"{(r['title'] or '').strip()} {(r['name'] or '').strip()}".strip()})
+        return {"ok": True, "total": total, "items": items, "can_bill": user_can(request, "cashier_billing")}
+    finally:
+        conn.close()
+
+
 # ---------------------------- WHATSAPP BILL ------------------------
 def _bill_whatsapp_text(b: dict) -> str:
-    greet = _wa_greeting("", b["name"])
+    greet = f"Dear {b['name']}," if b["name"] else "Dear Sir/Madam,"
     lines = [greet, "", f"Thank you for choosing {_BILLING_LAB_NAME.title()} {_BILLING_LAB_SUB.title()}.",
              f"Your bill - {b['ref']} ({b['now']})", ""]
     for t in b["tests"]:
