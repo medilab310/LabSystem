@@ -1165,8 +1165,6 @@ def _shell_user_from_request(request: Request):
         return None
 
 
-_SHELL_BRAND = "MEDISTAR MEDICAL LABORATORY"
-
 _SHELL_NAV = [
     ("Main", [
         ("dashboard", "Dashboard", "fa-house", "/dashboard", None, None),
@@ -1345,16 +1343,14 @@ html body.ms{overflow-x:hidden;}
 .ms-collapse{display:flex;align-items:center;gap:14px;background:transparent;border:1px dashed var(--border);color:var(--muted);border-radius:10px;padding:7px 16px;margin:0 0 10px;font-size:12.5px;font-weight:700;cursor:pointer;font-family:inherit;width:100%;}
 .ms-collapse i{width:24px;text-align:center;transition:transform .2s;}
 .ms-collapse:hover{background:var(--primary-soft);color:var(--primary);}
-.ms-banner{display:flex;align-items:center;gap:14px;background:var(--header-bg);color:#fff;border-radius:22px;padding:16px 30px;margin:0 0 18px;box-shadow:0 6px 18px rgba(13,71,161,.18);}
-.ms-banner i{font-size:22px;color:#fff;}
-.ms-banner-t{font-size:24px;font-weight:800;letter-spacing:.4px;line-height:1.2;color:#fff;}
-.ms-banner-line{flex:1 1 40px;height:2px;min-width:40px;background:rgba(255,255,255,.35);border-radius:2px;margin-left:8px;}
-@media (max-width:700px){.ms-banner{padding:12px 16px;border-radius:16px;gap:10px;}.ms-banner-t{font-size:16px;}.ms-banner-line{display:none;}}
 .ms-crumb{display:flex;align-items:center;gap:10px;font-size:13.5px;font-weight:600;color:var(--muted);margin:0 0 14px;flex-wrap:wrap;}
 .ms-crumb a{color:var(--primary);font-weight:700;}
 .ms-crumb .sep{font-size:10px;opacity:.7;}
 .ms-crumb span{color:var(--text);font-weight:800;display:inline-flex;align-items:center;gap:8px;}
 .ms-crumb span i{color:var(--primary);}
+.ms-page-heading{display:flex;align-items:center;gap:13px;min-height:56px;padding:0 28px;margin:0 0 18px;background:linear-gradient(90deg,#16469a 0%,#0d47a1 100%);color:#fff;border-radius:15px;box-shadow:0 3px 8px rgba(13,71,161,.16);font-size:21px;font-weight:800;letter-spacing:.2px;white-space:nowrap;overflow:hidden;}
+.ms-page-heading>i{font-size:22px;flex:0 0 auto;}
+.ms-page-heading-line{height:3px;flex:1 1 auto;min-width:24px;margin-left:16px;background:rgba(255,255,255,.18);border-radius:4px;}
 .ms-page{color:#1e293b;overflow-x:auto;border-radius:16px;}
 [data-theme="dark"] .ms-page{background:#f4f7fb;padding:16px;border:1px solid var(--border);}
 html body.ms .ms-page > .header{border-radius:12px;margin-bottom:16px;}
@@ -1374,7 +1370,7 @@ html body.ms .ms-page > .header{border-radius:12px;margin-bottom:16px;}
 @media (max-width:1200px){.ms-brand p{display:none;}}
 @media (max-height:900px){.ms-side-foot{display:none;}}
 @media print{
- .ms-header,.ms-sidebar,.ms-scrim,.ms-crumb,.ms-banner{display:none !important;}
+ .ms-header,.ms-sidebar,.ms-scrim,.ms-crumb{display:none !important;}
  .ms-layout{display:block !important;}
  html body.ms .ms-main{padding:0 !important;}
  .ms-page{background:#fff !important;padding:0 !important;border:0 !important;overflow:visible !important;}
@@ -1635,11 +1631,16 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     active = _shell_active_key(path, query)
     nav_item = _shell_nav_item(active)
     icon = nav_item[2] if nav_item else "fa-file-lines"
-    banner_title = html.escape((nav_item[1] if nav_item else page_title) or "Page").upper()
-    crumb = (
-        f'<div class="ms-banner"><i class="fa-solid {icon}"></i>'
-        f'<span class="ms-banner-t">{_SHELL_BRAND} - {banner_title}</span>'
-        '<span class="ms-banner-line"></span></div>'
+    # Use the canonical menu label so every page heading is consistent,
+    # even when an older route has a different internal HTML <title>.
+    heading_label = nav_item[1] if nav_item else (page_title or "Page")
+    heading_label = html.escape(str(heading_label).strip())
+    page_heading = (
+        '<div class="ms-page-heading">'
+        f'<i class="fa-solid {icon}"></i>'
+        f'<span>MEDISTAR MEDICAL LABORATORY - {heading_label.upper()}</span>'
+        '<span class="ms-page-heading-line"></span>'
+        '</div>'
     )
 
     fa_link = ""
@@ -1655,7 +1656,7 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
         + '</head><body class="ms ms-wrapped">'
         + _shell_header_html(user)
         + '<div class="ms-layout">' + _shell_sidebar_html(user, active)
-        + '<main class="ms-main">' + crumb + '<div class="ms-page">' + body_inner + '</div></main></div>'
+        + '<main class="ms-main">' + page_heading + '<div class="ms-page">' + body_inner + '</div></main></div>'
         + "<script>" + _SHELL_CORE_JS + "</script><script>" + _SHELL_EXTRA_JS + "</script>"
         + "</body></html>"
     )
@@ -8731,7 +8732,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 # 1. PATIENT RESULTS & EDIT PAGE (Split Screen UI with Formatting Toolbar)
 # -------------------------------------------------------------
 @app.get("/patient-results/{patient_id}", response_class=HTMLResponse)
-def patient_results(request: Request, patient_id: int, updated: Optional[str] = Query(None)):
+def patient_results(request: Request, patient_id: int, updated: Optional[str] = Query(None), test_id: Optional[int] = Query(None)):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -8844,21 +8845,27 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         if t_row["result"] and str(t_row["result"]).strip():
             completed_count += 1
 
-    # 3. Build Categories, Parameters & Comment Boxes HTML with Formatting Toolbar
+    # 3. Build category headings, explicit test tabs and their result panels.
+    # The selected test is not advanced automatically; the operator changes
+    # it only by clicking another test tab. The selected ID is also preserved
+    # through Save using the ?test_id=... query string.
     categories_html = ""
-    _tab_groups = []
     if tests:
         for category, cat_tests in tests_by_category.items():
+            category_tab_buttons = "".join(
+                f'<button type="button" class="result-test-tab" data-test-tab="{int(item["test_id"])}" onclick="selectResultTest({int(item["test_id"])})">'
+                f'<i class="fa-solid fa-circle"></i> {html.escape(str(item["test_name"] or "Test"))}</button>'
+                for item in cat_tests
+            )
             categories_html += f"""
-            <div style="margin-bottom: 25px;">
-                <h4 style="background: #e2e8f0; color: #0d47a1; padding: 10px 14px; border-radius: 8px; font-size: 14px; margin-bottom: 15px; font-weight: 700; border-left: 4px solid #0d47a1;">
-                    <i class="fa-solid fa-layer-group"></i> {category}
+            <div class="result-category-group" style="margin-bottom: 18px;">
+                <h4 class="result-category-heading">
+                    <i class="fa-solid fa-layer-group"></i> {html.escape(str(category or "General Tests"))}
                 </h4>
+                <div class="result-test-tabs">{category_tab_buttons}</div>
             """
             
-            _tab_panes = []
             for t in cat_tests:
-                _pane_start = len(categories_html)
                 t_id = t["test_id"]
                 t_name = t["test_name"]
                 assigned_id = t["assigned_id"]
@@ -9011,7 +9018,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                         </div>"""
 
                 categories_html += f"""
-                <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.03);">
+                <section class="result-test-panel" data-test-panel="{int(t_id)}" style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.03);">
                     <form action="/save-test-results" method="post" style="margin: 0;">
                         <input type="hidden" name="patient_id" value="{p_id}">
                         <input type="hidden" name="test_id" value="{t_id}">
@@ -9111,23 +9118,8 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 </div>
                 </form>
                 {reset_button_html}
-                </div>
+                </section>
                 """
-                _tab_panes.append((t_id, t_name, categories_html[_pane_start:]))
-                categories_html = categories_html[:_pane_start]
-
-            _g = len(_tab_groups)
-            _tab_groups.append(_g)
-            categories_html += '<div class="test-tabs" data-group="%d">' % _g
-            for _tid, _tname, _ in _tab_panes:
-                categories_html += (
-                    '<button type="button" class="test-pill" data-group="%d" data-tab="%s" '
-                    'onclick="labSelectTab(%d, \'%s\')"><span class="dot">&bull;</span> %s</button>'
-                    % (_g, _tid, _g, _tid, html.escape(str(_tname)))
-                )
-            categories_html += '</div>'
-            for _tid, _tname, _pane in _tab_panes:
-                categories_html += '<div class="test-pane" data-group="%d" data-tab="%s" style="display:none;">%s</div>' % (_g, _tid, _pane)
             categories_html += "</div>"
     else:
         categories_html = '<div style="padding: 24px; text-align: center; color: #94a3b8; background: white; border-radius: 8px; border: 1px solid #e2e8f0;">No tests assigned for this patient.</div>'
@@ -9166,38 +9158,6 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     document.addEventListener('DOMContentLoaded', function () {
         if (waPicks().length) { var b = document.getElementById('wa-multi-bar'); if (b) b.style.display = 'flex'; waCount(); }
     });
-    </script>
-    """.replace("__PID__", str(patient_id))
-
-    tabs_js = """
-    <script>
-    (function () {
-        var KEY = 'lab_rtab___PID__';
-        function load() { try { return JSON.parse(sessionStorage.getItem(KEY) || '{}'); } catch (e) { return {}; } }
-        function save(o) { try { sessionStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} }
-        window.labSelectTab = function (g, id) {
-            id = String(id);
-            document.querySelectorAll('.test-pane[data-group="' + g + '"]').forEach(function (p) {
-                p.style.display = (p.getAttribute('data-tab') === id) ? 'block' : 'none';
-            });
-            document.querySelectorAll('.test-pill[data-group="' + g + '"]').forEach(function (b) {
-                b.classList.toggle('active', b.getAttribute('data-tab') === id);
-            });
-            var o = load(); o[g] = id; save(o);
-        };
-        function init() {
-            var o = load();
-            document.querySelectorAll('.test-tabs').forEach(function (bar) {
-                var g = bar.getAttribute('data-group');
-                var pills = bar.querySelectorAll('.test-pill');
-                if (!pills.length) return;
-                var want = o[g], ok = false;
-                pills.forEach(function (b) { if (b.getAttribute('data-tab') === want) ok = true; });
-                labSelectTab(g, ok ? want : pills[0].getAttribute('data-tab'));
-            });
-        }
-        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
-    })();
     </script>
     """.replace("__PID__", str(patient_id))
 
@@ -9242,12 +9202,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
             body {{ background: #f4f7fe; color: #1b2559; padding: 24px; }}
-            .container {{ max-width: 1400px; margin: auto; }}
+            .container {{ max-width: 1480px; margin: auto; }}
             .top-bar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
             .back-link {{ color: #0d47a1; text-decoration: none; font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 6px; }}
-            .main-grid {{ display: grid; grid-template-columns: 360px 1fr; gap: 22px; }}
-            @media (max-width: 992px) {{ .main-grid {{ grid-template-columns: 1fr; }} }}
-            .card-box {{ background: white; padding: 22px; border-radius: 12px; box-shadow: 0px 8px 24px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }}
+            .main-grid {{ display: grid; grid-template-columns: 440px minmax(0, 1fr); gap: 28px; align-items: start; }}
+            @media (max-width: 992px) {{ .main-grid {{ grid-template-columns: 1fr; gap:16px; }} }}
+            .card-box {{ background: white; padding: 24px; border-radius: 12px; box-shadow: 0px 8px 24px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }}
             .card-box h3 {{ font-size: 16px; color: #0d47a1; font-weight: 700; margin-bottom: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }}
             .form-group {{ margin-bottom: 14px; }}
             .form-group label {{ display: block; font-size: 12px; font-weight: 700; color: #475569; margin-bottom: 5px; }}
@@ -9256,13 +9216,40 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
             .row-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
             .btn-save {{ background: #0d47a1; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: 700; font-size: 14px; cursor: pointer; width: 100%; margin-top: 10px; }}
             .btn-save:hover {{ background: #0a3880; }}
-            .test-tabs {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }}
-            .test-pill {{ background: #ede9fe; color: #1b2559; border: 1px solid #a78bfa; border-radius: 12px; padding: 10px 22px; font-size: 15px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }}
-            .test-pill .dot {{ color: #7c3aed; font-size: 18px; line-height: 1; }}
-            .test-pill:hover {{ background: #ddd6fe; }}
-            .test-pill.active {{ background: #fff; border: 2px solid #0d47a1; color: #0d47a1; box-shadow: 0 3px 10px rgba(13,71,161,.15); }}
-            .test-pill.active .dot {{ color: #0d47a1; }}
+            .result-category-heading {{ background:#e2e8f0; color:#0d47a1; padding:10px 14px; border-radius:8px; font-size:14px; margin:0 0 12px; font-weight:700; border-left:4px solid #0d47a1; }}
+            .result-test-tabs {{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 12px; }}
+            .result-test-tab {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; min-width:130px; padding:10px 16px; border:1px solid #2563eb; border-radius:11px; background:#eff6ff; color:#0f172a; font-size:13px; font-weight:700; cursor:pointer; transition:background .15s,border-color .15s,box-shadow .15s; }}
+            .result-test-tab i {{ font-size:8px; color:#6d28d9; }}
+            .result-test-tab:hover {{ background:#dbeafe; }}
+            .result-test-tab.active {{ background:#ddd6fe; border-color:#8b5cf6; box-shadow:0 0 0 1px rgba(139,92,246,.12); }}
+            .result-test-panel[hidden] {{ display:none !important; }}
+            @media(max-width:700px) {{ .main-grid {{ grid-template-columns:1fr; }} .result-test-tab {{ flex:1 1 120px; min-width:0; }} }}
         </style>
+        <script>
+            function selectResultTest(testId) {{
+                document.querySelectorAll('.result-test-panel').forEach(function(panel) {{
+                    panel.hidden = panel.getAttribute('data-test-panel') !== String(testId);
+                }});
+                document.querySelectorAll('.result-test-tab').forEach(function(tab) {{
+                    var active = tab.getAttribute('data-test-tab') === String(testId);
+                    tab.classList.toggle('active', active);
+                    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                }});
+                try {{
+                    var url = new URL(window.location.href);
+                    url.searchParams.set('test_id', String(testId));
+                    window.history.replaceState({{}}, '', url.toString());
+                }} catch (e) {{}}
+            }}
+            document.addEventListener('DOMContentLoaded', function() {{
+                var requested = new URLSearchParams(window.location.search).get('test_id');
+                var available = Array.prototype.map.call(document.querySelectorAll('.result-test-tab'), function(tab) {{
+                    return tab.getAttribute('data-test-tab');
+                }});
+                var initial = requested && available.indexOf(requested) >= 0 ? requested : (available[0] || null);
+                if (initial) selectResultTest(initial);
+            }});
+        </script>
         <script>
             function formatText(fieldId, startTag, endTag) {{
                 var field = document.getElementById(fieldId);
@@ -9369,7 +9356,6 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                     </h3>
                     {wa_multi_bar_html}
                     {categories_html}
-                    {tabs_js}
                 </div>
             </div>
         </div>
@@ -10313,7 +10299,7 @@ button.cb-unit{cursor:pointer;}
 @media (max-width:900px){.cb-two{grid-template-columns:1fr;}}
 .cb-pos{color:#15803d;font-weight:700;} .cb-neg2{color:#b91c1c;font-weight:700;}
 @media print{
-  .ms-header,.ms-sidebar,.ms-crumb,.ms-banner,.ms-scrim,.cb-tabs,.cb-filter,.cb-noprint,.cb-toast{display:none !important;}
+  .ms-header,.ms-sidebar,.ms-crumb,.ms-scrim,.cb-tabs,.cb-filter,.cb-noprint,.cb-toast{display:none !important;}
   .ms-layout{display:block !important;} .ms-main{padding:0 !important;}
   .cb-card,.cb-kpi{box-shadow:none !important;}
 }
@@ -11362,7 +11348,9 @@ async def save_test_results(request: Request):
         conn.commit()
         conn.close()
         
-        return RedirectResponse(url=f"/patient-results/{patient_id}?updated=results_saved", status_code=303)
+        saved_test_id = form_data.get("test_id")
+        redirect_suffix = f"&test_id={quote(str(saved_test_id))}" if saved_test_id else ""
+        return RedirectResponse(url=f"/patient-results/{patient_id}?updated=results_saved{redirect_suffix}", status_code=303)
         
     except Exception as e:
         return HTMLResponse(content=f"<h3>Error saving: {str(e)}</h3>", status_code=500)
