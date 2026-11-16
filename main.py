@@ -1635,7 +1635,23 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     # even when an older route has a different internal HTML <title>.
     heading_label = nav_item[1] if nav_item else (page_title or "Page")
     heading_label = html.escape(str(heading_label).strip())
-    page_heading = (
+    # Some legacy menu pages already render their own boxed H1/H2 page title.
+    # Do not add a second shared title bar on those pages. Match only heading
+    # text (not ordinary section labels) so normal content headings remain.
+    existing_title_texts = []
+    for _heading_match in re.finditer(r'<h[12]\b[^>]*>(.*?)</h[12]>', body_inner, re.I | re.S):
+        _heading_text = html.unescape(re.sub(r'<[^>]+>', ' ', _heading_match.group(1)))
+        _heading_text = re.sub(r'\s+', ' ', _heading_text).strip()
+        if _heading_text:
+            existing_title_texts.append(_heading_text.casefold())
+    _target_heading = re.sub(r'\s+', ' ', html.unescape(heading_label)).strip().casefold()
+    has_matching_page_title = any(
+        _existing == _target_heading
+        or _existing.startswith(_target_heading + ' -')
+        or _existing.startswith(_target_heading + ' |')
+        for _existing in existing_title_texts
+    )
+    page_heading = '' if has_matching_page_title else (
         '<div class="ms-page-heading">'
         f'<i class="fa-solid {icon}"></i>'
         f'<span>MEDISTAR MEDICAL LABORATORY - {heading_label.upper()}</span>'
@@ -8813,6 +8829,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         cursor.execute("""
             SELECT pat.id as assigned_id, pat.test_id, pat.result, pat.comment,
                    COALESCE(t.test_name, tt.test_name, 'Unknown Test') as test_name,
+                   COALESCE(NULLIF(t.test_code, ''), '') as test_code,
                    COALESCE(t.category, tt.category, 'General Tests') as category_name
             FROM patient_assigned_tests pat
             LEFT JOIN tests t ON pat.test_id = t.id
@@ -8823,7 +8840,8 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     except:
         cursor.execute("""
             SELECT pat.id as assigned_id, pat.test_id, pat.result, pat.comment,
-                   COALESCE(t.test_name, 'Unknown Test') as test_name, 
+                   COALESCE(t.test_name, 'Unknown Test') as test_name,
+                   COALESCE(NULLIF(t.test_code, ''), '') as test_code,
                    'General Tests' as category_name
             FROM patient_assigned_tests pat
             LEFT JOIN tests t ON pat.test_id = t.id
@@ -8854,7 +8872,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
         for category, cat_tests in tests_by_category.items():
             category_tab_buttons = "".join(
                 f'<button type="button" class="result-test-tab" data-test-tab="{int(item["test_id"])}" onclick="selectResultTest({int(item["test_id"])})">'
-                f'<i class="fa-solid fa-circle"></i> {html.escape(str(item["test_name"] or "Test"))}</button>'
+                f'<i class="fa-solid fa-circle"></i> {html.escape(str(item["test_code"] or item["test_name"] or "Test"))}</button>'
                 for item in cat_tests
             )
             categories_html += f"""
