@@ -1165,6 +1165,8 @@ def _shell_user_from_request(request: Request):
         return None
 
 
+_SHELL_BRAND = "MEDISTAR MEDICAL LABORATORY"
+
 _SHELL_NAV = [
     ("Main", [
         ("dashboard", "Dashboard", "fa-house", "/dashboard", None, None),
@@ -1343,6 +1345,11 @@ html body.ms{overflow-x:hidden;}
 .ms-collapse{display:flex;align-items:center;gap:14px;background:transparent;border:1px dashed var(--border);color:var(--muted);border-radius:10px;padding:7px 16px;margin:0 0 10px;font-size:12.5px;font-weight:700;cursor:pointer;font-family:inherit;width:100%;}
 .ms-collapse i{width:24px;text-align:center;transition:transform .2s;}
 .ms-collapse:hover{background:var(--primary-soft);color:var(--primary);}
+.ms-banner{display:flex;align-items:center;gap:14px;background:var(--header-bg);color:#fff;border-radius:22px;padding:16px 30px;margin:0 0 18px;box-shadow:0 6px 18px rgba(13,71,161,.18);}
+.ms-banner i{font-size:22px;color:#fff;}
+.ms-banner-t{font-size:24px;font-weight:800;letter-spacing:.4px;line-height:1.2;color:#fff;}
+.ms-banner-line{flex:1 1 40px;height:2px;min-width:40px;background:rgba(255,255,255,.35);border-radius:2px;margin-left:8px;}
+@media (max-width:700px){.ms-banner{padding:12px 16px;border-radius:16px;gap:10px;}.ms-banner-t{font-size:16px;}.ms-banner-line{display:none;}}
 .ms-crumb{display:flex;align-items:center;gap:10px;font-size:13.5px;font-weight:600;color:var(--muted);margin:0 0 14px;flex-wrap:wrap;}
 .ms-crumb a{color:var(--primary);font-weight:700;}
 .ms-crumb .sep{font-size:10px;opacity:.7;}
@@ -1367,7 +1374,7 @@ html body.ms .ms-page > .header{border-radius:12px;margin-bottom:16px;}
 @media (max-width:1200px){.ms-brand p{display:none;}}
 @media (max-height:900px){.ms-side-foot{display:none;}}
 @media print{
- .ms-header,.ms-sidebar,.ms-scrim,.ms-crumb{display:none !important;}
+ .ms-header,.ms-sidebar,.ms-scrim,.ms-crumb,.ms-banner{display:none !important;}
  .ms-layout{display:block !important;}
  html body.ms .ms-main{padding:0 !important;}
  .ms-page{background:#fff !important;padding:0 !important;border:0 !important;overflow:visible !important;}
@@ -1628,11 +1635,11 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
     active = _shell_active_key(path, query)
     nav_item = _shell_nav_item(active)
     icon = nav_item[2] if nav_item else "fa-file-lines"
-    crumb_title = html.escape(page_title or (nav_item[1] if nav_item else "Page"))
+    banner_title = html.escape((nav_item[1] if nav_item else page_title) or "Page").upper()
     crumb = (
-        '<div class="ms-crumb"><a href="/dashboard"><i class="fa-solid fa-house"></i> Dashboard</a>'
-        '<i class="fa-solid fa-chevron-right sep"></i>'
-        f'<span><i class="fa-solid {icon}"></i> {crumb_title}</span></div>'
+        f'<div class="ms-banner"><i class="fa-solid {icon}"></i>'
+        f'<span class="ms-banner-t">{_SHELL_BRAND} - {banner_title}</span>'
+        '<span class="ms-banner-line"></span></div>'
     )
 
     fa_link = ""
@@ -8839,6 +8846,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
 
     # 3. Build Categories, Parameters & Comment Boxes HTML with Formatting Toolbar
     categories_html = ""
+    _tab_groups = []
     if tests:
         for category, cat_tests in tests_by_category.items():
             categories_html += f"""
@@ -8848,7 +8856,9 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 </h4>
             """
             
+            _tab_panes = []
             for t in cat_tests:
+                _pane_start = len(categories_html)
                 t_id = t["test_id"]
                 t_name = t["test_name"]
                 assigned_id = t["assigned_id"]
@@ -9103,6 +9113,21 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                 {reset_button_html}
                 </div>
                 """
+                _tab_panes.append((t_id, t_name, categories_html[_pane_start:]))
+                categories_html = categories_html[:_pane_start]
+
+            _g = len(_tab_groups)
+            _tab_groups.append(_g)
+            categories_html += '<div class="test-tabs" data-group="%d">' % _g
+            for _tid, _tname, _ in _tab_panes:
+                categories_html += (
+                    '<button type="button" class="test-pill" data-group="%d" data-tab="%s" '
+                    'onclick="labSelectTab(%d, \'%s\')"><span class="dot">&bull;</span> %s</button>'
+                    % (_g, _tid, _g, _tid, html.escape(str(_tname)))
+                )
+            categories_html += '</div>'
+            for _tid, _tname, _pane in _tab_panes:
+                categories_html += '<div class="test-pane" data-group="%d" data-tab="%s" style="display:none;">%s</div>' % (_g, _tid, _pane)
             categories_html += "</div>"
     else:
         categories_html = '<div style="padding: 24px; text-align: center; color: #94a3b8; background: white; border-radius: 8px; border: 1px solid #e2e8f0;">No tests assigned for this patient.</div>'
@@ -9141,6 +9166,38 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     document.addEventListener('DOMContentLoaded', function () {
         if (waPicks().length) { var b = document.getElementById('wa-multi-bar'); if (b) b.style.display = 'flex'; waCount(); }
     });
+    </script>
+    """.replace("__PID__", str(patient_id))
+
+    tabs_js = """
+    <script>
+    (function () {
+        var KEY = 'lab_rtab___PID__';
+        function load() { try { return JSON.parse(sessionStorage.getItem(KEY) || '{}'); } catch (e) { return {}; } }
+        function save(o) { try { sessionStorage.setItem(KEY, JSON.stringify(o)); } catch (e) {} }
+        window.labSelectTab = function (g, id) {
+            id = String(id);
+            document.querySelectorAll('.test-pane[data-group="' + g + '"]').forEach(function (p) {
+                p.style.display = (p.getAttribute('data-tab') === id) ? 'block' : 'none';
+            });
+            document.querySelectorAll('.test-pill[data-group="' + g + '"]').forEach(function (b) {
+                b.classList.toggle('active', b.getAttribute('data-tab') === id);
+            });
+            var o = load(); o[g] = id; save(o);
+        };
+        function init() {
+            var o = load();
+            document.querySelectorAll('.test-tabs').forEach(function (bar) {
+                var g = bar.getAttribute('data-group');
+                var pills = bar.querySelectorAll('.test-pill');
+                if (!pills.length) return;
+                var want = o[g], ok = false;
+                pills.forEach(function (b) { if (b.getAttribute('data-tab') === want) ok = true; });
+                labSelectTab(g, ok ? want : pills[0].getAttribute('data-tab'));
+            });
+        }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+    })();
     </script>
     """.replace("__PID__", str(patient_id))
 
@@ -9199,6 +9256,12 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
             .row-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
             .btn-save {{ background: #0d47a1; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: 700; font-size: 14px; cursor: pointer; width: 100%; margin-top: 10px; }}
             .btn-save:hover {{ background: #0a3880; }}
+            .test-tabs {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }}
+            .test-pill {{ background: #ede9fe; color: #1b2559; border: 1px solid #a78bfa; border-radius: 12px; padding: 10px 22px; font-size: 15px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }}
+            .test-pill .dot {{ color: #7c3aed; font-size: 18px; line-height: 1; }}
+            .test-pill:hover {{ background: #ddd6fe; }}
+            .test-pill.active {{ background: #fff; border: 2px solid #0d47a1; color: #0d47a1; box-shadow: 0 3px 10px rgba(13,71,161,.15); }}
+            .test-pill.active .dot {{ color: #0d47a1; }}
         </style>
         <script>
             function formatText(fieldId, startTag, endTag) {{
@@ -9306,6 +9369,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
                     </h3>
                     {wa_multi_bar_html}
                     {categories_html}
+                    {tabs_js}
                 </div>
             </div>
         </div>
@@ -10249,7 +10313,7 @@ button.cb-unit{cursor:pointer;}
 @media (max-width:900px){.cb-two{grid-template-columns:1fr;}}
 .cb-pos{color:#15803d;font-weight:700;} .cb-neg2{color:#b91c1c;font-weight:700;}
 @media print{
-  .ms-header,.ms-sidebar,.ms-crumb,.ms-scrim,.cb-tabs,.cb-filter,.cb-noprint,.cb-toast{display:none !important;}
+  .ms-header,.ms-sidebar,.ms-crumb,.ms-banner,.ms-scrim,.cb-tabs,.cb-filter,.cb-noprint,.cb-toast{display:none !important;}
   .ms-layout{display:block !important;} .ms-main{padding:0 !important;}
   .cb-card,.cb-kpi{box-shadow:none !important;}
 }
