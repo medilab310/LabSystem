@@ -1197,7 +1197,7 @@ _SHELL_MATCH = [
     ("sales", ("/reports/sales-analytics",)),
     ("reports", ("/reports",)),
     ("results", ("/patients-dashboard", "/patient-results", "/patient-tests", "/test-entry")),
-    ("entry", ("/select-patient", "/add-test-entry")),
+    ("entry", ("/select-patient", "/add-test-entry", "/enter-results")),
     ("register", ("/add-patient",)),
     ("billing", ("/billing",)),
     ("share", ("/share-reports",)),
@@ -1353,7 +1353,8 @@ html body.ms{overflow-x:hidden;}
 .ms-page-heading-line{height:3px;flex:1 1 auto;min-width:24px;margin-left:16px;background:rgba(255,255,255,.18);border-radius:4px;}
 .ms-page{color:#1e293b;overflow-x:auto;border-radius:16px;}
 [data-theme="dark"] .ms-page{background:#f4f7fb;padding:16px;border:1px solid var(--border);}
-html body.ms .ms-page > .header{border-radius:12px;margin-bottom:16px;}
+html body.ms .ms-page > .header{display:none !important;}
+html body.ms .ms-page > .page-header,html body.ms .ms-page > .page-title,html body.ms .ms-page > .title-bar{display:none !important;}
 @media (min-width:993px){
  html.ms-collapsed .ms-layout{grid-template-columns:78px minmax(0,1fr);}
  html.ms-collapsed .ms-sidebar{padding:14px 10px 20px;}
@@ -1645,16 +1646,37 @@ def wrap_page_in_shell(page_html: str, user: dict, path: str, query: str):
         if _heading_text:
             existing_title_texts.append(_heading_text.casefold())
     _target_heading = re.sub(r'\s+', ' ', html.unescape(heading_label)).strip().casefold()
-    has_matching_page_title = any(
-        _existing == _target_heading
-        or _existing.startswith(_target_heading + ' -')
-        or _existing.startswith(_target_heading + ' |')
-        for _existing in existing_title_texts
+    def _heading_words(value):
+        return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip().split()
+
+    _target_words = _heading_words(_target_heading)
+    _page_title_normalized = re.sub(r"\s+", " ", page_title).strip().casefold()
+
+    # Remove the old plain H1/H2 page title when it represents this menu
+    # page (or its legacy HTML <title>). This avoids showing the same title
+    # twice while ensuring every sidebar page receives the common blue bar.
+    def _remove_replaced_page_title(match):
+        _old_text = html.unescape(re.sub(r"<[^>]+>", " ", match.group(1)))
+        _old_text = re.sub(r"\s+", " ", _old_text).strip().casefold()
+        _old_words = _heading_words(_old_text)
+        _matches_menu = bool(_target_words) and all(w in _old_words for w in _target_words)
+        _matches_document_title = bool(_page_title_normalized) and _old_text == _page_title_normalized
+        return "" if (_matches_menu or _matches_document_title) else match.group(0)
+
+    body_inner = re.sub(
+        r"<h[12]\b[^>]*>(.*?)</h[12]>",
+        _remove_replaced_page_title,
+        body_inner,
+        count=3,
+        flags=re.I | re.S,
     )
-    page_heading = '' if has_matching_page_title else (
+
+    # Always render one common heading for a recognized sidebar menu page.
+    # The visible text is the menu label only - no lab-name prefix.
+    page_heading = (
         '<div class="ms-page-heading">'
         f'<i class="fa-solid {icon}"></i>'
-        f'<span>MEDISTAR MEDICAL LABORATORY - {heading_label.upper()}</span>'
+        f'<span>{heading_label}</span>'
         '<span class="ms-page-heading-line"></span>'
         '</div>'
     )
