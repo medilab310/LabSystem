@@ -8892,11 +8892,31 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
     categories_html = ""
     if tests:
         for category, cat_tests in tests_by_category.items():
-            category_tab_buttons = "".join(
-                f'<button type="button" class="result-test-tab" data-test-tab="{int(item["test_id"])}" onclick="selectResultTest({int(item["test_id"])})">'
-                f'<i class="fa-solid fa-circle"></i> {html.escape(str(item["test_code"] or item["test_name"] or "Test"))}</button>'
-                for item in cat_tests
-            )
+            category_tab_button_list = []
+            for item in cat_tests:
+                tab_test_id = int(item["test_id"])
+                # A tab is green only when a non-empty result is already
+                # persisted in the database; otherwise it remains red.
+                tab_is_saved = bool(item["result"] and str(item["result"]).strip())
+                if not tab_is_saved:
+                    try:
+                        cursor.execute(
+                            "SELECT 1 FROM patient_parameter_results "
+                            "WHERE patient_id = ? AND test_id = ? "
+                            "AND result_value IS NOT NULL AND TRIM(result_value) <> '' LIMIT 1",
+                            (patient_id, tab_test_id)
+                        )
+                        tab_is_saved = cursor.fetchone() is not None
+                    except Exception:
+                        tab_is_saved = False
+                tab_status_class = "saved" if tab_is_saved else "unsaved"
+                category_tab_button_list.append(
+                    f'<button type="button" class="result-test-tab {tab_status_class}" '
+                    f'data-test-tab="{tab_test_id}" onclick="selectResultTest({tab_test_id})">'
+                    f'<i class="fa-solid fa-circle"></i> '
+                    f'{html.escape(str(item["test_code"] or item["test_name"] or "Test"))}</button>'
+                )
+            category_tab_buttons = "".join(category_tab_button_list)
             categories_html += f"""
             <div class="result-category-group" style="margin-bottom: 18px;">
                 <h4 class="result-category-heading">
@@ -9245,7 +9265,7 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
             .container {{ max-width: 1480px; margin: auto; }}
             .top-bar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
             .back-link {{ color: #0d47a1; text-decoration: none; font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 6px; }}
-            .main-grid {{ display: grid; grid-template-columns: 440px minmax(0, 1fr); gap: 28px; align-items: start; }}
+            .main-grid {{ display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 24px; align-items: start; }}
             @media (max-width: 992px) {{ .main-grid {{ grid-template-columns: 1fr; gap:16px; }} }}
             .card-box {{ background: white; padding: 24px; border-radius: 12px; box-shadow: 0px 8px 24px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; }}
             .card-box h3 {{ font-size: 16px; color: #0d47a1; font-weight: 700; margin-bottom: 18px; border-bottom: 2px solid #f1f5f9; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }}
@@ -9258,10 +9278,14 @@ def patient_results(request: Request, patient_id: int, updated: Optional[str] = 
             .btn-save:hover {{ background: #0a3880; }}
             .result-category-heading {{ background:#e2e8f0; color:#0d47a1; padding:10px 14px; border-radius:8px; font-size:14px; margin:0 0 12px; font-weight:700; border-left:4px solid #0d47a1; }}
             .result-test-tabs {{ display:flex; flex-wrap:wrap; gap:8px; margin:0 0 12px; }}
-            .result-test-tab {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; min-width:130px; padding:10px 16px; border:1px solid #2563eb; border-radius:11px; background:#eff6ff; color:#0f172a; font-size:13px; font-weight:700; cursor:pointer; transition:background .15s,border-color .15s,box-shadow .15s; }}
-            .result-test-tab i {{ font-size:8px; color:#6d28d9; }}
-            .result-test-tab:hover {{ background:#dbeafe; }}
-            .result-test-tab.active {{ background:#ddd6fe; border-color:#8b5cf6; box-shadow:0 0 0 1px rgba(139,92,246,.12); }}
+            .result-test-tab {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; min-width:130px; padding:10px 16px; border:1px solid #dc2626; border-radius:11px; background:#fee2e2; color:#991b1b; font-size:13px; font-weight:700; cursor:pointer; transition:background .15s,border-color .15s,box-shadow .15s; }}
+            .result-test-tab.unsaved {{ background:#fee2e2; border-color:#dc2626; color:#991b1b; }}
+            .result-test-tab.saved {{ background:#dcfce7; border-color:#16a34a; color:#166534; }}
+            .result-test-tab.unsaved i {{ font-size:8px; color:#dc2626; }}
+            .result-test-tab.saved i {{ font-size:8px; color:#16a34a; }}
+            .result-test-tab.unsaved:hover {{ background:#fecaca; }}
+            .result-test-tab.saved:hover {{ background:#bbf7d0; }}
+            .result-test-tab.active {{ box-shadow:0 0 0 2px rgba(15,23,42,.18); }}
             .result-test-panel[hidden] {{ display:none !important; }}
             @media(max-width:700px) {{ .main-grid {{ grid-template-columns:1fr; }} .result-test-tab {{ flex:1 1 120px; min-width:0; }} }}
         </style>
