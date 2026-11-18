@@ -11170,8 +11170,7 @@ def billing_whatsapp(pid: int, request: Request):
     if not b["wa_phone"]:
         return HTMLResponse("<h3>This patient has no valid phone number for WhatsApp.</h3>"
                             "<p>Add a mobile number in the patient details and try again.</p>", status_code=400)
-    return RedirectResponse(url=f"https://wa.me/{b['wa_phone']}?text={quote(_bill_whatsapp_text(b), safe='')}",
-                            status_code=302)
+    return _wa_open_response(request, b["wa_phone"], _bill_whatsapp_text(b))
 
 
 # ---------------------------- RECEIPT ------------------------------
@@ -11472,6 +11471,43 @@ async def set_critical(patient_id: int, test_id: int, request: Request):
     return HTMLResponse("ok")
 
 
+def _wa_open_response(request: Request, number: str, message: str):
+    """Open WhatsApp with a ready message.
+    On Android phones that have BOTH normal WhatsApp and WhatsApp Business, a plain
+    wa.me link goes to Business. Here we send an Android intent that is pinned to the
+    NORMAL WhatsApp package (com.whatsapp). If normal WhatsApp is not installed, or on
+    PC / iPhone, it falls back to the usual wa.me link."""
+    text = quote(message, safe="")
+    if number:
+        web_url = f"https://wa.me/{number}?text={text}"
+        phone_q = f"phone={number}&"
+    else:
+        web_url = f"https://api.whatsapp.com/send?text={text}"
+        phone_q = ""
+    ua = (request.headers.get("user-agent") or "").lower()
+    if "android" in ua:
+        intent_url = (
+            f"intent://send?{phone_q}text={text}"
+            f"#Intent;scheme=whatsapp;package=com.whatsapp;"
+            f"S.browser_fallback_url={quote(web_url, safe='')};end"
+        )
+        esc_intent = html.escape(intent_url, quote=True)
+        esc_web = html.escape(web_url, quote=True)
+        page = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opening WhatsApp...</title></head>
+<body style="font-family:Arial,sans-serif;text-align:center;padding:40px 16px;">
+<p style="font-size:16px;color:#334155;">Opening WhatsApp...</p>
+<p><a id="go" href="{esc_intent}" style="display:inline-block;background:#25D366;color:#fff;
+padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:bold;">Open WhatsApp</a></p>
+<p style="margin-top:18px;"><a href="{esc_web}" style="color:#64748b;font-size:13px;">Open with default app instead</a></p>
+<p style="margin-top:18px;"><a href="javascript:history.back()" style="color:#64748b;font-size:13px;">&larr; Back</a></p>
+<script>setTimeout(function(){{ window.location.href = document.getElementById('go').href; }}, 150);</script>
+</body></html>"""
+        return HTMLResponse(page)
+    return RedirectResponse(url=web_url, status_code=303)
+
+
 def _wa_phone_digits(raw_phone: str) -> str:
     """Sri Lankan style number -> international digits for wa.me ('' if unusable)."""
     digits = re.sub(r"\D", "", str(raw_phone or ""))
@@ -11530,11 +11566,7 @@ def whatsapp_share_report(patient_id: int, test_id: int, request: Request):
         f"Best regards,\nMedistar Medical Laboratory"
     )
     number = _wa_phone_digits(p_phone)
-    if number:
-        wa_url = f"https://wa.me/{number}?text={quote(message)}"
-    else:
-        wa_url = f"https://api.whatsapp.com/send?text={quote(message)}"
-    return RedirectResponse(url=wa_url, status_code=303)
+    return _wa_open_response(request, number, message)
 
 
 @app.get("/whatsapp-share-multi/{patient_id}")
@@ -11627,11 +11659,7 @@ def whatsapp_share_multi(patient_id: int, request: Request, tests: str = ""):
         f"Best regards,\nMedistar Medical Laboratory"
     )
     number = _wa_phone_digits(p_phone)
-    if number:
-        wa_url = f"https://wa.me/{number}?text={quote(message)}"
-    else:
-        wa_url = f"https://api.whatsapp.com/send?text={quote(message)}"
-    return RedirectResponse(url=wa_url, status_code=303)
+    return _wa_open_response(request, number, message)
 
 
 # -------------------------------------------------------------
