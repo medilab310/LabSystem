@@ -12067,8 +12067,8 @@ def public_report_bundle(bundle_token: str, request: Request):
         cards.append(
             f'''<section class="rep">
             <div class="rep-head">{html.escape(tname)}</div>
-            <div class="rep-box"><iframe class="rep-frame" src="/public-report/{st}?embed=1" title="{html.escape(tname, quote=True)}" scrolling="no" loading="eager"></iframe></div>
-            <div class="rep-dl"><a href="/public-report/{st}/download">&#128196; Download PDF &ndash; {html.escape(tname)}</a></div>
+            <div class="rep-box"><iframe id="fr-{len(cards)}" class="rep-frame" src="/public-report/{st}?embed=1" title="{html.escape(tname, quote=True)}" scrolling="no" loading="eager"></iframe></div>
+            <div class="rep-dl"><button type="button" onclick="dlFrame('fr-{len(cards)}','/public-report/{st}/download?server=1')">&#128196; Download PDF &ndash; {html.escape(tname)}</button></div>
             </section>'''
         )
     if not cards:
@@ -12090,7 +12090,7 @@ body{{font-family:Arial,sans-serif;background:#e9eef7;color:#1b2559;margin:0;pad
 .rep-box{{width:100%;overflow:hidden;position:relative;background:#fff;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,.08);}}
 .rep-frame{{width:794px;border:0;background:#fff;display:block;height:1123px;transform-origin:top left;}}
 .rep-dl{{text-align:center;margin-top:10px;}}
-.rep-dl a{{display:inline-block;background:#0f4c81;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:14px;}}
+.rep-dl a,.rep-dl button{{display:inline-block;background:#0f4c81;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:14px;border:0;cursor:pointer;}}
 </style></head>
 <body><div class="wrap">
 <div class="top"><h2>MEDISTAR MEDICAL LABORATORY</h2>
@@ -12111,6 +12111,11 @@ document.querySelectorAll('.rep-frame').forEach(function(f){{
   f.addEventListener('load',function(){{fit(f);setTimeout(function(){{fit(f);}},400);setTimeout(function(){{fit(f);}},1500);}});
 }});
 window.addEventListener('resize',function(){{document.querySelectorAll('.rep-frame').forEach(fit);}});
+function dlFrame(id,fallback){{
+  var f=document.getElementById(id);
+  try{{ if(f&&f.contentWindow&&typeof f.contentWindow.downloadReportPdf==='function'){{ f.contentWindow.downloadReportPdf(); return; }} }}catch(e){{}}
+  window.location.href=fallback;
+}}
 </script>
 </body></html>"""
     return HTMLResponse(page, headers=dict(PUBLIC_REPORT_HEADERS))
@@ -12157,14 +12162,46 @@ def public_report_view(token: str, request: Request, embed: int = 0):
     )
     public_bar = f"""
     <div class="public-bar">
-        <a href="/public-report/{safe_token}/download" style="display:inline-block;background:#0f4c81;color:#fff;padding:11px 24px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:14px;margin:2px 4px;">&#128196; Download PDF</a>
+        <button type="button" onclick="downloadReportPdf()" style="display:inline-block;background:#0f4c81;color:#fff;padding:11px 24px;border-radius:8px;border:none;font-weight:bold;font-size:14px;cursor:pointer;margin:2px 4px;">&#128196; Download PDF</button>
         <button type="button" onclick="window.print()" style="display:inline-block;background:#0f172a;color:#fff;padding:11px 24px;border-radius:8px;border:none;font-weight:bold;font-size:14px;cursor:pointer;margin:2px 4px;">&#128424; Print</button>
+        <div id="pr-status" style="font-size:12px;color:#64748b;margin-top:4px;min-height:14px;"></div>
     </div>
     """
+    # Direct, in-page PDF download (no navigation). The server route is only the fallback.
+    pdf_script = """<script>
+(function(){
+  var LIB="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js";
+  var FALLBACK="__FALLBACK__", FILE="__FILE__";
+  function status(m){var e=document.getElementById('pr-status');if(e)e.textContent=m;}
+  function load(ok,fail){
+    if(window.html2pdf){ok();return;}
+    var s=document.createElement('script');s.src=LIB;s.onload=ok;s.onerror=fail;document.head.appendChild(s);
+  }
+  window.downloadReportPdf=function(){
+    var el=document.querySelector('.report-page');
+    if(!el){window.location.href=FALLBACK;return;}
+    status('Preparing PDF...');
+    load(function(){
+      try{
+        window.scrollTo(0,0);
+        html2pdf().set({margin:0,filename:FILE,image:{type:'jpeg',quality:0.98},
+          html2canvas:{scale:2,useCORS:true,scrollX:0,scrollY:0},
+          jsPDF:{unit:'mm',format:'a4',orientation:'portrait'}})
+        .from(el).save()
+        .then(function(){status('');})
+        .catch(function(){status('');window.location.href=FALLBACK;});
+      }catch(e){status('');window.location.href=FALLBACK;}
+    },function(){status('');window.location.href=FALLBACK;});
+  };
+})();
+</script>""".replace("__FALLBACK__", f"/public-report/{safe_token}/download?server=1").replace(
+        "__FILE__", f"Report_MED-{patient_id:04d}-{test_id}.pdf")
+    public_bar = public_bar + pdf_script
 
     if embed:
         # Shown inside the "all reports" page: no bottom bar, no extra padding.
-        public_bar = ""
+        # (keeps only the PDF script so the parent page's button can call it)
+        public_bar = pdf_script
         head_css = head_css.replace(
             "body{padding-bottom:76px !important;}",
             "body{padding:0 !important;margin:0 !important;background:#fff !important;}"
