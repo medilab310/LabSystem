@@ -10,6 +10,7 @@ import hashlib
 import base64
 import hmac
 import time
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -159,8 +160,9 @@ class _TursoCursorWrapper:
     through to the underlying raw cursor.
     """
 
-    def __init__(self, raw_cursor):
+    def __init__(self, raw_cursor, conn_wrapper=None):
         self._raw_cursor = raw_cursor
+        self._conn_wrapper = conn_wrapper
 
     def _columns(self):
         desc = self._raw_cursor.description
@@ -168,38 +170,62 @@ class _TursoCursorWrapper:
 
     def execute(self, *args, **kwargs):
         # Serialized against every other statement in the app (see
-        # _CONNECTION_LOCK): FastAPI runs sync routes in a thread pool, so
-        # without this, two concurrent requests could issue raw execute()
-        # calls against the same shared libsql connection at the same
-        # instant. The lock is only held for this one call, never across
-        # calls, so it cannot deadlock a request that forgets to release
-        # anything - it just guarantees no two statements ever hit the
-        # underlying connection at the exact same moment.
+        # _CONNECTION_LOCK). The lock is only held for this one call.
+        read_only = _is_read_only_sql(args)
         with _CONNECTION_LOCK:
             try:
                 self._raw_cursor.execute(*args, **kwargs)
-            except Exception:
-                # Don't leave a broken connection cached for every future
-                # request to keep failing against. Drop it so the next
-                # get_db_connection() call creates a fresh one. We deliberately
-                # do NOT retry the write right here - silently re-issuing an
-                # INSERT/UPDATE after an ambiguous network failure risks
-                # executing it twice, which is worse than surfacing this one
-                # error to the caller (existing except sqlite3.OperationalError
-                # / IntegrityError handling elsewhere in this file still works
-                # unchanged, since we re-raise the exact original exception).
+            except Exception as exc:
+                # A genuine SQL-level error (missing column, constraint,
+                # syntax...) says nothing about the connection. Several
+                # routes deliberately rely on such errors (schema probing),
+                # so do NOT throw the shared connection away for them -
+                # that forced a full reconnect handshake every time.
+                if _is_sql_level_error(exc):
+                    raise
+                # Looks like a stale/broken connection: drop it so the next
+                # get_db_connection() builds a fresh one.
                 _reset_db_connection()
-                raise
+                cw = self._conn_wrapper
+                # Transparent single retry, ONLY for plain reads and ONLY
+                # when no write is pending on the old connection (otherwise
+                # the retry would silently run on a connection that lost
+                # that uncommitted work). Writes are never retried.
+                if not (read_only and cw is not None and not getattr(cw, "_dirty", False)):
+                    raise
+                try:
+                    new_wrapper = _TursoConnectionWrapper(
+                        libsql.connect(database=TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
+                    )
+                    new_cursor = new_wrapper._raw_conn.cursor()
+                    new_cursor.execute(*args, **kwargs)
+                except Exception:
+                    _reset_db_connection()
+                    raise
+                global _CACHED_TURSO_CONNECTION
+                _CACHED_TURSO_CONNECTION = new_wrapper
+                self._raw_cursor = new_cursor
+                self._conn_wrapper = new_wrapper
+                logging.getLogger("uvicorn.error").warning(
+                    "DB read retried on a fresh connection after: %r", exc
+                )
+                return self
+            if not read_only and self._conn_wrapper is not None:
+                self._conn_wrapper._dirty = True
         return self
 
     def executemany(self, *args, **kwargs):
         with _CONNECTION_LOCK:
             self._raw_cursor.executemany(*args, **kwargs)
+            if self._conn_wrapper is not None:
+                self._conn_wrapper._dirty = True
         return self
 
     def executescript(self, *args, **kwargs):
         with _CONNECTION_LOCK:
             self._raw_cursor.executescript(*args, **kwargs)
+            if self._conn_wrapper is not None:
+                self._conn_wrapper._dirty = True
         return self
 
     def fetchone(self):
@@ -244,9 +270,10 @@ class _TursoConnectionWrapper:
 
     def __init__(self, raw_conn):
         self._raw_conn = raw_conn
+        self._dirty = False  # True while uncommitted writes may be pending
 
     def cursor(self):
-        return _TursoCursorWrapper(self._raw_conn.cursor())
+        return _TursoCursorWrapper(self._raw_conn.cursor(), self)
 
     def execute(self, *args, **kwargs):
         return self.cursor().execute(*args, **kwargs)
@@ -272,13 +299,35 @@ class _TursoConnectionWrapper:
         # not-yet-committed statements on the shared connection.
         with _CONNECTION_LOCK:
             self._raw_conn.commit()
+            self._dirty = False
 
     def rollback(self):
         with _CONNECTION_LOCK:
             self._raw_conn.rollback()
+            self._dirty = False
 
     def __getattr__(self, name):
         return getattr(self._raw_conn, name)
+
+
+def _is_read_only_sql(args) -> bool:
+    try:
+        s = str(args[0]).lstrip().upper()
+    except Exception:
+        return False
+    return s.startswith("SELECT") or s.startswith("PRAGMA TABLE_INFO")
+
+
+_SQL_ERROR_MARKERS = (
+    "sqlite failure", "no such table", "no such column", "syntax error",
+    "constraint failed", "unique constraint", "duplicate column",
+    "already exists", "datatype mismatch", "no such index",
+)
+
+
+def _is_sql_level_error(exc) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _SQL_ERROR_MARKERS)
 
 
 def get_db_connection():
@@ -2454,6 +2503,125 @@ def select_best_ref_range(cursor, param_id: int, patient_gender: str, age_days: 
         return (exact,width,abs(center-age_days),r["id"])
     best=sorted(rows,key=key)[0]
     return bounds_to_ref_text(best["low"],best["high"])
+
+_REF_FALLBACK = object()
+_QR_LOCAL_WARNED = False
+
+
+def _local_qr_data_uri(text: str):
+    """Vector QR as an inline data URI - no network call at render/PDF time.
+    Returns None if the 'segno' package is missing, so the caller falls back
+    to the previous external QR service (nothing breaks)."""
+    try:
+        import segno
+        import io
+        qr = segno.make(text, error="m", micro=False)
+        buf = io.BytesIO()
+        qr.save(buf, kind="svg", scale=4, border=1, dark="#000000", light="#ffffff", xmldecl=False)
+        svg = buf.getvalue().decode("utf-8")
+        # Add a viewBox so the image scales cleanly to whatever size the
+        # report CSS gives it (the print CSS shrinks it to 75px).
+        m = re.search(r"width='(\d+)' height='(\d+)'", svg)
+        if m and "viewBox" not in svg:
+            svg = svg.replace("<svg ", f"<svg viewBox='0 0 {m.group(1)} {m.group(2)}' ", 1)
+        return "data:image/svg+xml;charset=utf-8," + quote(svg, safe="")
+    except Exception:
+        global _QR_LOCAL_WARNED
+        if not _QR_LOCAL_WARNED:
+            _QR_LOCAL_WARNED = True
+            logging.getLogger("uvicorn.error").warning(
+                "Local QR generation unavailable (is 'segno' in requirements.txt?) - using external QR service", exc_info=True)
+        return None
+
+
+def select_best_ref_range_batch(cursor, param_ids, patient_gender: str, age_days: int):
+    """Same selection logic as select_best_ref_range(), but for many
+    parameters in ONE query. Returns {param_id: ref_text_or_None}. A param
+    that could not be computed maps to _REF_FALLBACK so the caller can use
+    the original per-parameter function for it. Returns None if the batch
+    query itself failed (caller then uses the original path for all)."""
+    ids = []
+    for x in param_ids:
+        try:
+            ids.append(int(x))
+        except (TypeError, ValueError):
+            pass
+    ids = sorted(set(ids))
+    out = {i: None for i in ids}
+    if not ids:
+        return out
+    try:
+        gender = normalize_patient_gender(patient_gender)
+        age_days = max(0, int(age_days or 0))
+        grouped = {}
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" for _ in chunk)
+            cursor.execute(
+                f"""SELECT id, param_id, gender, age_from_days, age_to_days, low, high FROM param_ref_ranges
+                WHERE param_id IN ({marks}) AND COALESCE(age_from_days,0)<=? AND COALESCE(age_to_days,73000)>=?
+                AND (LOWER(TRIM(COALESCE(gender,'Both')))= 'both' OR LOWER(TRIM(COALESCE(gender,'')))=?)""",
+                tuple(chunk) + (age_days, age_days, gender.lower()),
+            )
+            for r in cursor.fetchall():
+                grouped.setdefault(int(r["param_id"]), []).append(r)
+    except Exception:
+        return None
+
+    def key(r):
+        rg = normalize_patient_gender(r["gender"]); exact = 0 if gender and rg == gender else 1
+        width = max(0, int(r["age_to_days"]) - int(r["age_from_days"]))
+        center = (int(r["age_from_days"]) + int(r["age_to_days"])) / 2
+        return (exact, width, abs(center - age_days), r["id"])
+
+    for pid, rows in grouped.items():
+        try:
+            best = sorted(rows, key=key)[0]
+            out[pid] = bounds_to_ref_text(best["low"], best["high"])
+        except Exception:
+            out[pid] = _REF_FALLBACK
+    return out
+
+
+def _prefetch_param_results(cursor, patient_id, test_id):
+    """All saved results of one patient/test in ONE query:
+    {parameter_id: row}. First row per parameter wins (same as the old
+    per-parameter LIMIT 1). Returns None on any problem so the caller keeps
+    the original per-parameter queries."""
+    try:
+        cursor.execute(
+            "SELECT parameter_id, result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND test_id=?",
+            (patient_id, test_id),
+        )
+        out = {}
+        for r in cursor.fetchall():
+            try:
+                k = int(r["parameter_id"])
+            except (TypeError, ValueError):
+                k = r["parameter_id"]
+            out.setdefault(k, r)
+        return out
+    except Exception:
+        return None
+
+
+_TABLE_COLS_CACHE = {}
+
+
+def _cached_table_cols(cursor, tbl):
+    """PRAGMA table_info(tbl) column names, cached for 5 minutes. Only
+    cached when the table already has display_order, so a column added
+    later is never hidden behind a stale cache."""
+    now = time.time()
+    hit = _TABLE_COLS_CACHE.get(tbl)
+    if hit and now - hit[0] < 300:
+        return list(hit[1])
+    cursor.execute(f"PRAGMA table_info({tbl});")
+    cols = [c[1] for c in cursor.fetchall()]
+    if cols and "display_order" in cols:
+        _TABLE_COLS_CACHE[tbl] = (now, list(cols))
+    return cols
+
 
 def parse_optional_float(x: str):
     if x is None:
@@ -11749,6 +11917,11 @@ def _get_or_create_report_qr_token(patient_id: int, test_id: int):
         row = cursor.fetchone()
         return row[0] if row else None
     except Exception:
+        # Still fail closed (no QR), but leave a trace so a missing QR on a
+        # printed report can be diagnosed from the server logs.
+        logging.getLogger("uvicorn.error").exception(
+            "QR token lookup/creation failed (patient=%s test=%s)", patient_id, test_id
+        )
         return None
     finally:
         if conn is not None:
@@ -13242,8 +13415,7 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
 
     for tbl in possible_tables:
         try:
-            cursor.execute(f"PRAGMA table_info({tbl});")
-            cols=[c[1] for c in cursor.fetchall()]
+            cols=_cached_table_cols(cursor, tbl)
             if not cols: continue
             n_col=next((c for c in possible_cols if c in cols), "param_name" if "param_name" in cols else cols[1])
             u_col=next((c for c in ["unit","units"] if c in cols),None)
@@ -13321,6 +13493,22 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         critical_html = ""
     in_abst_section = False
 
+    # Batched lookups (2 queries total instead of 2 per parameter). Any
+    # problem makes these None and the original per-parameter queries run.
+    _ref_map = None
+    _results_map = None
+    if params:
+        try:
+            _pid_list = []
+            for _p in params:
+                _pv = dict(_p).get("id")
+                if _pv is not None:
+                    _pid_list.append(int(_pv))
+            _ref_map = select_best_ref_range_batch(cursor, _pid_list, patient_gender, patient_age_days)
+        except Exception:
+            _ref_map = None
+        _results_map = _prefetch_param_results(cursor, patient_id, test_id)
+
     if params:
         for p in params:
             d=dict(p); p_id=d.get("id")
@@ -13353,24 +13541,41 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
             p_name=raw_name_str or "Parameter"
             unit=str(d.get(unit_col,"") or "").strip() if unit_col else ""
             default_ref=str(d.get(range_col,"") or "").strip() if range_col else ""
-            matched=select_best_ref_range(cursor,int(p_id),patient_gender,patient_age_days) if p_id is not None else None
+            if p_id is None:
+                matched=None
+            else:
+                _mk=int(p_id)
+                if _ref_map is None or _ref_map.get(_mk, _REF_FALLBACK) is _REF_FALLBACK:
+                    matched=select_best_ref_range(cursor,_mk,patient_gender,patient_age_days)
+                else:
+                    matched=_ref_map[_mk]
             ref_range=matched or default_ref
             res="-"
             result_is_bold = False
-            try:
-                cursor.execute("SELECT result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",(patient_id,test_id,p_id))
-                rr=cursor.fetchone()
+            if _results_map is not None:
+                try:
+                    _rk = int(p_id)
+                except (TypeError, ValueError):
+                    _rk = p_id
+                rr = _results_map.get(_rk)
                 if rr and rr["result_value"] is not None and str(rr["result_value"]).strip():
                     res=str(rr["result_value"]).strip()
                     result_is_bold = bool(rr["is_bold"])
-            except sqlite3.Error:
+            else:
                 try:
-                    cursor.execute("SELECT result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND parameter_id=? LIMIT 1",(patient_id,p_id))
+                    cursor.execute("SELECT result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND test_id=? AND parameter_id=? LIMIT 1",(patient_id,test_id,p_id))
                     rr=cursor.fetchone()
                     if rr and rr["result_value"] is not None and str(rr["result_value"]).strip():
                         res=str(rr["result_value"]).strip()
                         result_is_bold = bool(rr["is_bold"])
-                except sqlite3.Error: pass
+                except sqlite3.Error:
+                    try:
+                        cursor.execute("SELECT result_value, COALESCE(is_bold,0) AS is_bold FROM patient_parameter_results WHERE patient_id=? AND parameter_id=? LIMIT 1",(patient_id,p_id))
+                        rr=cursor.fetchone()
+                        if rr and rr["result_value"] is not None and str(rr["result_value"]).strip():
+                            res=str(rr["result_value"]).strip()
+                            result_is_bold = bool(rr["is_bold"])
+                    except sqlite3.Error: pass
 
             # Capture Total WBC / differential % values for the Absolute
             # Differential Count sub-section, purely in-memory for this
@@ -13578,12 +13783,14 @@ def _report_html_impl(patient_id: int, test_id: int, request: Request,
         </div>
         """
 
-    barcode_url = f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
+    # Local Code 128 SVG (helper already used by the public report); the
+    # external service stays only as a fallback if encoding is impossible.
+    barcode_url = _code128b_data_uri(str(ref_no)) or f"https://barcode.tec-it.com/barcode.ashx?data={ref_no}&code=Code128&dpi=96&hidehrt=true"
     if qr_token:
         # Dedicated, unauthenticated, read-only public page for this ONE report.
         download_url = str(request.base_url).rstrip("/") + f"/public-report/{qr_token}"
         qr_data = quote(download_url, safe="")
-        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=120x120&data={qr_data}"
+        qr_url = _local_qr_data_uri(download_url) or f"https://api.qrserver.com/v1/create-qr-code/?size=120x120&data={qr_data}"
     else:
         # Fail closed: never fall back to a guessable /report-download/{id}/{id} link.
         qr_url = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
